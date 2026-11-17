@@ -1,0 +1,5 @@
+anthropic
+python-bitvavo-api
+feedparser
+requests
+python-dotenv

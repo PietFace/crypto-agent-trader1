@@ -1,0 +1,22 @@
+{
+  "budget_eur": 100,
+  "max_trade_eur": 20,
+  "min_order_eur": 5,
+  "max_positions": 3,
+  "max_loss_per_trade_eur": 1.0,
+  "daily_loss_limit_eur": 5,
+  "max_buys_per_day": 4,
+  "reward_risk": 2.0,
+  "min_confidence": 0.65,
+  "max_spread_pct": 0.4,
+  "fee_pct": 0.25,
+  "cooldown_hours_after_stop": 12,
+  "stop_pct": {
+    "default": 6,
+    "BTC-EUR": 5,
+    "ETH-EUR": 5,
+    "SOL-EUR": 7,
+    "XRP-EUR": 7
+  },
+  "blocked_markets": []
+}

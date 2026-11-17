@@ -1,0 +1,13 @@
+# Geheimen: NOOIT committen
+.env
+
+# Lokale data
+trader.db
+STOP
+
+.venv/
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
