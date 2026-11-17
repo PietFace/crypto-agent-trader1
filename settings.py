@@ -13,6 +13,7 @@ DEFAULTS = {
     "cycle_minutes": 120,
     "model": "claude-haiku-5-5",
     "model_chief": "",  # leeg = zelfde als model
+    "remote": {"enabled": False, "url": "https://pietface-trader-live.lovable.app/api/public/bot-ingest", "token": ""},
     "rules": {
         "budget_eur": 100,
         "max_trade_eur": 20,

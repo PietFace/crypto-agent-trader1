@@ -444,6 +444,25 @@ class SettingsPage(QWidget):
             self.stop_form.addRow("Overige munten" if m == "default" else m, s)
         v.addWidget(g)
 
+        g = QGroupBox("Op afstand meekijken")
+        f = QFormLayout(g)
+        self.rm_on = QCheckBox("Stand, keuzes en logboek naar het online dashboard sturen")
+        f.addRow("", self.rm_on)
+        self.rm_url = QLineEdit()
+        self.rm_url.setPlaceholderText("https://…/functions/v1/bot-ingest")
+        f.addRow("Adres", self.rm_url)
+        self.rm_token = self._secret()
+        f.addRow("Token", self.rm_token)
+        tb = QPushButton("Verbinding testen")
+        tb.clicked.connect(self._test_remote)
+        self.rm_result = lab("", "hint", wrap=True)
+        row = QHBoxLayout()
+        row.addWidget(tb)
+        row.addWidget(self.rm_result, 1)
+        f.addRow("", row)
+        f.addRow("", lab("Alleen versturen: vanaf je telefoon kun je meekijken, maar niets bedienen.", "hint", wrap=True))
+        v.addWidget(g)
+
         g = QGroupBox("Gegevens")
         h = QHBoxLayout(g)
         h.addWidget(lab(settings.data_dir(), "hint", wrap=True), 1)
@@ -459,8 +478,16 @@ class SettingsPage(QWidget):
         e.setEchoMode(QLineEdit.Password)
         return e
 
+    def _test_remote(self):
+        import remote
+        self.rm_result.setText("Bezig…")
+        QApplication.processEvents()
+        ok, msg = remote.test(self.rm_url.text(), self.rm_token.text())
+        self.rm_result.setText(msg)
+        self.rm_result.setStyleSheet(f"color: {C['good'] if ok else C['bad']};")
+
     def _toggle_keys(self, on):
-        for e in (self.k_ant, self.k_bv, self.k_bvs):
+        for e in (self.k_ant, self.k_bv, self.k_bvs, self.rm_token):
             e.setEchoMode(QLineEdit.Normal if on else QLineEdit.Password)
 
     def _confirm_live(self, on):
@@ -494,6 +521,10 @@ class SettingsPage(QWidget):
         for m, c in self.m_checks.items():
             c.setChecked(m in cfg.get("markets", []))
         self.cycle.setValue(int(cfg.get("cycle_minutes", 120)))
+        rc = cfg.get("remote") or {}
+        self.rm_on.setChecked(bool(rc.get("enabled")))
+        self.rm_url.setText(rc.get("url", ""))
+        self.rm_token.setText(rc.get("token", ""))
         self.model.setCurrentText(cfg.get("model") or settings.MODELS[0])
         self.model_chief.setCurrentText(cfg.get("model_chief") or "(zelfde als agents)")
         for key, s in self.r.items():
@@ -523,6 +554,8 @@ class SettingsPage(QWidget):
         mc = self.model_chief.currentText()
         cfg["model_chief"] = "" if mc.startswith("(") else mc
         cfg["rules"] = self.collect_rules()
+        cfg["remote"] = {"enabled": self.rm_on.isChecked(), "url": self.rm_url.text().strip(),
+                         "token": self.rm_token.text().strip()}
         settings.save(cfg)
         if self.win.engine and self.win.engine.running:
             self.note.setText("Opgeslagen. De bot draait nog met de oude instellingen: stop en start hem om ze te gebruiken.")

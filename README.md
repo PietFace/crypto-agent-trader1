@@ -19,6 +19,10 @@ De exe wordt automatisch opnieuw gebouwd bij elke wijziging in deze repository. 
 - **Overzicht**: alle trades, elk oordeel van de risicopoort en de API-kosten per agent met een maandschatting.
 - **Instellingen**: keys, live of droog, markten, hoe vaak de agents analyseren, model, alle risicoregels en de stop-loss per munt.
 
+## Op afstand meekijken
+
+Onder **Instellingen > Op afstand meekijken** zet je het versturen aan en vul je je token in. Daarna zie je op https://pietface-trader-live.lovable.app (inloggen) de stand, de keuzes van alle agents, de trades en het logboek. Alleen meekijken: vanaf daar kan niemand de bot bedienen.
+
 ## Standaardregels
 
 | Regel | Waarde |

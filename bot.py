@@ -21,6 +21,7 @@ import requests
 from python_bitvavo_api.bitvavo import Bitvavo
 
 import kosten
+import remote
 import risk_gate
 import settings
 
@@ -103,7 +104,7 @@ class Engine:
 
     def __init__(self, cfg, log=print, db_path=None):
         self.cfg = cfg
-        self.log = log
+        self._ui_log = log
         self.db_path = db_path or settings.db_path()
         self.rules = cfg["rules"]
         self.live = bool(cfg.get("live"))
@@ -120,7 +121,17 @@ class Engine:
         self._thread = None
         self.next_cycle = None
         self.busy = False
+        self.cycle_id = None
         init_db(self.db_path)
+        rc = cfg.get("remote") or {}
+        self.remote = None
+        if rc.get("enabled") and rc.get("url") and rc.get("token"):
+            self.remote = remote.Remote(rc["url"], rc["token"], self._ui_log)
+
+    def log(self, text, kind=""):
+        self._ui_log(text, kind)
+        if self.remote:
+            self.remote.push("log", {"ts": now(), "kind": kind, "text": text})
 
     # ---------- start / stop ----------
     def problems(self):
@@ -161,6 +172,7 @@ class Engine:
                 self.check_exits()
                 if time.time() - last_cycle >= self.cycle_minutes * 60:
                     self.busy = True
+                    self.push_status(True)
                     self.run_cycle()
                     self.summary()
                     last_cycle = time.time()
@@ -169,9 +181,14 @@ class Engine:
             except Exception as e:
                 self.busy = False
                 self.log(f"Fout in loop: {e}", "bad")
+            self.push_status(True)
             self._stop.wait(EXIT_CHECK_SECONDS)
         self.next_cycle = None
+        self.busy = False
+        self.push_status(False)
         self.log("Bot gestopt. Open posities blijven staan; stop-loss werkt pas weer als de bot draait.", "info")
+        if self.remote:
+            self.remote.close()
 
     # ---------- database ----------
     def db(self):
@@ -265,6 +282,7 @@ class Engine:
             res = risk_gate.check_buy(con, market, amount_eur, confidence, self.spread_pct(market),
                                       stop_file=settings.stop_path(), rules=self.rules)
             risk_gate.log_verdict(con, market, res)
+        self.last_verdict = res
         if res["verdict"] == "BLOCK":
             return 0, "; ".join(res["reasons"])
         plan = risk_gate.exit_plan(self.rules, market, self.price(market))
@@ -294,6 +312,7 @@ class Engine:
             con.execute("INSERT INTO trades(ts,market,side,amount,price,eur,fee,pnl,live,reason) "
                         "VALUES(?,?,?,?,?,?,?,?,?,?)",
                         (now(), market, "buy", amount, fill_px, spent, fee, 0, int(self.live), reason))
+        self.push_trade(market, "buy", spent, fill_px, 0, reason)
         self.log(f"  {'LIVE' if self.live else 'DROOG'} KOOP {market}: €{spent:.2f} @ {fmt_px(fill_px)}", "good")
 
     def execute_sell(self, market, reason):
@@ -328,6 +347,7 @@ class Engine:
             con.execute("INSERT INTO trades(ts,market,side,amount,price,eur,fee,pnl,live,reason) "
                         "VALUES(?,?,?,?,?,?,?,?,?,?)",
                         (now(), market, "sell", amount, fill_px, net, fee, pnl, int(self.live), reason))
+        self.push_trade(market, "sell", net, fill_px, pnl, reason)
         self.log(f"  {'LIVE' if self.live else 'DROOG'} VERKOOP {market}: €{net:.2f} (resultaat {pnl:+.2f})",
                  "good" if pnl >= 0 else "bad")
 
@@ -342,6 +362,7 @@ class Engine:
     # ---------- cyclus ----------
     def run_cycle(self):
         self.log(f"=== Cyclus {datetime.now():%d-%m %H:%M} ({'LIVE' if self.live else 'droog'}) ===", "head")
+        self.cycle_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
         news = self.headlines()
         sentiment = self.ask("sentiment", {"fear_greed": self.fear_greed()})
         self.log_agent("*", "sentiment", sentiment)
@@ -363,8 +384,11 @@ class Engine:
                                           "skeptic": skeptic, "positie": pos})
             for name, out in [("charts", charts), ("news", news_r), ("skeptic", skeptic), ("chief", decision)]:
                 self.log_agent(market, name, out)
+            self.last_verdict = None
+            executed = False
             if "fout" in decision:
                 self.log(f"{market}: Chief gaf geen antwoord ({decision['fout'][:120]})", "bad")
+                self.push_decision(market, ind, charts, news_r, sentiment, skeptic, decision, executed)
                 continue
             action = decision.get("action", "hold")
             self.log(f"{market}: Chief = {action} (zekerheid {decision.get('confidence')}) - {decision.get('reason')}")
@@ -373,10 +397,65 @@ class Engine:
                                                   float(decision.get("confidence", 0) or 0))
                 if amount:
                     self.execute_buy(market, amount, decision.get("reason", ""))
+                    executed = True
                 else:
                     self.log(f"  risicopoort blokkeert: {why}", "muted")
             elif action == "sell" and pos:
                 self.execute_sell(market, decision.get("reason", ""))
+                executed = True
+            self.push_decision(market, ind, charts, news_r, sentiment, skeptic, decision, executed)
+
+    # ---------- op afstand meekijken ----------
+    def push_trade(self, market, side, eur_amount, price, pnl, reason):
+        if self.remote:
+            self.remote.push("trade", {"ts": now(), "market": market, "side": side, "eur": round(eur_amount, 2),
+                                       "price": price, "pnl": round(pnl, 2), "live": self.live, "reason": reason})
+
+    def push_decision(self, market, ind, charts, news_r, sentiment, skeptic, decision, executed):
+        if not self.remote:
+            return
+        v = getattr(self, "last_verdict", None)
+        self.remote.push("decision", {
+            "ts": now(), "cycle_id": self.cycle_id, "market": market, "price": ind.get("price"),
+            "indicators": ind, "charts": charts, "news": news_r, "sentiment": sentiment,
+            "skeptic": skeptic, "chief": decision,
+            "verdict": v["verdict"] if v else None, "verdict_reasons": v["reasons"] if v else [],
+            "amount_eur": v["amount_eur"] if v else None, "executed": executed})
+
+    def status_snapshot(self, running):
+        budget = float(self.rules["budget_eur"])
+        with self.db() as con:
+            b = con.execute("SELECT bot_eur, btc_hold_eur FROM benchmark ORDER BY id DESC LIMIT 1").fetchone()
+            day = datetime.now(timezone.utc).strftime("%Y-%m-%d") + "%"
+            pnl, sells = con.execute("SELECT COALESCE(SUM(pnl),0), COUNT(*) FROM trades "
+                                     "WHERE side='sell' AND ts LIKE ?", (day,)).fetchone()
+            buys = con.execute("SELECT COUNT(*) FROM trades WHERE side='buy' AND ts LIKE ?", (day,)).fetchone()[0]
+            since = datetime.now(timezone.utc).timestamp() - 30 * 86400
+            since = datetime.fromtimestamp(since, timezone.utc).isoformat()
+            usd, calls = con.execute("SELECT COALESCE(SUM(usd),0), COUNT(*) FROM api_usage WHERE ts >= ?",
+                                     (since,)).fetchone()
+            positions = []
+            for r in con.execute("SELECT market, cost_eur, entry_price, opened FROM positions"):
+                plan = risk_gate.exit_plan(self.rules, r["market"], r["entry_price"])
+                positions.append({"market": r["market"], "cost_eur": round(r["cost_eur"], 2),
+                                  "entry": r["entry_price"], "stop": plan["stop_price"],
+                                  "target": plan["target_price"], "opened": r["opened"]})
+        nxt = None
+        if running and self.next_cycle:
+            nxt = datetime.fromtimestamp(self.next_cycle, timezone.utc).isoformat(timespec="seconds")
+        return {"ts": now(), "running": running, "live": self.live, "busy": self.busy, "next_cycle": nxt,
+                "budget": budget, "bot_eur": b["bot_eur"] if b else None,
+                "btc_hold_eur": b["btc_hold_eur"] if b else None, "today_pnl": round(pnl, 2),
+                "buys_today": buys, "sells_today": sells, "daily_limit": self.rules["daily_loss_limit_eur"],
+                "api_usd_30d": round(usd, 4), "api_calls_30d": calls, "markets": self.markets,
+                "positions": positions}
+
+    def push_status(self, running):
+        if self.remote:
+            try:
+                self.remote.push("status", self.status_snapshot(running))
+            except Exception:
+                pass
 
     def summary(self):
         budget = float(self.rules["budget_eur"])
