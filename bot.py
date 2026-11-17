@@ -20,6 +20,14 @@ import feedparser
 import requests
 from python_bitvavo_api.bitvavo import Bitvavo
 
+# Alleen IPv4 gebruiken. Windows wisselt anders soms naar IPv6, en dan past het
+# adres niet meer bij de IP-whitelist van je Bitvavo-key (fout 307).
+try:
+    import urllib3.util.connection as _uc
+    _uc.HAS_IPV6 = False
+except Exception:
+    pass
+
 import kosten
 import remote
 import risk_gate
@@ -63,6 +71,17 @@ def now():
 def fmt_px(x):
     """Koers leesbaar: 76000.00, 2660.00, 148.80, 2.1660"""
     return f"{x:.2f}" if x >= 10 else f"{x:.4f}"
+
+
+def bv_check(res, what):
+    """Bitvavo geeft fouten terug als {'errorCode': ..}. Maak er een duidelijke melding van."""
+    if isinstance(res, dict) and "errorCode" in res:
+        code = res.get("errorCode")
+        if code == 307:
+            raise RuntimeError("Bitvavo weigert dit IP-adres (307). Zet je huidige IPv4-adres op de "
+                               "IP-whitelist van je API-key, of maak de whitelist leeg.")
+        raise RuntimeError(f"Bitvavo-fout bij {what}: {res.get('error', res)} (code {code})")
+    return res
 
 
 def floor8(x):
@@ -116,6 +135,8 @@ class Engine:
             self.models["chief"] = cfg["model_chief"]
         keys = cfg["keys"]
         self.bv = Bitvavo({"APIKEY": keys.get("bitvavo_key", ""), "APISECRET": keys.get("bitvavo_secret", "")})
+        # Koersen, orderboek en candles zijn openbaar: zonder key, dus zonder IP-whitelist.
+        self.pub = Bitvavo({})
         self.ai = anthropic.Anthropic(api_key=keys.get("anthropic") or None)
         self._stop = threading.Event()
         self._thread = None
@@ -217,11 +238,11 @@ class Engine:
 
     # ---------- marktdata ----------
     def price(self, market):
-        return float(self.bv.tickerPrice({"market": market})["price"])
+        return float(bv_check(self.pub.tickerPrice({"market": market}), f"koers {market}")["price"])
 
     def spread_pct(self, market):
         try:
-            book = self.bv.book(market, {"depth": 1})
+            book = bv_check(self.pub.book(market, {"depth": 1}), "orderboek")
             bid = float(book["bids"][0][0])
             ask = float(book["asks"][0][0])
             return (ask - bid) / ((ask + bid) / 2) * 100
@@ -229,7 +250,7 @@ class Engine:
             return None
 
     def indicators(self, market):
-        raw = self.bv.candles(market, "1h", {"limit": 200})
+        raw = bv_check(self.pub.candles(market, "1h", {"limit": 200}), f"candles {market}")
         if not isinstance(raw, list) or len(raw) < 60:
             raise RuntimeError(f"te weinig candles: {raw}")
         raw = list(reversed(raw))
@@ -317,6 +338,9 @@ class Engine:
         fee_rate = self.rules["fee_pct"] / 100
         if self.live:
             res = self.bv.placeOrder(market, "buy", "market", {"amountQuote": f"{eur:.2f}"})
+            if res.get("errorCode") == 307:
+                self.log("  KOOP mislukt: Bitvavo weigert dit IP-adres (307). Controleer de IP-whitelist van je key.", "bad")
+                return
             if "errorCode" in res:
                 self.log(f"  KOOP mislukt: {res}", "bad")
                 return
@@ -351,6 +375,9 @@ class Engine:
                 self.log(f"  VERKOOP {market}: geen saldo beschikbaar, positie blijft staan", "bad")
                 return
             res = self.bv.placeOrder(market, "sell", "market", {"amount": f"{amount:.8f}"})
+            if res.get("errorCode") == 307:
+                self.log("  VERKOOP mislukt: Bitvavo weigert dit IP-adres (307). Controleer de IP-whitelist van je key.", "bad")
+                return
             if "errorCode" in res:
                 self.log(f"  VERKOOP mislukt: {res}", "bad")
                 return
