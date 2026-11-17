@@ -1,15 +1,16 @@
-"""Multi-agent crypto trader voor Bitvavo.
+"""Multi-agent crypto trader voor Bitvavo: de motor.
 
 Agents: Charts, News, Sentiment, Skeptic -> Chief beslist.
-De risicopoort (risk_gate.py + rules.json, gewone code) heeft altijd het laatste woord.
+De risicopoort (risk_gate.py, gewone code) heeft altijd het laatste woord.
 
-Start:  python bot.py          (LIVE=false in .env = droog draaien, geen echte orders)
-Stoppen: maak een leeg bestand STOP aan in deze map, of Ctrl+C.
+Normaal start je het programma (app.py / CryptoTrader.exe). Zonder venster:
+    python bot.py
+Instellingen staan in %APPDATA%\\CryptoTrader\\config.json (aan te passen in het programma).
 """
 import json
 import math
-import os
 import sqlite3
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,143 +18,17 @@ from pathlib import Path
 import anthropic
 import feedparser
 import requests
-from dotenv import load_dotenv
 from python_bitvavo_api.bitvavo import Bitvavo
 
 import kosten
 import risk_gate
-
-load_dotenv()
-
-# ---------- Instellingen ----------
-# Risico- en budgetregels staan in rules.json. Hier alleen de techniek.
-LIVE = os.getenv("LIVE", "false").lower() == "true"
-MARKETS = [m.strip() for m in os.getenv("MARKETS", "BTC-EUR,ETH-EUR,SOL-EUR,XRP-EUR").split(",")]
-CYCLE_MINUTES = int(os.getenv("CYCLE_MINUTES", "120"))       # hoe vaak de agents draaien
-EXIT_CHECK_SECONDS = 300                                      # stop/doel controle elke 5 min
-DB_PATH = "trader.db"
-RULES = risk_gate.load_rules()
-BUDGET_EUR = float(RULES["budget_eur"])
-SIM_FEE = RULES["fee_pct"] / 100                              # fee bij droog draaien
-
-# Model per agent: MODEL_CHARTS, MODEL_NEWS, MODEL_SENTIMENT, MODEL_SKEPTIC, MODEL_CHIEF.
-# Niet ingesteld? Dan geldt MODEL (standaard Haiku).
-DEFAULT_MODEL = os.getenv("MODEL", "claude-haiku-5-5")
-AGENT_NAMES = ["charts", "news", "sentiment", "skeptic", "chief"]
-MODELS = {a: os.getenv(f"MODEL_{a.upper()}", DEFAULT_MODEL) for a in AGENT_NAMES}
-
-bv = Bitvavo({
-    "APIKEY": os.getenv("BITVAVO_KEY", ""),
-    "APISECRET": os.getenv("BITVAVO_SECRET", ""),
-})
-ai = anthropic.Anthropic()
-
-
-# ---------- Database ----------
-def db():
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    return con
-
-
-def init_db():
-    with db() as con:
-        con.executescript("""
-        CREATE TABLE IF NOT EXISTS positions(
-            market TEXT PRIMARY KEY, amount REAL, entry_price REAL, cost_eur REAL, opened TEXT);
-        CREATE TABLE IF NOT EXISTS trades(
-            id INTEGER PRIMARY KEY, ts TEXT, market TEXT, side TEXT, amount REAL,
-            price REAL, eur REAL, fee REAL, pnl REAL, live INTEGER, reason TEXT);
-        CREATE TABLE IF NOT EXISTS agent_log(
-            id INTEGER PRIMARY KEY, ts TEXT, market TEXT, agent TEXT, output TEXT);
-        CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
-        CREATE TABLE IF NOT EXISTS benchmark(
-            id INTEGER PRIMARY KEY, ts TEXT, btc_price REAL, btc_hold_eur REAL, bot_eur REAL);
-        """)
-
-
-def now():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def log_agent(market, agent, output):
-    with db() as con:
-        con.execute("INSERT INTO agent_log(ts,market,agent,output) VALUES(?,?,?,?)",
-                    (now(), market, agent, json.dumps(output, ensure_ascii=False)))
-
-
-# ---------- Marktdata ----------
-def price(market):
-    return float(bv.tickerPrice({"market": market})["price"])
-
-
-def spread_pct(market):
-    """Spread tussen beste bid en ask in %. None als het orderboek niet te lezen is."""
-    try:
-        book = bv.book(market, {"depth": 1})
-        bid = float(book["bids"][0][0])
-        ask = float(book["asks"][0][0])
-        return (ask - bid) / ((ask + bid) / 2) * 100
-    except Exception:
-        return None
-
-
-def rsi(closes, n=14):
-    gains, losses = [], []
-    for a, b in zip(closes[-n - 1:-1], closes[-n:]):
-        d = b - a
-        gains.append(max(d, 0))
-        losses.append(max(-d, 0))
-    ag, al = sum(gains) / n, sum(losses) / n
-    return 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
-
-
-def indicators(market):
-    raw = bv.candles(market, "1h", {"limit": 200})
-    if not isinstance(raw, list) or len(raw) < 60:
-        raise RuntimeError(f"Te weinig candles voor {market}: {raw}")
-    raw = list(reversed(raw))  # oudste eerst
-    closes = [float(c[4]) for c in raw]
-    vols = [float(c[5]) for c in raw]
-    last = closes[-1]
-    return {
-        "market": market,
-        "price": last,
-        "rsi14": round(rsi(closes), 1),
-        "sma20": round(sum(closes[-20:]) / 20, 2),
-        "sma50": round(sum(closes[-50:]) / 50, 2),
-        "change_24h_pct": round((last / closes[-25] - 1) * 100, 2),
-        "change_7d_pct": round((last / closes[-169] - 1) * 100, 2) if len(closes) > 169 else None,
-        "volume_vs_24h_avg": round(vols[-1] / (sum(vols[-24:]) / 24), 2),
-    }
-
+import settings
 
 FEEDS = ["https://www.coindesk.com/arc/outboundfeeds/rss/",
          "https://cointelegraph.com/rss"]
+EXIT_CHECK_SECONDS = 300  # stop-loss en koersdoel elke 5 minuten
 
-
-def headlines(limit=15):
-    items = []
-    for url in FEEDS:
-        try:
-            for e in feedparser.parse(url).entries[:8]:
-                items.append(e.title)
-        except Exception:
-            pass
-    return items[:limit]
-
-
-def fear_greed():
-    try:
-        d = requests.get("https://api.alternative.me/fng/?limit=3", timeout=10).json()["data"]
-        return [{"value": int(x["value"]), "label": x["value_classification"]} for x in d]
-    except Exception:
-        return None
-
-
-# ---------- Agents ----------
 JSON_RULE = " Antwoord ALLEEN met geldig JSON, geen uitleg eromheen."
-
 PROMPTS = {
     "charts": "Je bent de Charts-agent: technisch analist voor crypto. Je krijgt indicatoren voor "
               "1-uurs candles. Geef JSON: {\"richting\": \"omhoog|omlaag|neutraal\", \"score\": -1..1, "
@@ -180,218 +55,363 @@ PROMPTS = {
 }
 
 
-def ask(agent, payload):
-    try:
-        r = ai.messages.create(
-            model=MODELS[agent], max_tokens=500, system=PROMPTS[agent],
-            messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}])
-        kosten.log_usage(agent, MODELS[agent], r.usage, DB_PATH)
-        text = r.content[0].text.strip()
-        if text.startswith("```"):
-            text = text.strip("`").removeprefix("json").strip()
-        return json.loads(text)
-    except Exception as e:
-        return {"fout": str(e), "score": 0}
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-# ---------- Posities en risicopoort ----------
-def get_positions():
-    with db() as con:
-        return {r["market"]: dict(r) for r in con.execute("SELECT * FROM positions")}
+def fmt_px(x):
+    """Koers leesbaar: 76000.00, 2660.00, 148.80, 2.1660"""
+    return f"{x:.2f}" if x >= 10 else f"{x:.4f}"
 
 
-def risk_check_buy(market, amount_eur, confidence):
-    """Geeft (toegestaan_bedrag, reden). Regels staan in rules.json, de AI kan ze niet overrulen."""
-    with db() as con:
-        res = risk_gate.check_buy(con, market, amount_eur, confidence, spread_pct(market), rules=RULES)
-        risk_gate.log_verdict(con, market, res)
-    if res["verdict"] == "BLOCK":
-        return 0, "; ".join(res["reasons"])
-    plan = risk_gate.exit_plan(RULES, market, price(market))
-    print(f"  PASS €{res['amount_eur']:.2f} (grens: {res['decider']}, risico €{res['risk_eur']:.2f}) "
-          f"stop {plan['stop_price']:.4f} doel {plan['target_price']:.4f}")
-    return res["amount_eur"], "ok"
-
-
-# ---------- Orders ----------
 def floor8(x):
     return math.floor(x * 1e8) / 1e8
 
 
-def execute_buy(market, eur, reason):
-    px = price(market)
-    if LIVE:
-        res = bv.placeOrder(market, "buy", "market", {"amountQuote": f"{eur:.2f}"})
-        if "errorCode" in res:
-            print("  BUY mislukt:", res)
+def rsi(closes, n=14):
+    gains, losses = [], []
+    for a, b in zip(closes[-n - 1:-1], closes[-n:]):
+        d = b - a
+        gains.append(max(d, 0))
+        losses.append(max(-d, 0))
+    ag, al = sum(gains) / n, sum(losses) / n
+    return 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
+
+
+def init_db(path):
+    with sqlite3.connect(path) as con:
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS positions(
+            market TEXT PRIMARY KEY, amount REAL, entry_price REAL, cost_eur REAL, opened TEXT);
+        CREATE TABLE IF NOT EXISTS trades(
+            id INTEGER PRIMARY KEY, ts TEXT, market TEXT, side TEXT, amount REAL,
+            price REAL, eur REAL, fee REAL, pnl REAL, live INTEGER, reason TEXT);
+        CREATE TABLE IF NOT EXISTS agent_log(
+            id INTEGER PRIMARY KEY, ts TEXT, market TEXT, agent TEXT, output TEXT);
+        CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS benchmark(
+            id INTEGER PRIMARY KEY, ts TEXT, btc_price REAL, btc_hold_eur REAL, bot_eur REAL);
+        CREATE TABLE IF NOT EXISTS risk_log(id INTEGER PRIMARY KEY, ts TEXT, market TEXT,
+            verdict TEXT, amount_eur REAL, risk_eur REAL, decider TEXT, reasons TEXT);
+        CREATE TABLE IF NOT EXISTS api_usage(id INTEGER PRIMARY KEY, ts TEXT, agent TEXT,
+            model TEXT, input_tokens INTEGER, output_tokens INTEGER, usd REAL);
+        """)
+
+
+class Engine:
+    """Draait de bot in een achtergrondthread. log(tekst, soort) krijgt alle meldingen."""
+
+    def __init__(self, cfg, log=print, db_path=None):
+        self.cfg = cfg
+        self.log = log
+        self.db_path = db_path or settings.db_path()
+        self.rules = cfg["rules"]
+        self.live = bool(cfg.get("live"))
+        self.markets = list(cfg.get("markets") or [])
+        self.cycle_minutes = int(cfg.get("cycle_minutes", 120))
+        self.models = {a: cfg.get("model") or "claude-haiku-5-5"
+                       for a in ["charts", "news", "sentiment", "skeptic", "chief"]}
+        if cfg.get("model_chief"):
+            self.models["chief"] = cfg["model_chief"]
+        keys = cfg["keys"]
+        self.bv = Bitvavo({"APIKEY": keys.get("bitvavo_key", ""), "APISECRET": keys.get("bitvavo_secret", "")})
+        self.ai = anthropic.Anthropic(api_key=keys.get("anthropic") or None)
+        self._stop = threading.Event()
+        self._thread = None
+        self.next_cycle = None
+        self.busy = False
+        init_db(self.db_path)
+
+    # ---------- start / stop ----------
+    def problems(self):
+        """Wat ontbreekt er nog voordat de bot kan starten?"""
+        p = []
+        if not self.cfg["keys"].get("anthropic"):
+            p.append("Anthropic API-key ontbreekt")
+        if not self.markets:
+            p.append("geen markten gekozen")
+        if self.live and not (self.cfg["keys"].get("bitvavo_key") and self.cfg["keys"].get("bitvavo_secret")):
+            p.append("Live staat aan, maar de Bitvavo-key of -secret ontbreekt")
+        return p
+
+    def start(self):
+        if self.running:
             return
-        amount = float(res["filledAmount"])
-        spent = float(res["filledAmountQuote"])
-        fee = float(res.get("feePaid", 0) or 0)
-        fill_px = spent / amount if amount else px
-    else:
-        fee = eur * SIM_FEE
-        amount = (eur - fee) / px
-        spent, fill_px = eur, px
-    with db() as con:
-        con.execute("INSERT INTO positions VALUES(?,?,?,?,?)",
-                    (market, amount, fill_px, spent, now()))
-        con.execute("INSERT INTO trades(ts,market,side,amount,price,eur,fee,pnl,live,reason) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (now(), market, "buy", amount, fill_px, spent, fee, 0, int(LIVE), reason))
-    print(f"  {'LIVE' if LIVE else 'DROOG'} BUY {market}: EUR {spent:.2f} @ {fill_px:.2f}")
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
 
+    def stop(self):
+        self._stop.set()
 
-def execute_sell(market, reason):
-    pos = get_positions().get(market)
-    if not pos:
-        return
-    px = price(market)
-    amount = pos["amount"]
-    if LIVE:
-        base = market.split("-")[0]
-        bal = bv.balance({"symbol": base})
-        avail = float(bal[0]["available"]) if isinstance(bal, list) and bal else 0.0
-        amount = floor8(min(amount, avail))
-        if amount <= 0:
-            print(f"  SELL {market}: geen saldo beschikbaar, positie blijft staan")
-            return
-        res = bv.placeOrder(market, "sell", "market", {"amount": f"{amount:.8f}"})
-        if "errorCode" in res:
-            print("  SELL mislukt:", res)
-            return
-        proceeds = float(res["filledAmountQuote"])
-        fee = float(res.get("feePaid", 0) or 0)
-        fill_px = proceeds / float(res["filledAmount"])
-        net = proceeds - fee
-    else:
-        gross = amount * px
-        fee = gross * SIM_FEE
-        net, fill_px = gross - fee, px
-    pnl = net - pos["cost_eur"]
-    with db() as con:
-        con.execute("DELETE FROM positions WHERE market=?", (market,))
-        con.execute("INSERT INTO trades(ts,market,side,amount,price,eur,fee,pnl,live,reason) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (now(), market, "sell", amount, fill_px, net, fee, pnl, int(LIVE), reason))
-    print(f"  {'LIVE' if LIVE else 'DROOG'} SELL {market}: EUR {net:.2f} (resultaat {pnl:+.2f})")
+    @property
+    def running(self):
+        return bool(self._thread and self._thread.is_alive())
 
+    def _loop(self):
+        self.log(f"Bot gestart ({'LIVE' if self.live else 'droog draaien'}): max €{self.rules['max_loss_per_trade_eur']} "
+                 f"verlies per trade, max {self.rules['max_positions']} posities, daglimiet "
+                 f"€{self.rules['daily_loss_limit_eur']}.", "info")
+        last_cycle = 0.0
+        while not self._stop.is_set():
+            if Path(settings.stop_path()).exists():
+                self.log("STOP-bestand gevonden, bot stopt. Open posities blijven staan.", "bad")
+                break
+            try:
+                self.check_exits()
+                if time.time() - last_cycle >= self.cycle_minutes * 60:
+                    self.busy = True
+                    self.run_cycle()
+                    self.summary()
+                    last_cycle = time.time()
+                    self.busy = False
+                self.next_cycle = last_cycle + self.cycle_minutes * 60
+            except Exception as e:
+                self.busy = False
+                self.log(f"Fout in loop: {e}", "bad")
+            self._stop.wait(EXIT_CHECK_SECONDS)
+        self.next_cycle = None
+        self.log("Bot gestopt. Open posities blijven staan; stop-loss werkt pas weer als de bot draait.", "info")
 
-def check_exits():
-    """Stop-loss en koersdoel. Verkopen wordt nooit geblokkeerd."""
-    for market, pos in get_positions().items():
-        why = risk_gate.exit_signal(RULES, market, pos["entry_price"], price(market))
-        if why:
-            print(f"[exit] {market}: {why}")
-            execute_sell(market, why)
+    # ---------- database ----------
+    def db(self):
+        con = sqlite3.connect(self.db_path)
+        con.row_factory = sqlite3.Row
+        return con
 
+    def log_agent(self, market, agent, output):
+        with self.db() as con:
+            con.execute("INSERT INTO agent_log(ts,market,agent,output) VALUES(?,?,?,?)",
+                        (now(), market, agent, json.dumps(output, ensure_ascii=False)))
 
-# ---------- Eén analyse-cyclus ----------
-def run_cycle():
-    print(f"\n=== Cyclus {now()} ({'LIVE' if LIVE else 'droog'}) ===")
-    news = headlines()
-    fg = fear_greed()
-    sentiment = ask("sentiment", {"fear_greed": fg})
-    log_agent("*", "sentiment", sentiment)
+    def get_positions(self):
+        with self.db() as con:
+            return {r["market"]: dict(r) for r in con.execute("SELECT * FROM positions")}
 
-    for market in MARKETS:
+    def meta_get(self, key):
+        with self.db() as con:
+            r = con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return r[0] if r else None
+
+    def meta_set(self, key, value):
+        with self.db() as con:
+            con.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (key, str(value)))
+
+    # ---------- marktdata ----------
+    def price(self, market):
+        return float(self.bv.tickerPrice({"market": market})["price"])
+
+    def spread_pct(self, market):
         try:
-            ind = indicators(market)
-        except Exception as e:
-            print(f"{market}: data-fout {e}")
-            continue
-        pos = get_positions().get(market)
-        charts = ask("charts", ind)
-        news_r = ask("news", {"market": market, "headlines": news})
-        reports = {"charts": charts, "news": news_r, "sentiment": sentiment}
-        skeptic = ask("skeptic", {"market": market, "indicatoren": ind, "rapporten": reports,
-                                  "positie": pos})
-        decision = ask("chief", {"market": market, "indicatoren": ind, "rapporten": reports,
-                                 "skeptic": skeptic, "positie": pos})
-        for name, out in [("charts", charts), ("news", news_r), ("skeptic", skeptic),
-                          ("chief", decision)]:
-            log_agent(market, name, out)
+            book = self.bv.book(market, {"depth": 1})
+            bid = float(book["bids"][0][0])
+            ask = float(book["asks"][0][0])
+            return (ask - bid) / ((ask + bid) / 2) * 100
+        except Exception:
+            return None
 
-        action = decision.get("action", "hold")
-        print(f"{market}: chief={action} conf={decision.get('confidence')} "
-              f"- {decision.get('reason')}")
+    def indicators(self, market):
+        raw = self.bv.candles(market, "1h", {"limit": 200})
+        if not isinstance(raw, list) or len(raw) < 60:
+            raise RuntimeError(f"te weinig candles: {raw}")
+        raw = list(reversed(raw))
+        closes = [float(c[4]) for c in raw]
+        vols = [float(c[5]) for c in raw]
+        last = closes[-1]
+        return {
+            "market": market, "price": last, "rsi14": round(rsi(closes), 1),
+            "sma20": round(sum(closes[-20:]) / 20, 2), "sma50": round(sum(closes[-50:]) / 50, 2),
+            "change_24h_pct": round((last / closes[-25] - 1) * 100, 2),
+            "change_7d_pct": round((last / closes[-169] - 1) * 100, 2) if len(closes) > 169 else None,
+            "volume_vs_24h_avg": round(vols[-1] / max(sum(vols[-24:]) / 24, 1e-12), 2),
+        }
 
-        if action == "buy" and not pos:
-            amount, why = risk_check_buy(market, float(decision.get("amount_eur", 0) or 0),
-                                         float(decision.get("confidence", 0) or 0))
-            if amount:
-                execute_buy(market, amount, decision.get("reason", ""))
-            else:
-                print(f"  risicopoort blokkeert: {why}")
-        elif action == "sell" and pos:
-            execute_sell(market, decision.get("reason", ""))
+    @staticmethod
+    def headlines(limit=15):
+        items = []
+        for url in FEEDS:
+            try:
+                for e in feedparser.parse(url).entries[:8]:
+                    items.append(e.title)
+            except Exception:
+                pass
+        return items[:limit]
 
-
-def meta_get(key):
-    with db() as con:
-        r = con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
-    return r[0] if r else None
-
-
-def meta_set(key, value):
-    with db() as con:
-        con.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (key, str(value)))
-
-
-def summary():
-    pos = get_positions()
-    unrealized = 0.0
-    total = 0.0
-    for m, p in pos.items():
-        v = p["amount"] * price(m)
-        total += v
-        unrealized += v - p["cost_eur"]
-        print(f"  {m}: {p['amount']:.6f} ingekocht voor EUR {p['cost_eur']:.2f}, nu EUR {v:.2f}")
-    with db() as con:
-        pnl = con.execute("SELECT COALESCE(SUM(pnl),0) FROM trades WHERE side='sell'").fetchone()[0]
-    print(f"  Gerealiseerd totaal: EUR {pnl:+.2f} | open posities waarde: EUR {total:.2f}")
-
-    # Benchmark: wat zou BUDGET_EUR in BTC kopen-en-vasthouden nu waard zijn?
-    try:
-        btc = price("BTC-EUR")
-        start = meta_get("btc_start_price")
-        if start is None:
-            meta_set("btc_start_price", btc)
-            meta_set("bench_start", now())
-            start = btc
-        btc_hold = BUDGET_EUR * btc / float(start)
-        bot_eur = BUDGET_EUR + pnl + unrealized
-        with db() as con:
-            con.execute("INSERT INTO benchmark(ts,btc_price,btc_hold_eur,bot_eur) VALUES(?,?,?,?)",
-                        (now(), btc, btc_hold, bot_eur))
-        print(f"  Benchmark: bot EUR {bot_eur:.2f} vs BTC vasthouden EUR {btc_hold:.2f} "
-              f"(verschil {bot_eur - btc_hold:+.2f})")
-    except Exception as e:
-        print("  Benchmark niet bijgewerkt:", e)
-
-
-def main():
-    init_db()
-    if LIVE and not os.getenv("BITVAVO_KEY"):
-        raise SystemExit("LIVE=true maar BITVAVO_KEY ontbreekt in .env")
-    print(f"Regels: max €{RULES['max_loss_per_trade_eur']} verlies per trade, max "
-          f"{RULES['max_positions']} posities, daglimiet €{RULES['daily_loss_limit_eur']}, "
-          f"doel {RULES['reward_risk']}R ({'LIVE' if LIVE else 'droog draaien'})")
-    last_cycle = 0.0
-    while True:
-        if Path("STOP").exists():
-            print("STOP-bestand gevonden, bot stopt. Open posities blijven staan.")
-            break
+    @staticmethod
+    def fear_greed():
         try:
-            check_exits()
-            if time.time() - last_cycle >= CYCLE_MINUTES * 60:
-                run_cycle()
-                summary()
-                last_cycle = time.time()
+            d = requests.get("https://api.alternative.me/fng/?limit=3", timeout=10).json()["data"]
+            return [{"value": int(x["value"]), "label": x["value_classification"]} for x in d]
+        except Exception:
+            return None
+
+    # ---------- agents ----------
+    def ask(self, agent, payload):
+        try:
+            r = self.ai.messages.create(
+                model=self.models[agent], max_tokens=500, system=PROMPTS[agent],
+                messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}])
+            kosten.log_usage(agent, self.models[agent], r.usage, self.db_path)
+            text = r.content[0].text.strip()
+            if text.startswith("```"):
+                text = text.strip("`").removeprefix("json").strip()
+            return json.loads(text)
         except Exception as e:
-            print("Fout in loop:", e)
-        time.sleep(EXIT_CHECK_SECONDS)
+            return {"fout": str(e), "score": 0}
+
+    # ---------- risicopoort ----------
+    def risk_check_buy(self, market, amount_eur, confidence):
+        with self.db() as con:
+            res = risk_gate.check_buy(con, market, amount_eur, confidence, self.spread_pct(market),
+                                      stop_file=settings.stop_path(), rules=self.rules)
+            risk_gate.log_verdict(con, market, res)
+        if res["verdict"] == "BLOCK":
+            return 0, "; ".join(res["reasons"])
+        plan = risk_gate.exit_plan(self.rules, market, self.price(market))
+        self.log(f"  PASS €{res['amount_eur']:.2f} (grens: {res['decider']}, risico €{res['risk_eur']:.2f}), "
+                 f"stop {fmt_px(plan['stop_price'])}, doel {fmt_px(plan['target_price'])}", "good")
+        return res["amount_eur"], "ok"
+
+    # ---------- orders ----------
+    def execute_buy(self, market, eur, reason):
+        px = self.price(market)
+        fee_rate = self.rules["fee_pct"] / 100
+        if self.live:
+            res = self.bv.placeOrder(market, "buy", "market", {"amountQuote": f"{eur:.2f}"})
+            if "errorCode" in res:
+                self.log(f"  KOOP mislukt: {res}", "bad")
+                return
+            amount = float(res["filledAmount"])
+            spent = float(res["filledAmountQuote"])
+            fee = float(res.get("feePaid", 0) or 0)
+            fill_px = spent / amount if amount else px
+        else:
+            fee = eur * fee_rate
+            amount = (eur - fee) / px
+            spent, fill_px = eur, px
+        with self.db() as con:
+            con.execute("INSERT INTO positions VALUES(?,?,?,?,?)", (market, amount, fill_px, spent, now()))
+            con.execute("INSERT INTO trades(ts,market,side,amount,price,eur,fee,pnl,live,reason) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        (now(), market, "buy", amount, fill_px, spent, fee, 0, int(self.live), reason))
+        self.log(f"  {'LIVE' if self.live else 'DROOG'} KOOP {market}: €{spent:.2f} @ {fmt_px(fill_px)}", "good")
+
+    def execute_sell(self, market, reason):
+        pos = self.get_positions().get(market)
+        if not pos:
+            return
+        px = self.price(market)
+        amount = pos["amount"]
+        if self.live:
+            base = market.split("-")[0]
+            bal = self.bv.balance({"symbol": base})
+            avail = float(bal[0]["available"]) if isinstance(bal, list) and bal else 0.0
+            amount = floor8(min(amount, avail))
+            if amount <= 0:
+                self.log(f"  VERKOOP {market}: geen saldo beschikbaar, positie blijft staan", "bad")
+                return
+            res = self.bv.placeOrder(market, "sell", "market", {"amount": f"{amount:.8f}"})
+            if "errorCode" in res:
+                self.log(f"  VERKOOP mislukt: {res}", "bad")
+                return
+            proceeds = float(res["filledAmountQuote"])
+            fee = float(res.get("feePaid", 0) or 0)
+            fill_px = proceeds / float(res["filledAmount"])
+            net = proceeds - fee
+        else:
+            gross = amount * px
+            fee = gross * self.rules["fee_pct"] / 100
+            net, fill_px = gross - fee, px
+        pnl = net - pos["cost_eur"]
+        with self.db() as con:
+            con.execute("DELETE FROM positions WHERE market=?", (market,))
+            con.execute("INSERT INTO trades(ts,market,side,amount,price,eur,fee,pnl,live,reason) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        (now(), market, "sell", amount, fill_px, net, fee, pnl, int(self.live), reason))
+        self.log(f"  {'LIVE' if self.live else 'DROOG'} VERKOOP {market}: €{net:.2f} (resultaat {pnl:+.2f})",
+                 "good" if pnl >= 0 else "bad")
+
+    def check_exits(self):
+        """Stop-loss en koersdoel. Verkopen wordt nooit geblokkeerd."""
+        for market, pos in self.get_positions().items():
+            why = risk_gate.exit_signal(self.rules, market, pos["entry_price"], self.price(market))
+            if why:
+                self.log(f"[exit] {market}: {why}", "info")
+                self.execute_sell(market, why)
+
+    # ---------- cyclus ----------
+    def run_cycle(self):
+        self.log(f"=== Cyclus {datetime.now():%d-%m %H:%M} ({'LIVE' if self.live else 'droog'}) ===", "head")
+        news = self.headlines()
+        sentiment = self.ask("sentiment", {"fear_greed": self.fear_greed()})
+        self.log_agent("*", "sentiment", sentiment)
+        for market in self.markets:
+            if self._stop.is_set():
+                return
+            try:
+                ind = self.indicators(market)
+            except Exception as e:
+                self.log(f"{market}: data-fout {e}", "bad")
+                continue
+            pos = self.get_positions().get(market)
+            charts = self.ask("charts", ind)
+            news_r = self.ask("news", {"market": market, "headlines": news})
+            reports = {"charts": charts, "news": news_r, "sentiment": sentiment}
+            skeptic = self.ask("skeptic", {"market": market, "indicatoren": ind, "rapporten": reports,
+                                           "positie": pos})
+            decision = self.ask("chief", {"market": market, "indicatoren": ind, "rapporten": reports,
+                                          "skeptic": skeptic, "positie": pos})
+            for name, out in [("charts", charts), ("news", news_r), ("skeptic", skeptic), ("chief", decision)]:
+                self.log_agent(market, name, out)
+            if "fout" in decision:
+                self.log(f"{market}: Chief gaf geen antwoord ({decision['fout'][:120]})", "bad")
+                continue
+            action = decision.get("action", "hold")
+            self.log(f"{market}: Chief = {action} (zekerheid {decision.get('confidence')}) - {decision.get('reason')}")
+            if action == "buy" and not pos:
+                amount, why = self.risk_check_buy(market, float(decision.get("amount_eur", 0) or 0),
+                                                  float(decision.get("confidence", 0) or 0))
+                if amount:
+                    self.execute_buy(market, amount, decision.get("reason", ""))
+                else:
+                    self.log(f"  risicopoort blokkeert: {why}", "muted")
+            elif action == "sell" and pos:
+                self.execute_sell(market, decision.get("reason", ""))
+
+    def summary(self):
+        budget = float(self.rules["budget_eur"])
+        unrealized = 0.0
+        for m, p in self.get_positions().items():
+            unrealized += p["amount"] * self.price(m) - p["cost_eur"]
+        with self.db() as con:
+            pnl = con.execute("SELECT COALESCE(SUM(pnl),0) FROM trades WHERE side='sell'").fetchone()[0]
+        try:
+            btc = self.price("BTC-EUR")
+            start = self.meta_get("btc_start_price")
+            if start is None:
+                self.meta_set("btc_start_price", btc)
+                self.meta_set("bench_start", now())
+                start = btc
+            btc_hold = budget * btc / float(start)
+            bot_eur = budget + pnl + unrealized
+            with self.db() as con:
+                con.execute("INSERT INTO benchmark(ts,btc_price,btc_hold_eur,bot_eur) VALUES(?,?,?,?)",
+                            (now(), btc, btc_hold, bot_eur))
+            self.log(f"Stand: bot €{bot_eur:.2f} tegen BTC vasthouden €{btc_hold:.2f} "
+                     f"(verschil {bot_eur - btc_hold:+.2f})", "info")
+        except Exception as e:
+            self.log(f"Benchmark niet bijgewerkt: {e}", "bad")
 
 
 if __name__ == "__main__":
-    main()
+    cfg = settings.load()
+    eng = Engine(cfg, lambda m, k="": print(m))
+    missing = eng.problems()
+    if missing:
+        raise SystemExit("Kan niet starten: " + "; ".join(missing) + f"\nInstellingen: {settings.config_path()}")
+    eng.start()
+    try:
+        while eng.running:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        eng.stop()

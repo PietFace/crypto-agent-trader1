@@ -9,7 +9,11 @@ import sqlite3
 import sys
 from datetime import datetime, timezone
 
-DB_PATH = "trader.db"
+try:
+    import settings
+    DB_PATH = settings.db_path()
+except Exception:
+    DB_PATH = "trader.db"
 
 # Prijzen in dollar per miljoen tokens (input, output), prompts tot 100.000 tokens.
 # Controleer af en toe op https://platform.claude.com/docs/en/about-claude/pricing

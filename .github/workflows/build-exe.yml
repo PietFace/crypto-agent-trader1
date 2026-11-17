@@ -1,6 +1,6 @@
-# Bouwt trader.exe op een Windows-machine van GitHub bij elke push naar main,
+# Bouwt CryptoTrader.exe op een Windows-machine van GitHub bij elke push naar main,
 # en zet de download onder Releases > "Laatste versie".
-name: Bouw trader.exe
+name: Bouw CryptoTrader.exe
 
 on:
   push:
@@ -26,16 +26,20 @@ jobs:
           pip install -r requirements.txt pyinstaller
 
       - name: Controle (syntax)
-        run: python -m py_compile bot.py risk_gate.py kosten.py
+        run: python -m py_compile app.py bot.py settings.py risk_gate.py kosten.py
 
-      - name: trader.exe bouwen
-        run: pyinstaller --onefile --name trader bot.py
+      - name: CryptoTrader.exe bouwen
+        run: >
+          pyinstaller --noconfirm --onefile --windowed --name CryptoTrader
+          --exclude-module tkinter --exclude-module PySide6.QtWebEngineCore --exclude-module PySide6.Qt3DCore
+          --exclude-module PySide6.QtQuick --exclude-module PySide6.QtQml --exclude-module PySide6.QtMultimedia
+          --exclude-module PySide6.QtPdf app.py
 
       - name: Downloadpakket maken
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force trader | Out-Null
-          Copy-Item dist\trader.exe, rules.json, .env.example, README.md trader\
+          Copy-Item dist\CryptoTrader.exe, README.md trader\
           Compress-Archive -Path trader\* -DestinationPath trader-windows.zip -Force
 
       - name: Publiceren als "Laatste versie"
@@ -45,6 +49,6 @@ jobs:
           name: Laatste versie
           body: |
             Automatisch gebouwd uit commit ${{ github.sha }}.
-            Pak trader-windows.zip uit, hernoem .env.example naar .env, vul je keys in en start trader.exe.
+            Pak trader-windows.zip uit en start CryptoTrader.exe. Keys en regels stel je in het programma in (Instellingen).
           files: trader-windows.zip
           make_latest: true
