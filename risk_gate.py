@@ -34,6 +34,7 @@ DEFAULT_RULES = {
     "cooldown_hours_after_stop": 12,
     "stop_pct": {"default": 6, "BTC-EUR": 5, "ETH-EUR": 5, "SOL-EUR": 7, "XRP-EUR": 7},
     "blocked_markets": [],
+    "short_borrow_pct_day": 0.05,
 }
 
 
@@ -50,9 +51,24 @@ def stop_pct(rules, market):
     return float(sp.get(market, sp.get("default", 6)))
 
 
-def exit_plan(rules, market, entry_price):
-    """Stop en koersdoel vóór de aankoop. Doel = reward_risk x de stopafstand."""
+# Twee "boeken": long (echt kopen/verkopen) en short (alleen simulatie).
+BOOKS = {
+    "long": {"positions": "positions", "trades": "trades", "open": "buy", "close": "sell"},
+    "short": {"positions": "short_positions", "trades": "short_trades", "open": "short", "close": "cover"},
+}
+
+
+def exit_plan(rules, market, entry_price, side="long"):
+    """Stop en koersdoel vóór de instap. Doel = reward_risk x de stopafstand.
+    Bij een short ligt de stop boven de instap en het doel eronder."""
     s = stop_pct(rules, market) / 100
+    if side == "short":
+        return {
+            "stop_price": entry_price * (1 + s),
+            "target_price": entry_price * (1 - s * rules["reward_risk"]),
+            "stop_pct": s * 100,
+            "target_pct": s * rules["reward_risk"] * 100,
+        }
     return {
         "stop_price": entry_price * (1 - s),
         "target_price": entry_price * (1 + s * rules["reward_risk"]),
@@ -82,30 +98,32 @@ def _today_utc():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-def day_stats(con, rules):
-    """Gerealiseerd resultaat, aantal aankopen vandaag en open risico (UTC-dag)."""
+def day_stats(con, rules, book="long"):
+    """Gerealiseerd resultaat, aantal instappen vandaag en open risico (UTC-dag)."""
+    b = BOOKS[book]
     day = _today_utc() + "%"
     realized = con.execute(
-        "SELECT COALESCE(SUM(pnl),0) FROM trades WHERE side='sell' AND ts LIKE ?", (day,)
+        f"SELECT COALESCE(SUM(pnl),0) FROM {b['trades']} WHERE side=? AND ts LIKE ?", (b["close"], day)
     ).fetchone()[0]
     buys = con.execute(
-        "SELECT COUNT(*) FROM trades WHERE side='buy' AND ts LIKE ?", (day,)
+        f"SELECT COUNT(*) FROM {b['trades']} WHERE side=? AND ts LIKE ?", (b["open"], day)
     ).fetchone()[0]
     open_risk = 0.0
-    for market, cost in con.execute("SELECT market, cost_eur FROM positions"):
+    for market, cost in con.execute(f"SELECT market, cost_eur FROM {b['positions']}"):
         open_risk += cost * risk_per_eur(rules, market)
     return realized, buys, open_risk
 
 
-def last_stop_loss(con, market):
+def last_stop_loss(con, market, book="long"):
+    b = BOOKS[book]
     r = con.execute(
-        "SELECT ts FROM trades WHERE market=? AND side='sell' AND reason LIKE 'stop-loss%' "
-        "ORDER BY id DESC LIMIT 1", (market,)
+        f"SELECT ts FROM {b['trades']} WHERE market=? AND side=? AND reason LIKE 'stop-loss%' "
+        "ORDER BY id DESC LIMIT 1", (market, b["close"])
     ).fetchone()
     return datetime.fromisoformat(r[0]) if r else None
 
 
-def check_buy(con, market, wanted_eur, confidence, spread, stop_file="STOP", rules=None):
+def check_buy(con, market, wanted_eur, confidence, spread, stop_file="STOP", rules=None, book="long"):
     """PASS of BLOCK voor een aankoop.
 
     con: sqlite3-verbinding met de tabellen positions en trades van bot.py.
@@ -114,7 +132,8 @@ def check_buy(con, market, wanted_eur, confidence, spread, stop_file="STOP", rul
     """
     rules = rules or load_rules()
     reasons = []
-    positions = {m: c for m, c in con.execute("SELECT market, cost_eur FROM positions")}
+    b = BOOKS[book]
+    positions = {m: c for m, c in con.execute(f"SELECT market, cost_eur FROM {b['positions']}")}
     invested = sum(positions.values())
 
     if Path(stop_file).exists():
@@ -132,11 +151,12 @@ def check_buy(con, market, wanted_eur, confidence, spread, stop_file="STOP", rul
     elif spread > rules["max_spread_pct"]:
         reasons.append(f"spread {spread:.2f}% boven {rules['max_spread_pct']}%")
 
-    realized, buys, open_risk = day_stats(con, rules)
+    realized, buys, open_risk = day_stats(con, rules, book)
     if buys >= rules["max_buys_per_day"]:
-        reasons.append(f"al {buys} aankopen vandaag (max {rules['max_buys_per_day']})")
+        what = "shorts" if book == "short" else "aankopen"
+        reasons.append(f"al {buys} {what} vandaag (max {rules['max_buys_per_day']})")
 
-    last = last_stop_loss(con, market)
+    last = last_stop_loss(con, market, book)
     if last is not None:
         if last.tzinfo is None:
             last = last.replace(tzinfo=timezone.utc)
@@ -170,10 +190,17 @@ def check_buy(con, market, wanted_eur, confidence, spread, stop_file="STOP", rul
     }
 
 
-def exit_signal(rules, market, entry_price, price):
+def exit_signal(rules, market, entry_price, price, side="long"):
     """Reden om te verkopen (stop of doel geraakt), anders None. Verkopen mag altijd."""
-    plan = exit_plan(rules, market, entry_price)
+    plan = exit_plan(rules, market, entry_price, side)
     change = (price / entry_price - 1) * 100
+    if side == "short":
+        # Voor een short is een koersdaling winst.
+        if price >= plan["stop_price"]:
+            return f"stop-loss bij koers {change:+.1f}%"
+        if price <= plan["target_price"]:
+            return f"koersdoel bij koers {change:+.1f}% ({rules['reward_risk']}R)"
+        return None
     if price <= plan["stop_price"]:
         return f"stop-loss bij {change:.1f}%"
     if price >= plan["target_price"]:
@@ -181,17 +208,36 @@ def exit_signal(rules, market, entry_price, price):
     return None
 
 
-def log_verdict(con, market, result):
+def book_stats(con, book="long"):
+    """Losse statistieken per boek: gesloten trades, winrate, totaal, beste/slechtste."""
+    b = BOOKS[book]
+    pnls = [r[0] or 0.0 for r in con.execute(f"SELECT pnl FROM {b['trades']} WHERE side=?", (b["close"],))]
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p <= 0]
+    n_open = con.execute(f"SELECT COUNT(*) FROM {b['positions']}").fetchone()[0]
+    return {
+        "trades": len(pnls), "wins": len(wins), "losses": len(losses),
+        "winrate": round(len(wins) / len(pnls), 3) if pnls else None,
+        "total_pnl": round(sum(pnls), 2),
+        "avg_win": round(sum(wins) / len(wins), 2) if wins else None,
+        "avg_loss": round(sum(losses) / len(losses), 2) if losses else None,
+        "best": round(max(pnls), 2) if pnls else None,
+        "worst": round(min(pnls), 2) if pnls else None,
+        "open_positions": n_open,
+    }
+
+
+def log_verdict(con, market, result, book="long"):
     con.execute(
         "CREATE TABLE IF NOT EXISTS risk_log(id INTEGER PRIMARY KEY, ts TEXT, market TEXT, "
-        "verdict TEXT, amount_eur REAL, risk_eur REAL, decider TEXT, reasons TEXT)"
+        "verdict TEXT, amount_eur REAL, risk_eur REAL, decider TEXT, reasons TEXT, book TEXT DEFAULT 'long')"
     )
     con.execute(
-        "INSERT INTO risk_log(ts,market,verdict,amount_eur,risk_eur,decider,reasons) "
-        "VALUES(?,?,?,?,?,?,?)",
+        "INSERT INTO risk_log(ts,market,verdict,amount_eur,risk_eur,decider,reasons,book) "
+        "VALUES(?,?,?,?,?,?,?,?)",
         (datetime.now(timezone.utc).isoformat(timespec="seconds"), market, result["verdict"],
          result["amount_eur"], result["risk_eur"], result["decider"],
-         "; ".join(result["reasons"])),
+         "; ".join(result["reasons"]), book),
     )
 
 

@@ -13,6 +13,7 @@ DEFAULTS = {
     "cycle_minutes": 120,
     "model": "claude-haiku-5-5",
     "model_chief": "",  # leeg = zelfde als model
+    "shorts_sim": True,  # Chief mag shorts kiezen; die worden alleen gesimuleerd
     "remote": {"enabled": False, "url": "https://pietface-trader-live.lovable.app/api/public/bot-ingest", "token": ""},
     "rules": {
         "budget_eur": 100,
@@ -29,6 +30,7 @@ DEFAULTS = {
         "cooldown_hours_after_stop": 12,
         "stop_pct": {"default": 6, "BTC-EUR": 5, "ETH-EUR": 5, "SOL-EUR": 7, "XRP-EUR": 7},
         "blocked_markets": [],
+        "short_borrow_pct_day": 0.05,  # aanname leenkosten per dag voor gesimuleerde shorts
     },
 }
 

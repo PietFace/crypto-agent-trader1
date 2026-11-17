@@ -180,7 +180,7 @@ class BotPage(QWidget):
         pv = QVBoxLayout(pos_card)
         pv.setContentsMargins(14, 12, 14, 12)
         pv.addWidget(lab("OPEN POSITIES", "cap"))
-        self.pos = table(["Munt", "Ingelegd", "Instapkoers", "Stop-loss", "Koersdoel", "Sinds"])
+        self.pos = table(["Soort", "Munt", "Ingelegd", "Instapkoers", "Stop-loss", "Koersdoel", "Sinds"])
         self.pos.setMaximumHeight(150)
         pv.addWidget(self.pos)
         v.addWidget(pos_card)
@@ -253,7 +253,12 @@ class BotPage(QWidget):
         for market, amount, entry, cost_eur, opened in query(
                 "SELECT market, amount, entry_price, cost_eur, opened FROM positions"):
             plan = risk_gate.exit_plan(rules, market, entry)
-            rows.append([market, eur(cost_eur), fmt_px(entry), fmt_px(plan['stop_price']),
+            rows.append(["kopen", market, eur(cost_eur), fmt_px(entry), fmt_px(plan['stop_price']),
+                         fmt_px(plan['target_price']), local_time(opened)])
+        for market, amount, entry, cost_eur, opened in query(
+                "SELECT market, amount, entry_price, cost_eur, opened FROM short_positions"):
+            plan = risk_gate.exit_plan(rules, market, entry, "short")
+            rows.append(["short (sim)", market, eur(cost_eur), fmt_px(entry), fmt_px(plan['stop_price']),
                          fmt_px(plan['target_price']), local_time(opened)])
         fill(self.pos, rows)
         if not rows:
@@ -269,7 +274,44 @@ class OverviewPage(QWidget):
         v.addWidget(lab("Overzicht", "h1"))
         tabs = QTabWidget()
         self.trades = table(["Tijd", "Munt", "Koop/verkoop", "Bedrag", "Koers", "Resultaat", "Live", "Reden"])
-        self.risk = table(["Tijd", "Munt", "Oordeel", "Bedrag", "Risico", "Grens", "Redenen"])
+        self.risk = table(["Tijd", "Soort", "Munt", "Oordeel", "Bedrag", "Risico", "Grens", "Redenen"])
+        self.shorts = table(["Tijd", "Munt", "Open/sluiten", "Bedrag", "Koers", "Resultaat", "Reden"])
+        sw = QWidget()
+        sv = QVBoxLayout(sw)
+        sv.setContentsMargins(0, 8, 0, 0)
+        sv.addWidget(lab("Gesimuleerde shorts: Bitvavo biedt shorten nog niet via de API. Er gaat geen echt geld "
+                         "in om. Resultaat is inclusief fees en een aanname voor leenkosten (zie Instellingen).",
+                         "hint", wrap=True))
+        sv.addWidget(self.shorts, 1)
+        # Statistieken: twee kaarten naast elkaar
+        stw = QWidget()
+        sth = QHBoxLayout(stw)
+        sth.setContentsMargins(0, 12, 0, 0)
+        sth.setSpacing(12)
+        self.stat_cards = {}
+        for book, title in [("long", "Kopen"), ("short", "Shorten (simulatie)")]:
+            c = card()
+            cv2 = QVBoxLayout(c)
+            cv2.setContentsMargins(18, 16, 18, 16)
+            cv2.addWidget(lab(title.upper(), "cap"))
+            big = lab("–", "big")
+            cv2.addWidget(big)
+            grid = QGridLayout()
+            grid.setVerticalSpacing(6)
+            vals = {}
+            for i, (key, label) in enumerate([("trades", "Gesloten trades"), ("wl", "Winst / verlies"),
+                                              ("winrate", "Winrate"), ("avg_win", "Gem. winst"),
+                                              ("avg_loss", "Gem. verlies"), ("best", "Beste trade"),
+                                              ("worst", "Slechtste trade"), ("open", "Open posities")]):
+                grid.addWidget(lab(label, "sub"), i, 0)
+                vl = lab("–")
+                vl.setAlignment(Qt.AlignRight)
+                grid.addWidget(vl, i, 1)
+                vals[key] = vl
+            cv2.addLayout(grid)
+            cv2.addStretch(1)
+            self.stat_cards[book] = (big, vals)
+            sth.addWidget(c, 1)
         self.cost = table(["Agent", "Aanroepen", "Gem. tokens in", "Gem. tokens uit", "Kosten $"])
         self.cost_note = lab("", "hint", wrap=True)
         cw = QWidget()
@@ -277,7 +319,9 @@ class OverviewPage(QWidget):
         cv.setContentsMargins(0, 8, 0, 0)
         cv.addWidget(self.cost)
         cv.addWidget(self.cost_note)
+        tabs.addTab(stw, "Statistieken")
         tabs.addTab(self.trades, "Trades")
+        tabs.addTab(sw, "Shorts (sim)")
         tabs.addTab(self.risk, "Risicopoort")
         tabs.addTab(cw, "API-kosten")
         v.addWidget(tabs, 1)
@@ -291,9 +335,40 @@ class OverviewPage(QWidget):
                          reason])
         fill(self.trades, rows)
 
-        rows = [[local_time(ts), m, v, eur(a or 0), eur(r or 0), d, why] for ts, m, v, a, r, d, why in query(
-            "SELECT ts, market, verdict, amount_eur, risk_eur, decider, reasons FROM risk_log ORDER BY id DESC LIMIT 300")]
+        rows = [[local_time(ts), "short (sim)" if bk == "short" else "kopen", m, v, eur(a or 0), eur(r or 0), d, why]
+                for ts, bk, m, v, a, r, d, why in query(
+            "SELECT ts, COALESCE(book,'long'), market, verdict, amount_eur, risk_eur, decider, reasons "
+            "FROM risk_log ORDER BY id DESC LIMIT 300")]
         fill(self.risk, rows)
+
+        rows = []
+        for ts, m, side, e, px, pnl, reason in query(
+                "SELECT ts, market, side, eur, price, pnl, reason FROM short_trades ORDER BY id DESC LIMIT 300"):
+            rows.append([local_time(ts), m, "short open" if side == "short" else "short dicht", eur(e or 0),
+                         fmt_px(px or 0), eur(pnl or 0, True) if side == "cover" else "", reason])
+        fill(self.shorts, rows)
+
+        try:
+            con = sqlite3.connect(settings.db_path())
+            stats = {b: risk_gate.book_stats(con, b) for b in ("long", "short")}
+            con.close()
+        except Exception:
+            stats = {}
+        for book, (big, vals) in self.stat_cards.items():
+            st = stats.get(book)
+            if not st:
+                continue
+            big.setText(eur(st["total_pnl"], True))
+            big.setStyleSheet(f"color: {C['good'] if st['total_pnl'] > 0 else C['bad'] if st['total_pnl'] < 0 else C['text']};")
+            opt = lambda x: eur(x, True) if x is not None else "–"
+            vals["trades"].setText(str(st["trades"]))
+            vals["wl"].setText(f"{st['wins']} / {st['losses']}")
+            vals["winrate"].setText(f"{st['winrate'] * 100:.0f}%" if st["winrate"] is not None else "–")
+            vals["avg_win"].setText(opt(st["avg_win"]))
+            vals["avg_loss"].setText(opt(st["avg_loss"]))
+            vals["best"].setText(opt(st["best"]))
+            vals["worst"].setText(opt(st["worst"]))
+            vals["open"].setText(str(st["open_positions"]))
 
         rows = [[a, c, f"{i:.0f}", f"{o:.0f}", f"{u:.4f}"] for a, c, i, o, u in query(
             "SELECT agent, COUNT(*), AVG(input_tokens), AVG(output_tokens), SUM(usd) FROM api_usage "
@@ -384,6 +459,8 @@ class SettingsPage(QWidget):
         self.model_chief = QComboBox()
         self.model_chief.addItems(["(zelfde als agents)"] + settings.MODELS)
         f.addRow("Model Chief", self.model_chief)
+        self.shorts_on = QCheckBox("Chief mag ook shorts kiezen (alleen simulatie, geen echt geld)")
+        f.addRow("Shorten", self.shorts_on)
         f.addRow("", lab("Haiku kost ongeveer $1 per maand, Sonnet voor alles ongeveer $20.", "hint", wrap=True))
         v.addWidget(g)
 
@@ -423,6 +500,7 @@ class SettingsPage(QWidget):
         num("max_spread_pct", "Max spread", 0.05, 2, 0.05, 2, " %")
         num("cooldown_hours_after_stop", "Pauze na stop-loss", 0, 72, 1, 0, " uur")
         num("fee_pct", "Bitvavo-fee per order", 0, 1, 0.05, 2, " %")
+        num("short_borrow_pct_day", "Leenkosten short (aanname)", 0, 1, 0.01, 3, " % per dag")
         self.size_hint = lab("", "hint", wrap=True)
         f.addRow("", self.size_hint)
         for s in self.r.values():
@@ -537,6 +615,7 @@ class SettingsPage(QWidget):
         self.rm_token.setText(rc.get("token", ""))
         self.model.setCurrentText(cfg.get("model") or settings.MODELS[0])
         self.model_chief.setCurrentText(cfg.get("model_chief") or "(zelfde als agents)")
+        self.shorts_on.setChecked(bool(cfg.get("shorts_sim", True)))
         for key, s in self.r.items():
             s.setValue(cfg["rules"].get(key, settings.DEFAULTS["rules"][key]))
         sp = cfg["rules"].get("stop_pct", {})
@@ -563,6 +642,7 @@ class SettingsPage(QWidget):
         cfg["model"] = self.model.currentText()
         mc = self.model_chief.currentText()
         cfg["model_chief"] = "" if mc.startswith("(") else mc
+        cfg["shorts_sim"] = self.shorts_on.isChecked()
         cfg["rules"] = self.collect_rules()
         cfg["remote"] = {"enabled": self.rm_on.isChecked(), "url": self.rm_url.text().strip(),
                          "token": self.rm_token.text().strip()}

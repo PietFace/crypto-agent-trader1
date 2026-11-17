@@ -56,11 +56,13 @@ PROMPTS = {
                "\"max 2 zinnen\"}." + JSON_RULE,
     "chief": "Je bent de Chief: je beslist over een kleine portefeuille (ongeveer 100 euro, posities van hooguit 20 euro). "
              "Je krijgt de rapporten van Charts, News, Sentiment en Skeptic, plus de huidige positie. "
-             "Kies buy, sell of hold. 'hold' is de standaard: handel alleen bij een duidelijke edge en "
-             "als de Skeptic geen zwaarwegend bezwaar heeft. Een kleine portefeuille kan zich geen "
-             "dure foutjes veroorloven. Stop-loss en koersdoel worden automatisch gezet. "
-             "Geef JSON: {\"action\": \"buy|sell|hold\", \"amount_eur\": getal "
-             "(alleen bij buy), \"confidence\": 0..1, \"reason\": \"max 3 zinnen\"}." + JSON_RULE,
+             "Kies buy, sell, short, cover of hold. buy = kopen omdat je een stijging verwacht; sell = een "
+             "bestaande koop-positie sluiten; short = inzetten op een daling (alleen als er geen short-positie "
+             "is); cover = een bestaande short sluiten. 'hold' is de standaard: handel alleen bij een "
+             "duidelijke edge en als de Skeptic geen zwaarwegend bezwaar heeft. Een kleine portefeuille kan "
+             "zich geen dure foutjes veroorloven. Stop-loss en koersdoel worden automatisch gezet. "
+             "Geef JSON: {\"action\": \"buy|sell|short|cover|hold\", \"amount_eur\": getal "
+             "(alleen bij buy of short), \"confidence\": 0..1, \"reason\": \"max 3 zinnen\"}." + JSON_RULE,
 }
 
 
@@ -115,7 +117,15 @@ def init_db(path):
             verdict TEXT, amount_eur REAL, risk_eur REAL, decider TEXT, reasons TEXT);
         CREATE TABLE IF NOT EXISTS api_usage(id INTEGER PRIMARY KEY, ts TEXT, agent TEXT,
             model TEXT, input_tokens INTEGER, output_tokens INTEGER, usd REAL);
+        CREATE TABLE IF NOT EXISTS short_positions(
+            market TEXT PRIMARY KEY, amount REAL, entry_price REAL, cost_eur REAL, opened TEXT);
+        CREATE TABLE IF NOT EXISTS short_trades(
+            id INTEGER PRIMARY KEY, ts TEXT, market TEXT, side TEXT, amount REAL,
+            price REAL, eur REAL, fee REAL, pnl REAL, reason TEXT);
         """)
+        cols = [r[1] for r in con.execute("PRAGMA table_info(risk_log)")]
+        if "book" not in cols:
+            con.execute("ALTER TABLE risk_log ADD COLUMN book TEXT DEFAULT 'long'")
 
 
 class Engine:
@@ -143,6 +153,7 @@ class Engine:
         self.next_cycle = None
         self.busy = False
         self.cycle_id = None
+        self.shorts = bool(cfg.get("shorts_sim", True))
         self._thinking_ok = True
         init_db(self.db_path)
         rc = cfg.get("remote") or {}
@@ -319,16 +330,17 @@ class Engine:
             return {"fout": str(e)[:300], "score": 0}
 
     # ---------- risicopoort ----------
-    def risk_check_buy(self, market, amount_eur, confidence):
+    def risk_check_buy(self, market, amount_eur, confidence, book="long"):
         with self.db() as con:
             res = risk_gate.check_buy(con, market, amount_eur, confidence, self.spread_pct(market),
-                                      stop_file=settings.stop_path(), rules=self.rules)
-            risk_gate.log_verdict(con, market, res)
+                                      stop_file=settings.stop_path(), rules=self.rules, book=book)
+            risk_gate.log_verdict(con, market, res, book)
         self.last_verdict = res
         if res["verdict"] == "BLOCK":
             return 0, "; ".join(res["reasons"])
-        plan = risk_gate.exit_plan(self.rules, market, self.price(market))
-        self.log(f"  PASS €{res['amount_eur']:.2f} (grens: {res['decider']}, risico €{res['risk_eur']:.2f}), "
+        plan = risk_gate.exit_plan(self.rules, market, self.price(market), book)
+        tag = "PASS (short, simulatie)" if book == "short" else "PASS"
+        self.log(f"  {tag} €{res['amount_eur']:.2f} (grens: {res['decider']}, risico €{res['risk_eur']:.2f}), "
                  f"stop {fmt_px(plan['stop_price'])}, doel {fmt_px(plan['target_price'])}", "good")
         return res["amount_eur"], "ok"
 
@@ -406,6 +418,52 @@ class Engine:
             if why:
                 self.log(f"[exit] {market}: {why}", "info")
                 self.execute_sell(market, why)
+        for market, pos in self.get_short_positions().items():
+            why = risk_gate.exit_signal(self.rules, market, pos["entry_price"], self.price(market), "short")
+            if why:
+                self.log(f"[exit short] {market}: {why}", "info")
+                self.close_short(market, why)
+
+    # ---------- shorts (altijd simulatie) ----------
+    def get_short_positions(self):
+        with self.db() as con:
+            return {r["market"]: dict(r) for r in con.execute("SELECT * FROM short_positions")}
+
+    def open_short(self, market, eur, reason):
+        """Gesimuleerde short: je 'leent' de munt en verkoopt hem tegen de huidige koers."""
+        px = self.price(market)
+        fee = eur * self.rules["fee_pct"] / 100
+        amount = eur / px
+        with self.db() as con:
+            con.execute("INSERT INTO short_positions VALUES(?,?,?,?,?)", (market, amount, px, eur, now()))
+            con.execute("INSERT INTO short_trades(ts,market,side,amount,price,eur,fee,pnl,reason) "
+                        "VALUES(?,?,?,?,?,?,?,?,?)", (now(), market, "short", amount, px, eur, fee, 0, reason))
+        self.push_trade(market, "short", eur, px, 0, reason, sim=True)
+        self.log(f"  SIM SHORT {market}: €{eur:.2f} @ {fmt_px(px)}", "good")
+
+    def short_pnl(self, pos, px):
+        """Resultaat van een short bij koers px: koersdaling min fees en leenkosten."""
+        fee_rate = self.rules["fee_pct"] / 100
+        days = max(0.0, (datetime.now(timezone.utc) - datetime.fromisoformat(pos["opened"])).total_seconds() / 86400)
+        borrow = pos["cost_eur"] * float(self.rules.get("short_borrow_pct_day", 0.05)) / 100 * days
+        gross = pos["amount"] * (pos["entry_price"] - px)
+        fees = pos["cost_eur"] * fee_rate + pos["amount"] * px * fee_rate
+        return gross - fees - borrow, fees, borrow
+
+    def close_short(self, market, reason):
+        pos = self.get_short_positions().get(market)
+        if not pos:
+            return
+        px = self.price(market)
+        pnl, fees, borrow = self.short_pnl(pos, px)
+        with self.db() as con:
+            con.execute("DELETE FROM short_positions WHERE market=?", (market,))
+            con.execute("INSERT INTO short_trades(ts,market,side,amount,price,eur,fee,pnl,reason) "
+                        "VALUES(?,?,?,?,?,?,?,?,?)",
+                        (now(), market, "cover", pos["amount"], px, pos["amount"] * px, fees + borrow, pnl, reason))
+        self.push_trade(market, "cover", pos["amount"] * px, px, pnl, reason, sim=True)
+        self.log(f"  SIM SHORT SLUITEN {market} @ {fmt_px(px)} (resultaat {pnl:+.2f}, waarvan leenkosten "
+                 f"{borrow:.2f})", "good" if pnl >= 0 else "bad")
 
     # ---------- cyclus ----------
     def run_cycle(self):
@@ -423,13 +481,19 @@ class Engine:
                 self.log(f"{market}: data-fout {e}", "bad")
                 continue
             pos = self.get_positions().get(market)
+            spos = self.get_short_positions().get(market) if self.shorts else None
             charts = self.ask("charts", ind)
             news_r = self.ask("news", {"market": market, "headlines": news})
             reports = {"charts": charts, "news": news_r, "sentiment": sentiment}
             skeptic = self.ask("skeptic", {"market": market, "indicatoren": ind, "rapporten": reports,
                                            "positie": pos})
-            decision = self.ask("chief", {"market": market, "indicatoren": ind, "rapporten": reports,
-                                          "skeptic": skeptic, "positie": pos})
+            chief_in = {"market": market, "indicatoren": ind, "rapporten": reports,
+                        "skeptic": skeptic, "positie": pos}
+            if self.shorts:
+                chief_in["short_positie"] = spos
+            else:
+                chief_in["let_op"] = "short en cover zijn uitgeschakeld"
+            decision = self.ask("chief", chief_in)
             for name, out in [("charts", charts), ("news", news_r), ("skeptic", skeptic), ("chief", decision)]:
                 self.log_agent(market, name, out)
                 if "fout" in out and name != "chief":
@@ -453,13 +517,25 @@ class Engine:
             elif action == "sell" and pos:
                 self.execute_sell(market, decision.get("reason", ""))
                 executed = True
+            elif action == "short" and self.shorts and not spos:
+                amount, why = self.risk_check_buy(market, float(decision.get("amount_eur", 0) or 0),
+                                                  float(decision.get("confidence", 0) or 0), book="short")
+                if amount:
+                    self.open_short(market, amount, decision.get("reason", ""))
+                    executed = True
+                else:
+                    self.log(f"  risicopoort blokkeert short: {why}", "muted")
+            elif action == "cover" and spos:
+                self.close_short(market, decision.get("reason", ""))
+                executed = True
             self.push_decision(market, ind, charts, news_r, sentiment, skeptic, decision, executed)
 
     # ---------- op afstand meekijken ----------
-    def push_trade(self, market, side, eur_amount, price, pnl, reason):
+    def push_trade(self, market, side, eur_amount, price, pnl, reason, sim=False):
         if self.remote:
             self.remote.push("trade", {"ts": now(), "market": market, "side": side, "eur": round(eur_amount, 2),
-                                       "price": price, "pnl": round(pnl, 2), "live": self.live, "reason": reason})
+                                       "price": price, "pnl": round(pnl, 2), "live": self.live and not sim,
+                                       "sim": sim, "reason": reason})
 
     def push_decision(self, market, ind, charts, news_r, sentiment, skeptic, decision, executed):
         if not self.remote:
@@ -490,6 +566,14 @@ class Engine:
                 positions.append({"market": r["market"], "cost_eur": round(r["cost_eur"], 2),
                                   "entry": r["entry_price"], "stop": plan["stop_price"],
                                   "target": plan["target_price"], "opened": r["opened"]})
+            short_positions = []
+            for r in con.execute("SELECT * FROM short_positions"):
+                plan = risk_gate.exit_plan(self.rules, r["market"], r["entry_price"], "short")
+                short_positions.append({"market": r["market"], "cost_eur": round(r["cost_eur"], 2),
+                                        "entry": r["entry_price"], "stop": plan["stop_price"],
+                                        "target": plan["target_price"], "opened": r["opened"]})
+            stats = {"long": risk_gate.book_stats(con, "long"), "short": risk_gate.book_stats(con, "short")}
+        stats["long"]["open_pnl"], stats["short"]["open_pnl"] = self.open_pnl()
         nxt = None
         if running and self.next_cycle:
             nxt = datetime.fromtimestamp(self.next_cycle, timezone.utc).isoformat(timespec="seconds")
@@ -498,7 +582,19 @@ class Engine:
                 "btc_hold_eur": b["btc_hold_eur"] if b else None, "today_pnl": round(pnl, 2),
                 "buys_today": buys, "sells_today": sells, "daily_limit": self.rules["daily_loss_limit_eur"],
                 "api_usd_30d": round(usd, 4), "api_calls_30d": calls, "markets": self.markets,
-                "positions": positions}
+                "positions": positions, "short_positions": short_positions, "stats": stats}
+
+    def open_pnl(self):
+        """Open resultaat (long, short) tegen de huidige koersen."""
+        lp = sp = 0.0
+        try:
+            for m, p in self.get_positions().items():
+                lp += p["amount"] * self.price(m) * (1 - self.rules["fee_pct"] / 100) - p["cost_eur"]
+            for m, p in self.get_short_positions().items():
+                sp += self.short_pnl(p, self.price(m))[0]
+        except Exception:
+            pass
+        return round(lp, 2), round(sp, 2)
 
     def push_status(self, running):
         if self.remote:
