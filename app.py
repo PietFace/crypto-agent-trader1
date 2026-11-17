@@ -561,6 +561,9 @@ class SettingsPage(QWidget):
         self.rm_result.setText("Bezig…")
         QApplication.processEvents()
         ok, msg = remote.test(self.rm_url.text(), self.rm_token.text())
+        if ok and not self.rm_on.isChecked():
+            self.rm_on.setChecked(True)
+            msg += " Versturen staat nu aan: klik op Opslaan en start de bot opnieuw."
         self.rm_result.setText(msg)
         self.rm_result.setStyleSheet(f"color: {C['good'] if ok else C['bad']};")
 

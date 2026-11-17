@@ -196,6 +196,8 @@ class Engine:
         self.log(f"Bot gestart ({'LIVE' if self.live else 'droog draaien'}): max €{self.rules['max_loss_per_trade_eur']} "
                  f"verlies per trade, max {self.rules['max_positions']} posities, daglimiet "
                  f"€{self.rules['daily_loss_limit_eur']}.", "info")
+        self.log("Op afstand meekijken: " + ("aan, de stand gaat naar je telefoon." if self.remote else
+                 "uit (zet het aan onder Instellingen > Op afstand meekijken)."), "info" if self.remote else "muted")
         last_cycle = 0.0
         while not self._stop.is_set():
             if Path(settings.stop_path()).exists():
