@@ -509,7 +509,17 @@ class SettingsPage(QWidget):
         for m in [m for m, c in self.m_checks.items() if c.isChecked()]:
             amt, why = risk_gate.size_buy(rules, m, rules["max_trade_eur"], 0)
             parts.append(f"{m.split('-')[0]} max {eur(amt)}")
-        self.size_hint.setText("Grootste aankoop met deze regels: " + ", ".join(parts) if parts else "")
+        text = "Grootste aankoop met deze regels: " + ", ".join(parts) if parts else ""
+        too_small = [m.split('-')[0] for m in [m for m, c in self.m_checks.items() if c.isChecked()]
+                     if risk_gate.size_buy(rules, m, rules["max_trade_eur"], 0)[0] < rules["min_order_eur"]]
+        if too_small:
+            text += (f"\n⚠ Voor {', '.join(too_small)} is dat minder dan het Bitvavo-minimum van "
+                     f"{eur(rules['min_order_eur'])}: die aankopen worden altijd geblokkeerd. "
+                     "Verhoog 'Max verlies per trade'.")
+            self.size_hint.setStyleSheet(f"color: {C['accent2']};")
+        else:
+            self.size_hint.setStyleSheet("")
+        self.size_hint.setText(text)
 
     def load(self, cfg):
         self._loading = True

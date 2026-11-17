@@ -122,6 +122,7 @@ class Engine:
         self.next_cycle = None
         self.busy = False
         self.cycle_id = None
+        self._thinking_ok = True
         init_db(self.db_path)
         rc = cfg.get("remote") or {}
         self.remote = None
@@ -263,18 +264,38 @@ class Engine:
             return None
 
     # ---------- agents ----------
+    def _create(self, agent, payload, no_thinking=True):
+        kwargs = dict(model=self.models[agent], max_tokens=800, system=PROMPTS[agent],
+                      messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}])
+        if no_thinking:
+            # Nadenken is hier niet nodig: korte JSON-antwoorden, en het kost extra tokens.
+            kwargs["thinking"] = {"type": "disabled"}
+        return self.ai.messages.create(**kwargs)
+
     def ask(self, agent, payload):
         try:
-            r = self.ai.messages.create(
-                model=self.models[agent], max_tokens=500, system=PROMPTS[agent],
-                messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}])
+            try:
+                r = self._create(agent, payload, no_thinking=self._thinking_ok)
+            except anthropic.BadRequestError as e:
+                if self._thinking_ok and "thinking" in str(e).lower():
+                    self._thinking_ok = False  # model kent deze optie niet: zonder opnieuw
+                    r = self._create(agent, payload, no_thinking=False)
+                else:
+                    raise
             kosten.log_usage(agent, self.models[agent], r.usage, self.db_path)
-            text = r.content[0].text.strip()
+            # Alleen de tekstblokken: modellen kunnen ook denk-blokken teruggeven.
+            text = "".join(getattr(b, "text", "") for b in r.content
+                           if getattr(b, "type", "") == "text").strip()
+            if not text:
+                return {"fout": "leeg antwoord (geen tekst)", "score": 0}
             if text.startswith("```"):
                 text = text.strip("`").removeprefix("json").strip()
+            start, end = text.find("{"), text.rfind("}")
+            if start > 0 or (end != -1 and end < len(text) - 1):
+                text = text[start:end + 1]
             return json.loads(text)
         except Exception as e:
-            return {"fout": str(e), "score": 0}
+            return {"fout": str(e)[:300], "score": 0}
 
     # ---------- risicopoort ----------
     def risk_check_buy(self, market, amount_eur, confidence):
@@ -384,6 +405,8 @@ class Engine:
                                           "skeptic": skeptic, "positie": pos})
             for name, out in [("charts", charts), ("news", news_r), ("skeptic", skeptic), ("chief", decision)]:
                 self.log_agent(market, name, out)
+                if "fout" in out and name != "chief":
+                    self.log(f"{market}: {name}-agent gaf geen antwoord ({out['fout'][:120]})", "bad")
             self.last_verdict = None
             executed = False
             if "fout" in decision:
