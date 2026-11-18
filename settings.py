@@ -23,7 +23,7 @@ DEFAULTS = {
     "fast_cooldown_min": 30,
     "reopen_pause_min": 60,  # na zelf sluiten zo lang niet opnieuw dezelfde kant op  # per munt hooguit eens per zoveel minuten Skeptic+Chief tussendoor
     "followers": {
-        "enabled": True, "auto": True, "count": 20, "manual": [],
+        "enabled": True, "auto": True, "invo": True, "count": 20, "manual": [],
         "min_traders": 4, "min_consensus": 0.6, "use_as_setup": True,
         "exit_on_flip": True,  # positie sluiten als de volgers duidelijk de andere kant op draaien
     },  # Chief mag shorts kiezen; die worden alleen gesimuleerd

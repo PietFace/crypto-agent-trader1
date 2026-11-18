@@ -3,3 +3,4 @@ python-bitvavo-api
 feedparser
 requests
 PySide6
+lz4

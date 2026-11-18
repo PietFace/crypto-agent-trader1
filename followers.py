@@ -21,6 +21,11 @@ INFO_URL = "https://api.hyperliquid.xyz/info"
 _session = requests.Session()  # één verbinding hergebruiken: sneller bij elke 30 seconden
 LEADERBOARD_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
 LEADERBOARD_MAX_AGE = 24 * 3600
+# Invo (social trading-app) handelt via Hyperliquid met deze builder-code. Hyperliquid publiceert per dag
+# alle trades die via een builder-code liepen, inclusief het adres van de trader. Zo vinden we Invo-traders
+# zonder in te loggen bij Invo.
+INVO_BUILDER = "0x557edb253b1d7ed5f15b248a5a3fd919fa5d3c81"
+BUILDER_FILLS_URL = "https://stats-data.hyperliquid.xyz/Mainnet/builder_fills/{b}/{d}.csv.lz4"
 
 
 def now():
@@ -82,6 +87,41 @@ def fetch_leaderboard(cache_path, timeout=60):
     with open(cache_path, "w", encoding="utf-8") as f:
         json.dump(slim, f)
     return slim
+
+
+def fetch_invo_users(cache_path, days=7, timeout=60, log=lambda *a: None):
+    """Adressen die de afgelopen dagen via Invo handelden, met hun volume. {adres: volume_usd}. 24 uur in cache."""
+    if os.path.exists(cache_path) and time.time() - os.path.getmtime(cache_path) < LEADERBOARD_MAX_AGE:
+        try:
+            return json.load(open(cache_path, encoding="utf-8"))
+        except Exception:
+            pass
+    import csv
+    import io
+    import lz4.frame
+    from datetime import datetime, timedelta, timezone
+    vol = {}
+    today = datetime.now(timezone.utc).date()
+    for i in range(1, days + 1):
+        d = (today - timedelta(days=i)).strftime("%Y%m%d")
+        r = requests.get(BUILDER_FILLS_URL.format(b=INVO_BUILDER, d=d), timeout=timeout)
+        if r.status_code != 200:
+            continue
+        text = lz4.frame.decompress(r.content).decode("utf-8", "replace")
+        for row in csv.DictReader(io.StringIO(text)):
+            row = {k.strip().lower(): v for k, v in row.items() if k}
+            user = (row.get("user") or "").lower()
+            if not user.startswith("0x"):
+                continue
+            try:
+                usd = float(row.get("px") or 0) * float(row.get("sz") or 0)
+            except ValueError:
+                usd = 0.0
+            vol[user] = vol.get(user, 0.0) + usd
+    if vol:
+        json.dump(vol, open(cache_path, "w", encoding="utf-8"))
+    log(f"Volgers: {len(vol)} Invo-traders gevonden in de afgelopen {days} dagen", "info")
+    return vol
 
 
 def pick_traders(rows, n=10, min_account=50_000):
@@ -164,13 +204,30 @@ class Followers:
             except Exception as e:
                 self.log(f"Volgers: leaderboard niet op te halen ({e})", "bad")
         by_addr = {r["address"].lower(): r for r in rows if r.get("address")}
+        invo = {}
+        if self.cfg.get("auto", True) and self.cfg.get("invo", True):
+            try:
+                invo = fetch_invo_users(os.path.join(os.path.dirname(self.cache), "invo_users.json"), log=self.log)
+            except Exception as e:
+                self.log(f"Volgers: Invo-traders niet op te halen ({e})", "bad")
         chosen = []
         for a in manual:
             r = by_addr.get(a, {"address": a, "name": "", "account_value": 0,
                                 "month": {"pnl": 0, "roi": 0}, "alltime": {"pnl": 0}})
             chosen.append((r, "eigen"))
+        if invo:
+            # Maximaal de helft van de plekken voor Invo-traders; zelfde filters, wel kleinere accounts toegestaan.
+            invo_rows = [r for r in rows if r.get("address") and r["address"].lower() in invo]
+            room = max(0, n // 2)
+            for r in pick_traders(invo_rows, n=room + len(manual), min_account=10_000):
+                if r["address"].lower() not in manual and sum(1 for _, s in chosen if s == "invo") < room \
+                        and len(chosen) < n:
+                    chosen.append((r, "invo"))
+        taken = {r["address"].lower() for r, _ in chosen}
         if self.cfg.get("auto", True):
-            for r in pick_traders(rows, n=max(0, n - len(manual)) + len(manual)):
+            for r in pick_traders(rows, n=n + len(taken)):
+                if r["address"].lower() in taken:
+                    continue
                 if r["address"].lower() not in manual and len(chosen) < n:
                     chosen.append((r, "leaderboard"))
         if not chosen:
@@ -187,6 +244,7 @@ class Followers:
         self.last_refresh = time.time()
         self.log(f"Volgers: {len(chosen)} traders gekozen "
                  f"({sum(1 for _, s in chosen if s == 'eigen')} eigen, "
+                 f"{sum(1 for _, s in chosen if s == 'invo')} via Invo, "
                  f"{sum(1 for _, s in chosen if s == 'leaderboard')} van het leaderboard).", "info")
         return self.traders()
 

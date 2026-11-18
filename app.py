@@ -945,6 +945,8 @@ class SettingsPage(QWidget):
         f.addRow("", self.fw_exit)
         self.fw_auto = QCheckBox("Automatisch kiezen van het leaderboard")
         f.addRow("", self.fw_auto)
+        self.fw_invo = QCheckBox("Ook traders die via Invo handelen (tot de helft van de plekken)")
+        f.addRow("", self.fw_invo)
         self.fw_count = QSpinBox()
         self.fw_count.setRange(3, 50)
         f.addRow("Aantal traders", self.fw_count)
@@ -1099,6 +1101,7 @@ class SettingsPage(QWidget):
         self.fw_on.setChecked(bool(fc.get("enabled", True)))
         self.fw_setup.setChecked(bool(fc.get("use_as_setup", True)))
         self.fw_auto.setChecked(bool(fc.get("auto", True)))
+        self.fw_invo.setChecked(bool(fc.get("invo", True)))
         self.fw_exit.setChecked(bool(fc.get("exit_on_flip", True)))
         self.fw_count.setValue(int(fc.get("count", 10)))
         self.fw_min.setValue(int(fc.get("min_traders", 3)))
@@ -1152,7 +1155,8 @@ class SettingsPage(QWidget):
         cfg["max_api_usd_month"] = round(self.api_cap.value(), 2)
         cfg["rules"] = self.collect_rules()
         cfg["followers"] = {"enabled": self.fw_on.isChecked(), "use_as_setup": self.fw_setup.isChecked(),
-                            "auto": self.fw_auto.isChecked(), "count": self.fw_count.value(),
+                            "auto": self.fw_auto.isChecked(), "invo": self.fw_invo.isChecked(),
+                            "count": self.fw_count.value(),
                             "exit_on_flip": self.fw_exit.isChecked(),
                             "min_traders": self.fw_min.value(), "min_consensus": round(self.fw_cons.value(), 1),
                             "manual": [x.strip() for x in self.fw_manual.toPlainText().splitlines()
