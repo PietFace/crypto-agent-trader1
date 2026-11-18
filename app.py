@@ -1144,6 +1144,13 @@ class MainWindow(QMainWindow):
                                    "De bot begint altijd met droog draaien (geen echte orders).")
             self.sets.note.show()
 
+        # Backtest-verzoeken van de website (alleen backtests, niets anders)
+        try:
+            from remote_jobs import JobRunner
+            self.jobs = JobRunner(lambda: self.cfg, self.log)
+        except Exception:
+            self.jobs = None
+
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
         self.timer.start(500)
