@@ -180,7 +180,8 @@ class BotPage(QWidget):
         pv = QVBoxLayout(pos_card)
         pv.setContentsMargins(14, 12, 14, 12)
         pv.addWidget(lab("OPEN POSITIES", "cap"))
-        self.pos = table(["Soort", "Munt", "Ingelegd", "Instapkoers", "Stop-loss", "Koersdoel", "Sinds"])
+        self.pos = table(["Soort", "Munt", "Ingelegd", "Instapkoers", "Koers nu", "Waarde nu", "Resultaat",
+                          "Stop-loss", "Koersdoel", "Sinds"])
         self.pos.setMaximumHeight(150)
         pv.addWidget(self.pos)
         v.addWidget(pos_card)
@@ -225,13 +226,26 @@ class BotPage(QWidget):
             self.next_lbl.setText("")
 
         b = query("SELECT bot_eur, btc_hold_eur, ts FROM benchmark ORDER BY id DESC LIMIT 1")
+        meta = dict(query("SELECT key, value FROM meta WHERE key IN ('btc_price_now','btc_start_price','marks_ts')"))
+        if meta.get("marks_ts"):
+            realized = (query("SELECT COALESCE(SUM(pnl),0) FROM trades WHERE side='sell'") or [[0]])[0][0]
+            open_pnl = (query("SELECT COALESCE(SUM(pnl_eur),0) FROM position_marks WHERE book='long'") or [[0]])[0][0]
+            live_bot = budget + realized + open_pnl
+            live_hold = b[0][1] if b else None
+            try:
+                live_hold = budget * float(meta["btc_price_now"]) / float(meta["btc_start_price"])
+            except Exception:
+                pass
+            b = [(live_bot, live_hold, meta["marks_ts"])]
         if b:
             bot_eur, hold, ts = b[0]
-            self.t_bot.set(eur(bot_eur), f"{eur(bot_eur - budget, True)} sinds de start",
+            self.t_bot.set(eur(bot_eur), f"{eur(bot_eur - budget, True)} sinds de start · live {local_time(ts)}",
                            C["good"] if bot_eur >= budget else C["bad"])
-            diff = bot_eur - hold
-            self.t_btc.set(eur(hold), f"bot {eur(diff, True)} t.o.v. BTC · {local_time(ts)}",
-                           None)
+            if hold is not None:
+                diff = bot_eur - hold
+                self.t_btc.set(eur(hold), f"bot {eur(diff, True)} t.o.v. BTC", None)
+            else:
+                self.t_btc.set("–", "start na de eerste analyse")
         else:
             self.t_bot.set(eur(budget), "nog geen analyse gedraaid")
             self.t_btc.set("–", "start na de eerste analyse")
@@ -249,18 +263,37 @@ class BotPage(QWidget):
         usd, calls = cost[0] if cost else (0, 0)
         self.t_cost.set(f"$ {usd:.2f}".replace(".", ","), f"{calls} aanroepen")
 
+        marks = {(bk, m): (px, v, p) for bk, m, px, v, p in query(
+            "SELECT book, market, price, value_eur, pnl_eur FROM position_marks")}
+
+        def live_cols(mk, cost):
+            if not mk:
+                return ["…", "…", "…"]
+            px, v, p = mk
+            pct = p / cost * 100 if cost else 0
+            return [fmt_px(px), eur(v), f"{eur(p, True)} ({pct:+.1f}%)"]
+
         rows = []
         for market, amount, entry, cost_eur, opened in query(
                 "SELECT market, amount, entry_price, cost_eur, opened FROM positions"):
             plan = risk_gate.exit_plan(rules, market, entry)
-            rows.append(["kopen", market, eur(cost_eur), fmt_px(entry), fmt_px(plan['stop_price']),
-                         fmt_px(plan['target_price']), local_time(opened)])
+            mk = marks.get(("long", market))
+            rows.append(["kopen", market, eur(cost_eur), fmt_px(entry), *live_cols(mk, cost_eur),
+                         fmt_px(plan['stop_price']), fmt_px(plan['target_price']), local_time(opened)])
         for market, amount, entry, cost_eur, opened in query(
                 "SELECT market, amount, entry_price, cost_eur, opened FROM short_positions"):
             plan = risk_gate.exit_plan(rules, market, entry, "short")
-            rows.append(["short (sim)", market, eur(cost_eur), fmt_px(entry), fmt_px(plan['stop_price']),
-                         fmt_px(plan['target_price']), local_time(opened)])
+            mk = marks.get(("short", market))
+            rows.append(["short (sim)", market, eur(cost_eur), fmt_px(entry), *live_cols(mk, cost_eur),
+                         fmt_px(plan['stop_price']), fmt_px(plan['target_price']), local_time(opened)])
         fill(self.pos, rows)
+        from PySide6.QtGui import QColor
+        for r, row in enumerate(rows):
+            it = self.pos.item(r, 6)
+            if it and it.text().startswith("€ +") and not it.text().startswith("€ +0,00"):
+                it.setForeground(QColor(C["good"]))
+            elif it and it.text().startswith("€ -"):
+                it.setForeground(QColor(C["bad"]))
         if not rows:
             self.pos.setRowCount(0)
 

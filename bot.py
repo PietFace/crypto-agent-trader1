@@ -184,6 +184,9 @@ def init_db(path):
             verdict TEXT, amount_eur REAL, risk_eur REAL, decider TEXT, reasons TEXT);
         CREATE TABLE IF NOT EXISTS api_usage(id INTEGER PRIMARY KEY, ts TEXT, agent TEXT,
             model TEXT, input_tokens INTEGER, output_tokens INTEGER, usd REAL);
+        CREATE TABLE IF NOT EXISTS position_marks(
+            book TEXT, market TEXT, price REAL, value_eur REAL, pnl_eur REAL, ts TEXT,
+            PRIMARY KEY(book, market));
         CREATE TABLE IF NOT EXISTS short_positions(
             market TEXT PRIMARY KEY, amount REAL, entry_price REAL, cost_eur REAL, opened TEXT);
         CREATE TABLE IF NOT EXISTS short_trades(
@@ -506,17 +509,34 @@ class Engine:
                  "good" if pnl >= 0 else "bad")
 
     def check_exits(self):
-        """Stop-loss en koersdoel. Verkopen wordt nooit geblokkeerd."""
+        """Stop-loss en koersdoel, en de actuele waarde van elke open positie. Verkopen wordt nooit geblokkeerd."""
+        fee = self.rules["fee_pct"] / 100
+        marks = []
         for market, pos in self.get_positions().items():
-            why = risk_gate.exit_signal(self.rules, market, pos["entry_price"], self.price(market))
+            px = self.price(market)
+            value = pos["amount"] * px * (1 - fee)  # wat je na verkoop (incl. fee) zou krijgen
+            marks.append(("long", market, px, value, value - pos["cost_eur"]))
+            why = risk_gate.exit_signal(self.rules, market, pos["entry_price"], px)
             if why:
                 self.log(f"[exit] {market}: {why}", "info")
                 self.execute_sell(market, why)
         for market, pos in self.get_short_positions().items():
-            why = risk_gate.exit_signal(self.rules, market, pos["entry_price"], self.price(market), "short")
+            px = self.price(market)
+            pnl = self.short_pnl(pos, px)[0]
+            marks.append(("short", market, px, pos["cost_eur"] + pnl, pnl))
+            why = risk_gate.exit_signal(self.rules, market, pos["entry_price"], px, "short")
             if why:
                 self.log(f"[exit short] {market}: {why}", "info")
                 self.close_short(market, why)
+        try:
+            self.meta_set("btc_price_now", self.price("BTC-EUR"))
+            self.meta_set("marks_ts", now())
+        except Exception:
+            pass
+        with self.db() as con:
+            con.execute("DELETE FROM position_marks")
+            con.executemany("INSERT INTO position_marks(book,market,price,value_eur,pnl_eur,ts) VALUES(?,?,?,?,?,?)",
+                            [(b, m, px, v, p, now()) for b, m, px, v, p in marks])
 
     # ---------- shorts (altijd simulatie) ----------
     def get_short_positions(self):
@@ -776,28 +796,54 @@ class Engine:
             since = datetime.fromtimestamp(since, timezone.utc).isoformat()
             usd, calls = con.execute("SELECT COALESCE(SUM(usd),0), COUNT(*) FROM api_usage WHERE ts >= ?",
                                      (since,)).fetchone()
+            marks = {(r["book"], r["market"]): dict(r) for r in con.execute("SELECT * FROM position_marks")}
             positions = []
             for r in con.execute("SELECT market, cost_eur, entry_price, opened FROM positions"):
                 plan = risk_gate.exit_plan(self.rules, r["market"], r["entry_price"])
+                mk = marks.get(("long", r["market"])) or {}
                 positions.append({"market": r["market"], "cost_eur": round(r["cost_eur"], 2),
                                   "entry": r["entry_price"], "stop": plan["stop_price"],
-                                  "target": plan["target_price"], "opened": r["opened"]})
+                                  "target": plan["target_price"], "opened": r["opened"],
+                                  "price_now": mk.get("price"), "value_now": round(mk["value_eur"], 2) if mk else None,
+                                  "pnl_now": round(mk["pnl_eur"], 2) if mk else None,
+                                  "pnl_pct": round(mk["pnl_eur"] / r["cost_eur"] * 100, 2) if mk and r["cost_eur"] else None,
+                                  "marked_at": mk.get("ts")})
             short_positions = []
             for r in con.execute("SELECT * FROM short_positions"):
                 plan = risk_gate.exit_plan(self.rules, r["market"], r["entry_price"], "short")
+                mk = marks.get(("short", r["market"])) or {}
                 short_positions.append({"market": r["market"], "cost_eur": round(r["cost_eur"], 2),
                                         "entry": r["entry_price"], "stop": plan["stop_price"],
-                                        "target": plan["target_price"], "opened": r["opened"]})
+                                        "target": plan["target_price"], "opened": r["opened"],
+                                        "price_now": mk.get("price"),
+                                        "value_now": round(mk["value_eur"], 2) if mk else None,
+                                        "pnl_now": round(mk["pnl_eur"], 2) if mk else None,
+                                        "pnl_pct": round(mk["pnl_eur"] / r["cost_eur"] * 100, 2) if mk and r["cost_eur"] else None,
+                                        "marked_at": mk.get("ts")})
             stats = {"long": risk_gate.book_stats(con, "long"), "short": risk_gate.book_stats(con, "short")}
             stats_bron = {bk: {br: risk_gate.book_stats(con, bk, br) for br in ("regels", "volgers", "beide")}
                           for bk in ("long", "short")}
         stats["long"]["open_pnl"], stats["short"]["open_pnl"] = self.open_pnl()
+        # Live: gerealiseerd resultaat + actuele waarde van open posities, en BTC vasthouden tegen de koers van nu.
+        open_value = sum(p["value_now"] or 0 for p in positions)
+        open_pnl = sum(p["pnl_now"] or 0 for p in positions)
+        live_bot = live_hold = None
+        try:
+            with self.db() as con:
+                realized = con.execute("SELECT COALESCE(SUM(pnl),0) FROM trades WHERE side='sell'").fetchone()[0]
+            live_bot = round(budget + realized + open_pnl, 2)
+            start = self.meta_get("btc_start_price")
+            if start:
+                live_hold = round(budget * self.price("BTC-EUR") / float(start), 2)
+        except Exception:
+            pass
         nxt = None
         if running and self.next_cycle:
             nxt = datetime.fromtimestamp(self.next_cycle, timezone.utc).isoformat(timespec="seconds")
         return {"ts": now(), "running": running, "live": self.live, "busy": self.busy, "next_cycle": nxt,
-                "budget": budget, "bot_eur": b["bot_eur"] if b else None,
-                "btc_hold_eur": b["btc_hold_eur"] if b else None, "today_pnl": round(pnl, 2),
+                "budget": budget, "bot_eur": live_bot if live_bot is not None else (b["bot_eur"] if b else None),
+                "btc_hold_eur": live_hold if live_hold is not None else (b["btc_hold_eur"] if b else None),
+                "open_value": round(open_value, 2), "open_pnl": round(open_pnl, 2), "today_pnl": round(pnl, 2),
                 "buys_today": buys, "sells_today": sells, "daily_limit": self.rules["daily_loss_limit_eur"],
                 "api_usd_30d": round(usd, 4), "api_calls_30d": calls, "markets": self.markets,
                 "positions": positions, "short_positions": short_positions, "stats": stats,
