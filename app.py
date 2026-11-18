@@ -774,11 +774,19 @@ class CopyPage(QWidget):
         self.find_status = lab("", "sub", wrap=True)
         v.addWidget(self.find_status)
         self.found = table(["Invo-naam", "Adres", "Treffers", "Account $ nu", "Account $ op Invo", "Stijl", "Zekerheid"])
-        self.found.setSelectionMode(QTableWidget.SingleSelection)
+        self.found.setSelectionMode(QTableWidget.ExtendedSelection)
         self.found.setSelectionBehavior(QTableWidget.SelectRows)
         self.found.cellDoubleClicked.connect(self._add_found)
         self.found.setMinimumHeight(180)
         v.addWidget(self.found)
+        addrow = QHBoxLayout()
+        self.add_btn = QPushButton("Geselecteerde toevoegen")
+        self.add_btn.clicked.connect(self._add_selected)
+        addrow.addWidget(self.add_btn)
+        addrow.addWidget(lab("Klik een regel aan (Ctrl-klik voor meer) en druk op deze knop. Dubbelklikken kan ook.",
+                             "hint"))
+        addrow.addStretch(1)
+        v.addLayout(addrow)
 
         v.addWidget(lab("OPEN KOPIEËN", "cap"))
         self.open_t = table(["Geopend", "Munt", "Kant", "Hefboom", "Positie", "Instap", "Noodstop", "Trader", "Echt"])
@@ -917,21 +925,46 @@ class CopyPage(QWidget):
                                          "accountwaarde die het dichtst bij Invo ligt. Dubbelklik om toe te voegen.")
 
     def _add_found(self, r, _c):
-        name = self.found.item(r, 0).text()
-        addr = self.found.item(r, 1).text()
-        style = self.found.item(r, 5).text()
-        if not addr.startswith("0x"):
+        self._add_rows([r])
+
+    def _add_selected(self):
+        rows = sorted({i.row() for i in self.found.selectedIndexes()})
+        if not rows:
+            self.find_status.setText("Klik eerst een gevonden trader aan in de tabel.")
             return
+        self._add_rows(rows)
+
+    def _add_rows(self, rows):
         text = self.traders.toPlainText().strip()
-        if addr in text.lower():
-            return
-        self.traders.setPlainText((text + "\n" if text else "") + f"{addr} {name} {style}")
-        if not self.on.isChecked():
+        added, already, skipped = [], [], []
+        for r in rows:
+            it_name, it_addr, it_style = self.found.item(r, 0), self.found.item(r, 1), self.found.item(r, 5)
+            if not it_addr:
+                continue
+            name, addr = it_name.text() if it_name else "", it_addr.text().strip().lower()
+            style = it_style.text() if it_style and it_style.text() in ("lang", "kort") else "lang"
+            if not addr.startswith("0x"):
+                skipped.append(name)
+                continue
+            if addr in text.lower():
+                already.append(name)
+                continue
+            text = (text + "\n" if text else "") + f"{addr} {name} {style}"
+            added.append(name)
+        self.traders.setPlainText(text)
+        if (added or already) and not self.on.isChecked():
             self.on.setChecked(True)          # droog, dus veilig: anders gebeurt er niets
         self.save()
-        self.find_status.setText(f"@{name} toegevoegd en opgeslagen; de kopieer-modus staat aan "
-                                 f"({'LIVE' if self.live.isChecked() else 'droog'}). Stop en start de bot om te "
-                                 "beginnen. In het logboek staat dan 'Kopieer-modus … kijken naar …'.")
+        msg = []
+        if added:
+            msg.append("toegevoegd: " + ", ".join("@" + n for n in added))
+        if already:
+            msg.append("stond al in de lijst: " + ", ".join("@" + n for n in already))
+        if skipped:
+            msg.append("niet gevonden, dus niets toe te voegen: " + ", ".join("@" + n for n in skipped))
+        self.find_status.setText(("; ".join(msg) + ". ") +
+                                 f"Opgeslagen, kopieer-modus staat aan ({'LIVE' if self.live.isChecked() else 'droog'}). "
+                                 "Stop en start de bot om te beginnen.")
 
     # --- tabellen
     def refresh(self):
