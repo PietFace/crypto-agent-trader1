@@ -82,12 +82,13 @@ def risk_per_eur(rules, market):
     return stop_pct(rules, market) / 100 + 2 * rules["fee_pct"] / 100
 
 
-def size_buy(rules, market, wanted_eur, invested_eur):
-    """Grootste bedrag binnen vier grenzen. Geeft (bedrag, welke grens besliste)."""
+def size_buy(rules, market, wanted_eur, invested_eur, realized_eur=0.0):
+    """Grootste bedrag binnen vier grenzen. Geeft (bedrag, welke grens besliste).
+    realized_eur: totaal gerealiseerd resultaat; verlies verkleint het beschikbare budget."""
     limits = {
         "Chief-voorstel": wanted_eur,
         "max per trade": rules["max_trade_eur"],
-        "budgetruimte": rules["budget_eur"] - invested_eur,
+        "budgetruimte": rules["budget_eur"] + min(0.0, realized_eur) - invested_eur,
         "max verlies per trade": rules["max_loss_per_trade_eur"] / risk_per_eur(rules, market),
     }
     decider = min(limits, key=limits.get)
@@ -164,7 +165,14 @@ def check_buy(con, market, wanted_eur, confidence, spread, stop_file="STOP", rul
         if datetime.now(timezone.utc) < wait:
             reasons.append(f"afkoelperiode na stop-loss tot {wait:%H:%M} UTC")
 
-    amount, decider = size_buy(rules, market, wanted_eur, invested)
+    realized_total = 0.0
+    for bk in BOOKS.values():
+        try:
+            realized_total += con.execute(f"SELECT COALESCE(SUM(pnl),0) FROM {bk['trades']} WHERE side=?",
+                                          (bk["close"],)).fetchone()[0]
+        except sqlite3.OperationalError:
+            pass
+    amount, decider = size_buy(rules, market, wanted_eur, invested, realized_total)
     new_risk = amount * risk_per_eur(rules, market)
     loss_so_far = max(0.0, -realized)
     if loss_so_far + open_risk + new_risk > rules["daily_loss_limit_eur"]:

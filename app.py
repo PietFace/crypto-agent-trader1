@@ -6,7 +6,7 @@ import sqlite3
 import sys
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QIcon, QTextCursor
+from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QFrame, QGridLayout, QGroupBox,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton, QScrollArea,
@@ -526,6 +526,200 @@ class FollowersPage(QWidget):
         fill(self.events, rows)
 
 
+class EquityChart(QWidget):
+    """Eenvoudige lijngrafiek: bot (goud) tegen BTC vasthouden (blauw)."""
+    def __init__(self):
+        super().__init__()
+        self.series = []
+        self.setMinimumHeight(220)
+
+    def set(self, series):
+        self.series = [s for s in series if s[1]]
+        self.update()
+
+    def paintEvent(self, e):
+        qp = QPainter(self)
+        qp.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        qp.fillRect(0, 0, w, h, QColor(C["card"]))
+        pts = [v for _, data in self.series for _, v in data]
+        if not pts:
+            qp.setPen(QColor(C["muted"]))
+            qp.drawText(self.rect(), Qt.AlignCenter, "Nog geen test gedraaid")
+            return
+        lo, hi = min(pts), max(pts)
+        if hi - lo < 1e-9:
+            hi = lo + 1
+        pad = 40
+        t0 = min(t for _, d in self.series for t, _ in d)
+        t1 = max(t for _, d in self.series for t, _ in d)
+        span = max(1, t1 - t0)
+
+        def xy(t, v):
+            return pad + (t - t0) / span * (w - pad - 10), 10 + (hi - v) / (hi - lo) * (h - 40)
+        qp.setPen(QPen(QColor(C["line"]), 1))
+        for frac in (0, 0.5, 1):
+            v = lo + (hi - lo) * frac
+            _, y = xy(t0, v)
+            qp.drawLine(pad, int(y), w - 10, int(y))
+            qp.setPen(QColor(C["muted"]))
+            qp.drawText(2, int(y) + 4, f"€{v:.0f}")
+            qp.setPen(QPen(QColor(C["line"]), 1))
+        for color, data in self.series:
+            qp.setPen(QPen(QColor(color), 2))
+            prev = None
+            for t, v in data:
+                p = xy(t, v)
+                if prev:
+                    qp.drawLine(int(prev[0]), int(prev[1]), int(p[0]), int(p[1]))
+                prev = p
+        qp.setPen(QColor(C["accent"]))
+        qp.drawText(pad + 6, h - 8, "— bot (regels)")
+        qp.setPen(QColor(C["info"]))
+        qp.drawText(pad + 130, h - 8, "— BTC vasthouden")
+
+
+class BacktestPage(QWidget):
+    def __init__(self, win):
+        super().__init__()
+        self.win = win
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        inner.setObjectName("page")
+        v = QVBoxLayout(inner)
+        v.setContentsMargins(28, 24, 28, 24)
+        v.setSpacing(10)
+        scroll.setWidget(inner)
+        outer.addWidget(scroll)
+
+        top = QHBoxLayout()
+        top.addWidget(lab("Backtest", "h1"))
+        top.addStretch(1)
+        self.period = QComboBox()
+        self.period.addItems(["3 maanden", "6 maanden", "12 maanden", "24 maanden"])
+        self.period.setCurrentIndex(2)
+        top.addWidget(self.period)
+        self.with_shorts = QCheckBox("Met shorts")
+        self.with_shorts.setChecked(True)
+        top.addWidget(self.with_shorts)
+        self.btn = QPushButton("Test starten")
+        self.btn.setObjectName("primary")
+        self.btn.clicked.connect(self.start)
+        top.addWidget(self.btn)
+        v.addLayout(top)
+        v.addWidget(lab("Speelt de vaste regels uur voor uur na op echte koersen van Bitvavo, met jouw instellingen: "
+                        "de vijf instapregels, positiegrootte, stop-loss, koersdoel, daglimiet en fees. "
+                        "Niet mee te testen: de AI (de Charts-score wordt een rekenscore op dezelfde indicatoren, "
+                        "nieuws telt als neutraal, geen Skeptic/Chief) en de volgers. Kost geen API-tegoed.",
+                        "hint", wrap=True))
+        self.status = lab("", "sub", wrap=True)
+        v.addWidget(self.status)
+
+        g = QGridLayout()
+        g.setSpacing(12)
+        self.t_end = StatTile("Eindstand bot")
+        self.t_hold = StatTile("BTC vasthouden")
+        self.t_trades = StatTile("Trades")
+        self.t_dd = StatTile("Grootste daling")
+        for i, t in enumerate([self.t_end, self.t_hold, self.t_trades, self.t_dd]):
+            g.addWidget(t, 0, i)
+        v.addLayout(g)
+        self.chart = EquityChart()
+        v.addWidget(self.chart)
+        h = QHBoxLayout()
+        left = QVBoxLayout()
+        left.addWidget(lab("PER SOORT EN PER MUNT", "cap"))
+        self.per = table(["", "Trades", "Winrate", "Totaal", "Gem. winst", "Gem. verlies", "Beste", "Slechtste"])
+        self.per.setMinimumHeight(260)
+        left.addWidget(self.per)
+        right = QVBoxLayout()
+        right.addWidget(lab("LAATSTE TRADES", "cap"))
+        self.trades = table(["Open", "Munt", "Soort", "Inleg", "Resultaat", "Reden"])
+        self.trades.setMinimumHeight(260)
+        right.addWidget(self.trades)
+        h.addLayout(left, 1)
+        h.addLayout(right, 1)
+        v.addLayout(h)
+        self._q = queue.Queue()
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._poll)
+
+    def start(self):
+        import threading
+        months = [3, 6, 12, 24][self.period.currentIndex()]
+        markets = list(self.win.cfg.get("markets") or [])
+        if "BTC-EUR" not in markets:
+            markets = ["BTC-EUR"] + markets
+        rules = dict(self.win.cfg["rules"])
+        shorts = self.with_shorts.isChecked()
+        self.btn.setEnabled(False)
+        self.status.setText("Koersen ophalen bij Bitvavo…")
+
+        def work():
+            try:
+                import backtest
+                from python_bitvavo_api.bitvavo import Bitvavo
+                bv = Bitvavo({})
+                data = {}
+                for m in markets:
+                    data[m] = backtest.fetch_candles(bv, m, months, lambda t: self._q.put(("msg", t)))
+                self._q.put(("msg", "Naspelen…"))
+                res = backtest.run(data, rules, shorts=shorts, progress=lambda t: self._q.put(("msg", t)),
+                                   cycle_minutes=int(self.win.cfg.get("cycle_minutes", 120)))
+                res["months"] = months
+                self._q.put(("done", res))
+            except Exception as e:
+                self._q.put(("err", str(e)))
+        threading.Thread(target=work, daemon=True).start()
+        self._timer.start(300)
+
+    def _poll(self):
+        while True:
+            try:
+                kind, val = self._q.get_nowait()
+            except queue.Empty:
+                return
+            if kind == "msg":
+                self.status.setText(val)
+            elif kind == "err":
+                self._timer.stop()
+                self.btn.setEnabled(True)
+                self.status.setText(f"Test mislukt: {val}")
+            else:
+                self._timer.stop()
+                self.btn.setEnabled(True)
+                self.show_result(val)
+
+    def show_result(self, r):
+        def d(ts):
+            return datetime.datetime.fromtimestamp(ts / 1000).strftime("%d-%m-%Y") if ts else "?"
+        b = r["budget"]
+        self.status.setText(f"Periode {d(r['start'])} t/m {d(r['end'])} ({r['months']} maanden). "
+                            f"Nog open aan het eind: {r['open']}.")
+        self.t_end.set(eur(r["final"]), f"{eur(r['final'] - b, True)} op {eur(b)}",
+                       C["good"] if r["final"] >= b else C["bad"])
+        if r["hold_final"]:
+            self.t_hold.set(eur(r["hold_final"]), f"bot {eur(r['final'] - r['hold_final'], True)} t.o.v. BTC")
+        st = r["stats"]["all"]
+        self.t_trades.set(str(st["trades"]), f"{st['winrate'] * 100:.0f}% winst" if st["winrate"] is not None else "")
+        self.t_dd.set(eur(r["max_drawdown"]), "van hoogste naar laagste stand", C["bad"] if r["max_drawdown"] < 0 else None)
+        self.chart.set([(C["accent"], r["equity"]), (C["info"], r["hold"])])
+
+        def row(name, s):
+            o = lambda x: eur(x, True) if x is not None else "–"
+            return [name, s["trades"], f"{s['winrate'] * 100:.0f}%" if s["winrate"] is not None else "–",
+                    o(s["total"]), o(s["avg_win"]), o(s["avg_loss"]), o(s["best"]), o(s["worst"])]
+        rows = [row("Alles", st), row("Kopen", r["stats"]["long"]), row("Shorten", r["stats"]["short"])]
+        rows += [row(m, s) for m, s in r["per_market"].items()]
+        fill(self.per, rows)
+        rows = [[d(t["open"]), t["market"], "kopen" if t["side"] == "long" else "short", eur(t["eur"]),
+                 eur(t["pnl"], True), t["reason"]] for t in reversed(r["trades"][-300:])]
+        fill(self.trades, rows)
+
+
 class SettingsPage(QWidget):
     def __init__(self, win):
         super().__init__()
@@ -923,8 +1117,9 @@ class MainWindow(QMainWindow):
         self.sets = SettingsPage(self)
         self.navs = []
         self.fol = FollowersPage(self)
+        self.bt = BacktestPage(self)
         for i, (name, page) in enumerate([("Bot", self.bot), ("Overzicht", self.over), ("Volgers", self.fol),
-                                          ("Instellingen", self.sets)]):
+                                          ("Backtest", self.bt), ("Instellingen", self.sets)]):
             page.setObjectName("page")
             self.stack.addWidget(page)
             b = QPushButton(name)
@@ -944,7 +1139,7 @@ class MainWindow(QMainWindow):
         self.sets.load(self.cfg)
         self.go(0)
         if not self.cfg["keys"].get("anthropic"):
-            self.go(3)
+            self.go(4)
             self.sets.note.setText("Welkom! Vul eerst je API-keys in en klik op Opslaan. "
                                    "De bot begint altijd met droog draaien (geen echte orders).")
             self.sets.note.show()
@@ -1017,7 +1212,7 @@ class MainWindow(QMainWindow):
         if missing:
             QMessageBox.warning(self, "Kan niet starten", "Eerst nog regelen:\n\n• " + "\n• ".join(missing))
             self.engine = None
-            self.go(3)
+            self.go(4)
             return
         self.engine.start()
         self.refresh()

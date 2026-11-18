@@ -26,7 +26,7 @@ jobs:
           pip install -r requirements.txt pyinstaller
 
       - name: Controle (syntax)
-        run: python -m py_compile app.py bot.py settings.py risk_gate.py kosten.py remote.py followers.py
+        run: python -m py_compile app.py bot.py settings.py risk_gate.py kosten.py remote.py followers.py backtest.py
 
       - name: CryptoTrader.exe bouwen
         run: >
