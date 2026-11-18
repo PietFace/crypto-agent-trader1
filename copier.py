@@ -405,7 +405,7 @@ def _day_fills(cache_dir, day, timeout=60):
     return rows
 
 
-def find_trader(trades, cache_dir, days=30, tol_pct=0.05, account=None, progress=lambda t: None):
+def find_trader(trades, cache_dir, days=60, tol_pct=0.15, account=None, progress=lambda t: None):
     """Zoek adressen die (bijna) dezelfde trades deden. trades: [(munt, prijs), ...].
     Geeft kandidaten gesorteerd op aantal treffers, dan op hoe dicht de accountwaarde bij Invo's waarde ligt."""
     want = [(str(c).upper(), float(p)) for c, p in trades]
@@ -426,7 +426,9 @@ def find_trader(trades, cache_dir, days=30, tol_pct=0.05, account=None, progress
                     if diff <= tol_pct:
                         hits.setdefault(user, set()).add(k)
                         best[(user, k)] = min(best.get((user, k), 99), diff)
-    need = min(len(want), 3)
+    # Twee treffers is genoeg om mee te tellen: Invo toont een gemiddelde uitstapprijs (meerdere fills), en
+    # trades kunnen ouder zijn dan de periode. De beste match staat bovenaan (meeste treffers, kleinste verschil).
+    need = min(len(want), 2)
     cands = [(u, len(s), sum(best[(u, k)] for k in s)) for u, s in hits.items() if len(s) >= need]
     cands.sort(key=lambda x: (-x[1], x[2]))
     out = []

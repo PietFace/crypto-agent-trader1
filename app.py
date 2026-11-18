@@ -758,7 +758,7 @@ class CopyPage(QWidget):
 
         v.addWidget(lab("INVO-TRADER ZOEKEN (vingerafdruk)", "cap"))
         v.addWidget(lab("Zoekt in de openbare Invo-trades op Hyperliquid naar het adres dat dezelfde trades deed als "
-                        "op het Invo-profiel. De eerste keer duurt het een paar minuten (30 dagen aan bestanden), "
+                        "op het Invo-profiel. De eerste keer duurt het een paar minuten (60 dagen aan bestanden), "
                         "daarna gaat het snel. Dubbelklik op een uitkomst om hem bij de traders te zetten.",
                         "hint", wrap=True))
         row = QHBoxLayout()
