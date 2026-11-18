@@ -773,7 +773,7 @@ class CopyPage(QWidget):
         v.addLayout(row)
         self.find_status = lab("", "sub", wrap=True)
         v.addWidget(self.find_status)
-        self.found = table(["Invo-naam", "Adres", "Treffers", "Account $ nu", "Account $ op Invo", "Stijl"])
+        self.found = table(["Invo-naam", "Adres", "Treffers", "Account $ nu", "Account $ op Invo", "Stijl", "Zekerheid"])
         self.found.setSelectionMode(QTableWidget.SingleSelection)
         self.found.setSelectionBehavior(QTableWidget.SelectRows)
         self.found.cellDoubleClicked.connect(self._add_found)
@@ -863,18 +863,33 @@ class CopyPage(QWidget):
 
         def work():
             rows = []
+            found = {}
             try:
                 for n in names:
                     fp = copier.FINGERPRINTS[n]
                     res = copier.find_trader(fp["trades"], settings.data_dir(), account=fp.get("account"),
                                              progress=lambda t, n=n: self._q.put(("msg", f"@{n}: {t}")))
-                    for c in res[:3]:
-                        rows.append([n, c["address"], f"{c['matches']} van {c['of']}",
-                                     f"{c['account']:,.0f}" if c["account"] else "?",
-                                     f"{fp['account']:,}" if fp.get("account") else "verborgen", fp["style"]])
+                    conf = copier.confidence(res)
+                    found[n] = (res, conf)
                     if not res:
-                        rows.append([n, "niet gevonden", "", "", "", fp["style"]])
+                        rows.append([n, "niet gevonden", "", "", "", fp["style"], ""])
+                    else:
+                        # Zeker: alleen de beste. Anders max 3, zodat je zelf kunt kiezen.
+                        for j, c in enumerate(res[:1] if conf == "zeker" else res[:3]):
+                            rows.append([n, c["address"], f"{c['matches']} van {c['of']}",
+                                         f"{c['account']:,.0f}" if c["account"] else "?",
+                                         f"{fp['account']:,}" if fp.get("account") else "verborgen", fp["style"],
+                                         ("bot?" if c["bot"] else (conf if j == 0 else "alternatief"))])
                     self._q.put(("rows", list(rows)))
+                best_of = {}
+                for n, (res, conf) in found.items():
+                    if res:
+                        best_of.setdefault(res[0]["address"], []).append(n)
+                for r in rows:
+                    names_for = best_of.get(r[1], [])
+                    if len(names_for) > 1 and r[6] not in ("alternatief",):
+                        r[6] = "twijfel: past ook bij " + ", ".join(x for x in names_for if x != r[0])
+                self._q.put(("rows", list(rows)))
                 self._q.put(("done", len(names)))
             except Exception as e:
                 self._q.put(("err", str(e)))

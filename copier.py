@@ -405,13 +405,40 @@ def _day_fills(cache_dir, day, timeout=60):
     return rows
 
 
-def find_trader(trades, cache_dir, days=60, tol_pct=0.15, account=None, progress=lambda t: None):
-    """Zoek adressen die (bijna) dezelfde trades deden. trades: [(munt, prijs), ...].
-    Geeft kandidaten gesorteerd op aantal treffers, dan op hoe dicht de accountwaarde bij Invo's waarde ligt."""
+def _ts(v):
+    """Tijd uit het builder-bestand naar seconden (ms-getal of ISO-tekst). None als onbekend."""
+    try:
+        x = float(v)
+        return x / 1000 if x > 1e11 else x
+    except (TypeError, ValueError):
+        pass
+    try:
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def find_trader(trades, cache_dir, days=60, tol_pct=0.05, account=None, progress=lambda t: None):
+    """Zoek het Hyperliquid-adres dat dezelfde trades deed als op het Invo-profiel. trades: [(munt, prijs), ...].
+
+    - Invo toont vaak een GEMIDDELDE uitstapprijs als een order in stukjes is gevuld. Daarom vergelijken we niet
+      alleen losse fills, maar ook het gemiddelde van fills die binnen 2 minuten na elkaar kwamen.
+    - Kopieerders via Invo doen dezelfde trades een paar seconden later tegen een net andere prijs; het origineel
+      zit er het dichtst op. Bots die duizenden trades doen passen toevallig vaak op ronde BTC-prijzen; die zakken.
+    Geeft kandidaten, beste eerst: {address, matches, of, diff, fills, account, bot}."""
     want = [(str(c).upper(), float(p)) for c, p in trades]
-    hits = {}
-    best = {}   # (user, k) -> kleinste prijsverschil in %: het origineel zit meestal precies op de prijs
+    coins = {c for c, _ in want}
+    best = {}      # (user, k) -> kleinste verschil in %
+    nfills = {}    # user -> aantal fills in de periode (hoge aantallen = bot)
     today = datetime.now(timezone.utc).date()
+
+    def check(user, coin, px):
+        for k, (c, p) in enumerate(want):
+            if coin == c and p:
+                diff = abs(px - p) / p * 100
+                if diff <= tol_pct and diff < best.get((user, k), 99):
+                    best[(user, k)] = diff
+
     for i in range(days):
         d = (today - timedelta(days=i)).strftime("%Y%m%d")
         progress(f"Invo-trades van {d[6:]}-{d[4:6]} doorzoeken…")
@@ -419,26 +446,109 @@ def find_trader(trades, cache_dir, days=60, tol_pct=0.15, account=None, progress
             rows = _day_fills(cache_dir, d)
         except Exception:
             continue
+        groups = {}
         for user, coin, px, sz, ts in rows:
-            for k, (c, p) in enumerate(want):
-                if coin == c and p:
-                    diff = abs(px - p) / p * 100
-                    if diff <= tol_pct:
-                        hits.setdefault(user, set()).add(k)
-                        best[(user, k)] = min(best.get((user, k), 99), diff)
-    # Twee treffers is genoeg om mee te tellen: Invo toont een gemiddelde uitstapprijs (meerdere fills), en
-    # trades kunnen ouder zijn dan de periode. De beste match staat bovenaan (meeste treffers, kleinste verschil).
+            nfills[user] = nfills.get(user, 0) + 1
+            if coin not in coins:
+                continue
+            check(user, coin, px)
+            groups.setdefault((user, coin), []).append((_ts(ts), px, sz))
+        # gemiddelde prijs van fills die bij elkaar horen (binnen 2 minuten)
+        for (user, coin), fl in groups.items():
+            if len(fl) < 2:
+                continue
+            fl.sort(key=lambda x: x[0] or 0)
+            run = [fl[0]]
+            for f in fl[1:] + [None]:
+                if f is not None and run[-1][0] is not None and f[0] is not None and f[0] - run[-1][0] <= 120:
+                    run.append(f)
+                    continue
+                if len(run) > 1:
+                    q = sum(x[2] for x in run)
+                    if q > 0:
+                        check(user, coin, sum(x[1] * x[2] for x in run) / q)
+                if f is not None:
+                    run = [f]
+    per_user = {}
+    for (u, k), diff in best.items():
+        per_user.setdefault(u, {})[k] = diff
     need = min(len(want), 2)
-    cands = [(u, len(s), sum(best[(u, k)] for k in s)) for u, s in hits.items() if len(s) >= need]
-    cands.sort(key=lambda x: (-x[1], x[2]))
-    out = []
-    for u, n, _diff in cands[:15]:
-        acct = None
+    cands = []
+    for u, ks in per_user.items():
+        if len(ks) < need:
+            continue
+        bot = nfills.get(u, 0) > 300 * days      # meer dan ~300 trades per dag
+        cands.append({"address": u, "matches": len(ks), "of": len(want), "diff": sum(ks.values()) / len(ks),
+                      "fills": nfills.get(u, 0), "bot": bot, "account": None})
+    cands.sort(key=lambda c: (c["bot"], -c["matches"], c["diff"]))
+    out = cands[:8]
+    for c in out:
         try:
-            acct = trader_state(u)["account"]
+            c["account"] = trader_state(c["address"])["account"]
         except Exception:
             pass
-        out.append({"address": u, "matches": n, "of": len(want), "account": acct})
     if account:
-        out.sort(key=lambda c: (-c["matches"], abs((c["account"] or 0) - account)))
+        # Bij gelijke treffers: de accountwaarde die het dichtst bij Invo ligt wint.
+        out.sort(key=lambda c: (c["bot"], -c["matches"], abs((c["account"] or 0) - account) / account + c["diff"]))
+        if confidence(out) != "zeker":
+            try:
+                extra = find_by_account(trades, account, cache_dir, tol_pct=tol_pct, progress=progress)
+            except Exception:
+                extra = []
+            seen = {c["address"] for c in out}
+            out = [c for c in extra if c["address"] not in seen] + out
+            out.sort(key=lambda c: (c["bot"], -c["matches"],
+                                    abs((c["account"] or 0) - account) / account + c["diff"]))
     return out
+
+
+def find_by_account(trades, account, cache_dir, tol_acct=0.05, tol_pct=0.05, max_check=40,
+                    progress=lambda t: None):
+    """Voor 'Live Portfolio's op Invo: die handelen vaak rechtstreeks op Hyperliquid (niet via Invo), dus ze staan
+    niet in Invo's builder-bestanden. Wel zien we hun accountwaarde. Zoek in het leaderboard naar accounts met
+    (bijna) dezelfde waarde en controleer hun eigen trades op de vingerafdruk."""
+    import followers
+    rows = followers.fetch_leaderboard(os.path.join(cache_dir, "leaderboard.json"))
+    near = [r for r in rows if r.get("address") and r.get("account_value")
+            and abs(r["account_value"] - account) / account <= tol_acct]
+    near.sort(key=lambda r: abs(r["account_value"] - account))
+    want = [(str(c).upper(), float(p)) for c, p in trades]
+    out = []
+    for i, r in enumerate(near[:max_check]):
+        progress(f"Account {i + 1}/{min(len(near), max_check)} met ongeveer ${account:,.0f} controleren…")
+        try:
+            fl = _http.post(INFO_URL, json={"type": "userFills", "user": r["address"]}, timeout=15).json() or []
+        except Exception:
+            continue
+        ks = {}
+        for f in fl:
+            try:
+                coin, px = str(f.get("coin", "")).upper(), float(f.get("px") or 0)
+            except (TypeError, ValueError):
+                continue
+            for k, (c, p) in enumerate(want):
+                if coin == c and p and abs(px - p) / p * 100 <= tol_pct:
+                    ks[k] = min(ks.get(k, 99), abs(px - p) / p * 100)
+        if ks:
+            out.append({"address": r["address"].lower(), "matches": len(ks), "of": len(want),
+                        "diff": sum(ks.values()) / len(ks), "fills": len(fl), "bot": False,
+                        "account": r["account_value"]})
+        time.sleep(0.2)
+    out.sort(key=lambda c: (-c["matches"], c["diff"]))
+    return out
+
+
+def confidence(res):
+    """'zeker', 'waarschijnlijk' of 'twijfel' voor de beste kandidaat."""
+    if not res:
+        return None
+    b = res[0]
+    second = res[1] if len(res) > 1 else None
+    clear_lead = not second or second["matches"] < b["matches"] or second["diff"] > b["diff"] * 3
+    if b["bot"]:
+        return "twijfel"
+    if b["matches"] >= 3 and clear_lead:
+        return "zeker"
+    if b["matches"] >= 2 and clear_lead:
+        return "waarschijnlijk"
+    return "twijfel"
