@@ -204,8 +204,9 @@ class BotPage(QWidget):
         cfg = self.win.cfg
         rules = cfg["rules"]
         budget = float(rules["budget_eur"])
-        live = bool(cfg.get("live"))
-        self.badge.setText("LIVE: ECHTE ORDERS" if live else "DROOG DRAAIEN")
+        kr = cfg.get("exchange") == "kraken"
+        live = bool(cfg.get("live")) and not kr
+        self.badge.setText("LIVE: ECHTE ORDERS" if live else ("KRAKEN · DROOG" if kr else "DROOG DRAAIEN"))
         self.badge.setObjectName("badge_live" if live else "badge_dry")
         self.badge.setStyleSheet(self.badge.styleSheet())
         self.badge.style().unpolish(self.badge)
@@ -656,7 +657,7 @@ class BacktestPage(QWidget):
         markets = list(self.win.cfg.get("markets") or [])
         if "BTC-EUR" not in markets:
             markets = ["BTC-EUR"] + markets
-        rules = dict(self.win.cfg["rules"])
+        rules = settings.effective_rules(self.win.cfg)
         shorts = self.with_shorts.isChecked()
         self.btn.setEnabled(False)
         self.status.setText("Koersen ophalen bij Bitvavo…")
@@ -771,6 +772,16 @@ class SettingsPage(QWidget):
         # --- Handelen
         g = QGroupBox("Handelen")
         f = QFormLayout(g)
+        self.exch = QComboBox()
+        self.exch.addItems(["Bitvavo", "Kraken-perps (droog)"])
+        f.addRow("Beurs", self.exch)
+        self.lev = QSpinBox()
+        self.lev.setRange(1, 5)
+        self.lev.setSuffix("x")
+        f.addRow("Hefboom (Kraken)", self.lev)
+        f.addRow("", lab("Kraken: 0,05% kosten per kant in plaats van 0,25%, echte shorts zonder leenkosten. "
+                         "Nog alleen droog: er gaan geen echte Kraken-orders uit. Hefboom maakt posities groter, "
+                         "maar het maximale verlies per trade blijft je ingestelde bedrag.", "hint", wrap=True))
         self.live = QCheckBox("Live: echte orders plaatsen op Bitvavo")
         self.live.toggled.connect(self._confirm_live)
         f.addRow("", self.live)
@@ -1029,6 +1040,8 @@ class SettingsPage(QWidget):
         self.model.setCurrentText(cfg.get("model") or settings.MODELS[0])
         self.model_chief.setCurrentText(cfg.get("model_chief") or "(zelfde als agents)")
         self.shorts_on.setChecked(bool(cfg.get("shorts_sim", True)))
+        self.exch.setCurrentIndex(1 if cfg.get("exchange") == "kraken" else 0)
+        self.lev.setValue(int((cfg.get("kraken") or {}).get("leverage", 3)))
         lbs = cfg.get("live_bronnen") or ["volgers", "beide"]
         for key, c in self.lb_checks.items():
             c.setChecked(key in lbs)
@@ -1055,6 +1068,8 @@ class SettingsPage(QWidget):
                        "bitvavo_secret": self.k_bvs.text().strip()}
         cfg["live"] = self.live.isChecked()
         cfg["live_bronnen"] = [k for k, c in self.lb_checks.items() if c.isChecked()]
+        cfg["exchange"] = "kraken" if self.exch.currentIndex() == 1 else "bitvavo"
+        cfg["kraken"] = {"leverage": self.lev.value()}
         cfg["markets"] = [m for m, c in self.m_checks.items() if c.isChecked()]
         cfg["cycle_minutes"] = self.cycle.value()
         cfg["model"] = self.model.currentText()

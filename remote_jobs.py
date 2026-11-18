@@ -75,6 +75,7 @@ class JobRunner:
 
     def _run(self, cfg, rc, req):
         import backtest
+        import settings
         from python_bitvavo_api.bitvavo import Bitvavo
         months = int(req.get("months", 12))
         shorts = bool(req.get("shorts", True))
@@ -85,7 +86,7 @@ class JobRunner:
                 markets = ["BTC-EUR"] + markets
             bv = Bitvavo({})
             data = {m: backtest.fetch_candles(bv, m, months) for m in markets}
-            res = backtest.run(data, dict(cfg["rules"]), shorts=shorts,
+            res = backtest.run(data, settings.effective_rules(cfg), shorts=shorts,
                                cycle_minutes=int(cfg.get("cycle_minutes", 120)))
             self._send(rc, {"id": req["id"], "status": "done", "result": _slim(res, months)})
             self.log(f"Backtest klaar: eindstand €{res['final']:.2f} (BTC vasthouden "

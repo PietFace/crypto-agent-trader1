@@ -212,8 +212,15 @@ class Engine:
         self.cfg = cfg
         self._ui_log = log
         self.db_path = db_path or settings.db_path()
-        self.rules = cfg["rules"]
+        self.exchange = cfg.get("exchange", "bitvavo")
+        self.rules = settings.effective_rules(cfg)
         self.live = bool(cfg.get("live"))
+        self.kr = None
+        self.lev = max(1, int(self.rules.get("leverage", 1) or 1))
+        if self.exchange == "kraken":
+            import kraken
+            self.kr = kraken.KrakenPublic()
+            self.live = False  # Kraken-orders zitten er nog niet in: altijd droog
         self.markets = list(cfg.get("markets") or [])
         self.cycle_minutes = int(cfg.get("cycle_minutes", 120))
         self.models = {a: cfg.get("model") or "claude-haiku-5-5"
@@ -277,6 +284,19 @@ class Engine:
         return bool(self._thread and self._thread.is_alive())
 
     def _loop(self):
+        if self.kr:
+            lev = self.rules.get("leverage", 1)
+            self.log(f"Beurs: Kraken-perps (droog), hefboom max {lev}x, kosten {self.rules['fee_pct']}% per kant, "
+                     "shorts zonder leenkosten. Koersen in USD, omgerekend naar euro.", "info")
+            if self.cfg.get("live"):
+                self.log("Live staat aan, maar Kraken-orders zitten er nog niet in: de bot draait droog.", "bad")
+            try:
+                missing = [m for m in self.markets if not self.kr.supported(m)]
+                if missing:
+                    self.log(f"Niet bij Kraken te verhandelen, worden overgeslagen: {', '.join(missing)}", "bad")
+                    self.markets = [m for m in self.markets if m not in missing]
+            except Exception as e:
+                self.log(f"Kraken niet bereikbaar: {e}", "bad")
         self.log(f"Bot gestart ({'LIVE' if self.live else 'droog draaien'}): max €{self.rules['max_loss_per_trade_eur']} "
                  f"verlies per trade, max {self.rules['max_positions']} posities, daglimiet "
                  f"€{self.rules['daily_loss_limit_eur']}.", "info")
@@ -354,9 +374,16 @@ class Engine:
 
     # ---------- marktdata ----------
     def price(self, market):
+        if self.kr:
+            return self.kr.price(market)
         return float(bv_check(self.pub.tickerPrice({"market": market}), f"koers {market}")["price"])
 
     def spread_pct(self, market):
+        if self.kr:
+            try:
+                return self.kr.spread_pct(market)
+            except Exception:
+                return None
         try:
             book = bv_check(self.pub.book(market, {"depth": 1}), "orderboek")
             bid = float(book["bids"][0][0])
@@ -820,7 +847,7 @@ class Engine:
                 self.log("  Skeptic ziet hoog risico: houden", "muted")
                 action = "hold"
         if action == "buy" and not pos:
-            amount, why = self.risk_check_buy(market, float(decision.get("amount_eur", 0) or 0),
+            amount, why = self.risk_check_buy(market, float(decision.get("amount_eur", 0) or 0) * self.lev,
                                               float(decision.get("confidence", 0) or 0))
             if amount:
                 self.execute_buy(market, amount, decision.get("reason", ""), bron=setup["bron_long"])
@@ -838,7 +865,7 @@ class Engine:
                 self.log(f"  Chief wil verkopen, maar de charts zijn niet omgeslagen{extra}: positie blijft, "
                          "stop-loss en koersdoel bewaken hem", "muted")
         elif action == "short" and self.shorts and not spos:
-            amount, why = self.risk_check_buy(market, float(decision.get("amount_eur", 0) or 0),
+            amount, why = self.risk_check_buy(market, float(decision.get("amount_eur", 0) or 0) * self.lev,
                                               float(decision.get("confidence", 0) or 0), book="short")
             if amount:
                 self.open_short(market, amount, decision.get("reason", ""), bron=setup["bron_short"])

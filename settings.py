@@ -9,7 +9,9 @@ APP_NAME = "CryptoTrader"
 DEFAULTS = {
     "keys": {"anthropic": "", "bitvavo_key": "", "bitvavo_secret": ""},
     "live": False,
-    "live_bronnen": ["volgers", "beide"],  # alleen deze signalen met echt geld; de rest als schaduwtrade
+    "live_bronnen": ["volgers", "beide"],
+    "exchange": "bitvavo",  # "bitvavo" of "kraken" (Kraken-perps, voorlopig alleen droog)
+    "kraken": {"leverage": 3},  # max 5  # alleen deze signalen met echt geld; de rest als schaduwtrade
     "markets": ["BTC-EUR", "ETH-EUR", "SOL-EUR", "XRP-EUR"],
     "cycle_minutes": 120,
     "model": "claude-haiku-5-5",
@@ -107,6 +109,20 @@ def _import_env(cfg):
 
 
 CFG_VERSION = 2
+
+
+def effective_rules(cfg):
+    """Regels zoals de bot ze gebruikt. Op Kraken: lagere kosten, geen leenkosten voor shorts, hefboom."""
+    rules = copy.deepcopy(cfg["rules"])
+    if cfg.get("exchange") == "kraken":
+        import kraken
+        rules["fee_pct"] = kraken.TAKER_FEE_PCT
+        rules["short_borrow_pct_day"] = 0.0
+        lev = int((cfg.get("kraken") or {}).get("leverage", 3) or 1)
+        rules["leverage"] = max(1, min(kraken.MAX_LEVERAGE, lev))
+    else:
+        rules["leverage"] = 1
+    return rules
 
 
 def load():

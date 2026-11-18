@@ -85,10 +85,13 @@ def risk_per_eur(rules, market):
 def size_buy(rules, market, wanted_eur, invested_eur, realized_eur=0.0):
     """Grootste bedrag binnen vier grenzen. Geeft (bedrag, welke grens besliste).
     realized_eur: totaal gerealiseerd resultaat; verlies verkleint het beschikbare budget."""
+    # Met hefboom (Kraken) is de positie groter dan het onderpand. Het verlies per trade blijft begrensd
+    # door "max verlies per trade", want dat rekent met de stop-afstand over de hele positie.
+    lev = max(1, int(rules.get("leverage", 1) or 1))
     limits = {
         "Chief-voorstel": wanted_eur,
-        "max per trade": rules["max_trade_eur"],
-        "budgetruimte": rules["budget_eur"] + min(0.0, realized_eur) - invested_eur,
+        "max per trade": rules["max_trade_eur"] * lev,
+        "budgetruimte": (rules["budget_eur"] + min(0.0, realized_eur)) * lev - invested_eur,
         "max verlies per trade": rules["max_loss_per_trade_eur"] / risk_per_eur(rules, market),
     }
     decider = min(limits, key=limits.get)

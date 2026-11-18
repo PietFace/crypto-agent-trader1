@@ -166,7 +166,8 @@ def run(data, rules, shorts=True, start_budget=None, progress=None, cycle_minute
             if n_side >= rules["max_positions"] or day_buys.get((day, side), 0) >= rules["max_buys_per_day"]:
                 continue
             invested = sum(p["cost"] for (mm, s), p in open_pos.items() if s == side)
-            amount, _ = risk_gate.size_buy(rules, m, rules["max_trade_eur"], invested, realized)
+            amount, _ = risk_gate.size_buy(rules, m, rules["max_trade_eur"] * max(1, int(rules.get("leverage", 1) or 1)),
+                                               invested, realized)
             if amount < rules["min_order_eur"]:
                 continue
             open_risk = sum(p["cost"] * risk_per_eur(mm) for (mm, s), p in open_pos.items() if s == side)
