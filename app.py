@@ -810,6 +810,19 @@ class CopyPage(QWidget):
         addrow.addStretch(1)
         v.addLayout(addrow)
 
+        v.addWidget(lab("STATISTIEK KOPIËREN", "cap"))
+        tiles = QHBoxLayout()
+        self.t_total = StatTile("Resultaat")
+        self.t_win = StatTile("Winrate")
+        self.t_avg = StatTile("Gem. per trade")
+        self.t_lag = StatTile("Bot vs trader")
+        for t in (self.t_total, self.t_win, self.t_avg, self.t_lag):
+            tiles.addWidget(t)
+        v.addLayout(tiles)
+        self.per_trader = table(["Trader", "Trades", "Winrate", "Totaal €", "Gem. bot %", "Gem. trader %",
+                                 "Achterstand", "Beste", "Slechtste"])
+        self.per_trader.setMinimumHeight(150)
+        v.addWidget(self.per_trader)
         v.addWidget(lab("OPEN KOPIEËN", "cap"))
         self.open_t = table(["Geopend", "Munt", "Kant", "Hefboom", "Positie", "Instap", "Noodstop", "Trader", "Echt"])
         self.open_t.setMinimumHeight(140)
@@ -1005,6 +1018,44 @@ class CopyPage(QWidget):
                                  f"Opgeslagen, kopieer-modus staat aan ({'LIVE' if self.live.isChecked() else 'droog'}). "
                                  "Stop en start de bot om te beginnen.")
 
+    def _stats(self):
+        """Tegels en tabel per trader. Achterstand = gemiddeld (trader % − bot %) per trade, op dezelfde hefboom."""
+        data = query("SELECT trader_name, pnl_eur, pnl_pct, trader_pct, fee_eur FROM copy_trades")
+        good, bad = C.get("good", "#4ade80"), C.get("bad", "#f87171")
+        if not data:
+            for t in (self.t_total, self.t_win, self.t_avg, self.t_lag):
+                t.set("–", "nog geen gesloten kopieën")
+            fill(self.per_trader, [])
+            return
+        pnl = [d[1] or 0 for d in data]
+        tot, n = sum(pnl), len(pnl)
+        wins = sum(1 for x in pnl if x > 0)
+        fees = sum(d[4] or 0 for d in data)
+        lags = [(d[3] - d[2]) for d in data if d[3] is not None and d[2] is not None]
+        self.t_total.set(eur(tot, True), f"{n} trades, waarvan {eur(fees)} kosten", good if tot >= 0 else bad)
+        self.t_win.set(f"{wins / n * 100:.0f}%", f"{wins} winst, {n - wins} verlies")
+        self.t_avg.set(eur(tot / n, True), f"beste {eur(max(pnl), True)}, slechtste {eur(min(pnl), True)}",
+                       good if tot >= 0 else bad)
+        if lags:
+            lag = sum(lags) / len(lags)
+            self.t_lag.set(f"{lag:+.1f}%-pt", "hoeveel de trader per trade beter deed dan de bot (op je inzet)"
+                           if lag > 0 else "de bot deed het gemiddeld even goed of beter dan de trader")
+        else:
+            self.t_lag.set("–", "nog geen vergelijking")
+        per = {}
+        for name, p, bp, tp, _f in data:
+            per.setdefault(name or "?", []).append((p or 0, bp, tp))
+        rows = []
+        for name, lst in sorted(per.items(), key=lambda kv: -sum(x[0] for x in kv[1])):
+            ps = [x[0] for x in lst]
+            bps = [x[1] for x in lst if x[1] is not None]
+            tps = [x[2] for x in lst if x[2] is not None]
+            lg = [x[2] - x[1] for x in lst if x[1] is not None and x[2] is not None]
+            rows.append([name, len(lst), f"{sum(1 for x in ps if x > 0) / len(ps) * 100:.0f}%", eur(sum(ps), True),
+                         f"{sum(bps) / len(bps):+.1f}%" if bps else "–", f"{sum(tps) / len(tps):+.1f}%" if tps else "–",
+                         f"{sum(lg) / len(lg):+.1f}%-pt" if lg else "–", eur(max(ps), True), eur(min(ps), True)])
+        fill(self.per_trader, rows)
+
     # --- tabellen
     def refresh(self):
         rows = []
@@ -1024,6 +1075,7 @@ class CopyPage(QWidget):
             rows.append([local_time(closed), coin, side, tn, eur(pnl or 0, True), f"{(pct or 0):+.1f}%",
                          f"{tpct:+.1f}%" if tpct is not None else "?", eur(fee or 0), reason])
         fill(self.closed_t, rows)
+        self._stats()
         self.total.setText(f"{n} kopieën gesloten, {wins} met winst, totaal {eur(tot, True)}." if n else
                            "Nog geen gesloten kopieën.")
 
