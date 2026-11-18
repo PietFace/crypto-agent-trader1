@@ -9,6 +9,7 @@ APP_NAME = "CryptoTrader"
 DEFAULTS = {
     "keys": {"anthropic": "", "bitvavo_key": "", "bitvavo_secret": ""},
     "live": False,
+    "live_bronnen": ["volgers", "beide"],  # alleen deze signalen met echt geld; de rest als schaduwtrade
     "markets": ["BTC-EUR", "ETH-EUR", "SOL-EUR", "XRP-EUR"],
     "cycle_minutes": 120,
     "model": "claude-haiku-5-5",

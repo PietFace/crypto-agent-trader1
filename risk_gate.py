@@ -104,13 +104,13 @@ def day_stats(con, rules, book="long"):
     b = BOOKS[book]
     day = _today_utc() + "%"
     realized = con.execute(
-        f"SELECT COALESCE(SUM(pnl),0) FROM {b['trades']} WHERE side=? AND ts LIKE ?", (b["close"], day)
+        f"SELECT COALESCE(SUM(pnl),0) FROM {b['trades']} WHERE side=? AND ts LIKE ? AND COALESCE(schaduw,0)=0", (b["close"], day)
     ).fetchone()[0]
     buys = con.execute(
-        f"SELECT COUNT(*) FROM {b['trades']} WHERE side=? AND ts LIKE ?", (b["open"], day)
+        f"SELECT COUNT(*) FROM {b['trades']} WHERE side=? AND ts LIKE ? AND COALESCE(schaduw,0)=0", (b["open"], day)
     ).fetchone()[0]
     open_risk = 0.0
-    for market, cost in con.execute(f"SELECT market, cost_eur FROM {b['positions']}"):
+    for market, cost in con.execute(f"SELECT market, cost_eur FROM {b['positions']} WHERE COALESCE(schaduw,0)=0"):
         open_risk += cost * risk_per_eur(rules, market)
     return realized, buys, open_risk
 
@@ -119,7 +119,7 @@ def last_stop_loss(con, market, book="long"):
     b = BOOKS[book]
     r = con.execute(
         f"SELECT ts FROM {b['trades']} WHERE market=? AND side=? AND reason LIKE 'stop-loss%' "
-        "ORDER BY id DESC LIMIT 1", (market, b["close"])
+        "AND COALESCE(schaduw,0)=0 ORDER BY id DESC LIMIT 1", (market, b["close"])
     ).fetchone()
     return datetime.fromisoformat(r[0]) if r else None
 
@@ -134,14 +134,17 @@ def check_buy(con, market, wanted_eur, confidence, spread, stop_file="STOP", rul
     rules = rules or load_rules()
     reasons = []
     b = BOOKS[book]
-    positions = {m: c for m, c in con.execute(f"SELECT market, cost_eur FROM {b['positions']}")}
+    # Schaduwtrades kosten geen echt geld: ze tellen niet mee voor budget, limieten en aantal posities.
+    every = {m for (m,) in con.execute(f"SELECT market FROM {b['positions']}")}
+    positions = {m: c for m, c in con.execute(
+        f"SELECT market, cost_eur FROM {b['positions']} WHERE COALESCE(schaduw,0)=0")}
     invested = sum(positions.values())
 
     if Path(stop_file).exists():
         reasons.append("STOP-bestand aanwezig")
     if market in rules["blocked_markets"]:
         reasons.append(f"{market} staat op de blokkeerlijst")
-    if market in positions:
+    if market in every:
         reasons.append("al een positie in deze markt")
     if len(positions) >= rules["max_positions"]:
         reasons.append(f"maximaal {rules['max_positions']} posities bereikt")
@@ -168,7 +171,7 @@ def check_buy(con, market, wanted_eur, confidence, spread, stop_file="STOP", rul
     realized_total = 0.0
     for bk in BOOKS.values():
         try:
-            realized_total += con.execute(f"SELECT COALESCE(SUM(pnl),0) FROM {bk['trades']} WHERE side=?",
+            realized_total += con.execute(f"SELECT COALESCE(SUM(pnl),0) FROM {bk['trades']} WHERE side=? AND COALESCE(schaduw,0)=0",
                                           (bk["close"],)).fetchone()[0]
         except sqlite3.OperationalError:
             pass

@@ -228,8 +228,9 @@ class BotPage(QWidget):
         b = query("SELECT bot_eur, btc_hold_eur, ts FROM benchmark ORDER BY id DESC LIMIT 1")
         meta = dict(query("SELECT key, value FROM meta WHERE key IN ('btc_price_now','btc_start_price','marks_ts')"))
         if meta.get("marks_ts"):
-            realized = (query("SELECT COALESCE(SUM(pnl),0) FROM trades WHERE side='sell'") or [[0]])[0][0]
-            open_pnl = (query("SELECT COALESCE(SUM(pnl_eur),0) FROM position_marks WHERE book='long'") or [[0]])[0][0]
+            realized = (query("SELECT COALESCE(SUM(pnl),0) FROM trades WHERE side='sell' AND COALESCE(schaduw,0)=0") or [[0]])[0][0]
+            open_pnl = (query("SELECT COALESCE(SUM(m.pnl_eur),0) FROM position_marks m JOIN positions p "
+                              "ON p.market=m.market WHERE m.book='long' AND COALESCE(p.schaduw,0)=0") or [[0]])[0][0]
             live_bot = budget + realized + open_pnl
             live_hold = b[0][1] if b else None
             try:
@@ -251,8 +252,8 @@ class BotPage(QWidget):
             self.t_btc.set("–", "start na de eerste analyse")
 
         day = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d") + "%"
-        pnl = query("SELECT COALESCE(SUM(pnl),0), COUNT(*) FROM trades WHERE side='sell' AND ts LIKE ?", (day,))
-        buys = query("SELECT COUNT(*) FROM trades WHERE side='buy' AND ts LIKE ?", (day,))
+        pnl = query("SELECT COALESCE(SUM(pnl),0), COUNT(*) FROM trades WHERE side='sell' AND ts LIKE ? AND COALESCE(schaduw,0)=0", (day,))
+        buys = query("SELECT COUNT(*) FROM trades WHERE side='buy' AND ts LIKE ? AND COALESCE(schaduw,0)=0", (day,))
         p, n = pnl[0] if pnl else (0, 0)
         nb = buys[0][0] if buys else 0
         self.t_today.set(eur(p, True), f"{nb} gekocht, {n} verkocht · daglimiet {eur(rules['daily_loss_limit_eur'])}",
@@ -274,11 +275,11 @@ class BotPage(QWidget):
             return [fmt_px(px), eur(v), f"{eur(p, True)} ({pct:+.1f}%)"]
 
         rows = []
-        for market, amount, entry, cost_eur, opened in query(
-                "SELECT market, amount, entry_price, cost_eur, opened FROM positions"):
+        for market, amount, entry, cost_eur, opened, shadow in query(
+                "SELECT market, amount, entry_price, cost_eur, opened, COALESCE(schaduw,0) FROM positions"):
             plan = risk_gate.exit_plan(rules, market, entry)
             mk = marks.get(("long", market))
-            rows.append(["kopen", market, eur(cost_eur), fmt_px(entry), *live_cols(mk, cost_eur),
+            rows.append(["kopen (schaduw)" if shadow else "kopen", market, eur(cost_eur), fmt_px(entry), *live_cols(mk, cost_eur),
                          fmt_px(plan['stop_price']), fmt_px(plan['target_price']), local_time(opened)])
         for market, amount, entry, cost_eur, opened in query(
                 "SELECT market, amount, entry_price, cost_eur, opened FROM short_positions"):
@@ -363,10 +364,12 @@ class OverviewPage(QWidget):
 
     def refresh(self):
         rows = []
-        for ts, m, side, e, px, pnl, live, reason in query(
-                "SELECT ts, market, side, eur, price, pnl, live, reason FROM trades ORDER BY id DESC LIMIT 300"):
+        for ts, m, side, e, px, pnl, live, reason, shadow in query(
+                "SELECT ts, market, side, eur, price, pnl, live, reason, COALESCE(schaduw,0) FROM trades "
+                "ORDER BY id DESC LIMIT 300"):
             rows.append([local_time(ts), m, "koop" if side == "buy" else "verkoop", eur(e or 0),
-                         fmt_px(px or 0), eur(pnl or 0, True) if side == "sell" else "", "ja" if live else "nee",
+                         fmt_px(px or 0), eur(pnl or 0, True) if side == "sell" else "",
+                         "schaduw" if shadow else ("ja" if live else "nee"),
                          reason])
         fill(self.trades, rows)
 
@@ -771,6 +774,19 @@ class SettingsPage(QWidget):
         self.live = QCheckBox("Live: echte orders plaatsen op Bitvavo")
         self.live.toggled.connect(self._confirm_live)
         f.addRow("", self.live)
+        lb = QWidget()
+        lg = QHBoxLayout(lb)
+        lg.setContentsMargins(0, 0, 0, 0)
+        self.lb_checks = {}
+        for key, txt in (("volgers", "alleen volgers"), ("beide", "regels + volgers"), ("regels", "alleen regels")):
+            c = QCheckBox(txt)
+            self.lb_checks[key] = c
+            lg.addWidget(c)
+        lg.addStretch(1)
+        f.addRow("Live geld voor", lb)
+        f.addRow("", lab("Signalen die hier uit staan worden als schaduwtrade nagespeeld: zelfde regels, "
+                         "geen echt geld, wel eigen statistieken. De backtest liet zien dat 'alleen regels' "
+                         "verlies gaf.", "hint", wrap=True))
         mk = QWidget()
         mg = QGridLayout(mk)
         mg.setContentsMargins(0, 0, 0, 0)
@@ -1013,6 +1029,9 @@ class SettingsPage(QWidget):
         self.model.setCurrentText(cfg.get("model") or settings.MODELS[0])
         self.model_chief.setCurrentText(cfg.get("model_chief") or "(zelfde als agents)")
         self.shorts_on.setChecked(bool(cfg.get("shorts_sim", True)))
+        lbs = cfg.get("live_bronnen") or ["volgers", "beide"]
+        for key, c in self.lb_checks.items():
+            c.setChecked(key in lbs)
         self.api_cap.setValue(float(cfg.get("max_api_usd_month", 5.0) or 0))
         for key, s in self.r.items():
             s.setValue(cfg["rules"].get(key, settings.DEFAULTS["rules"][key]))
@@ -1035,6 +1054,7 @@ class SettingsPage(QWidget):
         cfg["keys"] = {"anthropic": self.k_ant.text().strip(), "bitvavo_key": self.k_bv.text().strip(),
                        "bitvavo_secret": self.k_bvs.text().strip()}
         cfg["live"] = self.live.isChecked()
+        cfg["live_bronnen"] = [k for k, c in self.lb_checks.items() if c.isChecked()]
         cfg["markets"] = [m for m, c in self.m_checks.items() if c.isChecked()]
         cfg["cycle_minutes"] = self.cycle.value()
         cfg["model"] = self.model.currentText()

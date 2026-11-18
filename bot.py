@@ -201,6 +201,8 @@ def init_db(path):
         for t in ("positions", "trades", "short_positions", "short_trades"):
             if "bron" not in [r[1] for r in con.execute(f"PRAGMA table_info({t})")]:
                 con.execute(f"ALTER TABLE {t} ADD COLUMN bron TEXT DEFAULT 'regels'")
+            if "schaduw" not in [r[1] for r in con.execute(f"PRAGMA table_info({t})")]:
+                con.execute(f"ALTER TABLE {t} ADD COLUMN schaduw INTEGER DEFAULT 0")
 
 
 class Engine:
@@ -334,6 +336,13 @@ class Engine:
         with self.db() as con:
             return {r["market"]: dict(r) for r in con.execute("SELECT * FROM positions")}
 
+    def is_shadow(self, bron):
+        """Live, maar dit signaal hoort niet bij de live-bronnen: dan alleen naspelen (schaduwtrade)."""
+        return self.live and (bron or "regels") not in (self.cfg.get("live_bronnen") or ["volgers", "beide"])
+
+    def mode_label(self, shadow):
+        return "SCHADUW" if shadow else ("LIVE" if self.live else "DROOG")
+
     def meta_get(self, key):
         with self.db() as con:
             r = con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
@@ -444,7 +453,9 @@ class Engine:
     def execute_buy(self, market, eur, reason, bron="regels"):
         px = self.price(market)
         fee_rate = self.rules["fee_pct"] / 100
-        if self.live:
+        shadow = self.is_shadow(bron)
+        real = self.live and not shadow
+        if real:
             res = self.bv.placeOrder(market, "buy", "market", {"amountQuote": f"{eur:.2f}"})
             if res.get("errorCode") == 307:
                 self.log("  KOOP mislukt: Bitvavo weigert dit IP-adres (307). Controleer de IP-whitelist van je key.", "bad")
@@ -461,13 +472,13 @@ class Engine:
             amount = (eur - fee) / px
             spent, fill_px = eur, px
         with self.db() as con:
-            con.execute("INSERT INTO positions(market,amount,entry_price,cost_eur,opened,bron) VALUES(?,?,?,?,?,?)",
-                        (market, amount, fill_px, spent, now(), bron))
-            con.execute("INSERT INTO trades(ts,market,side,amount,price,eur,fee,pnl,live,reason,bron) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                        (now(), market, "buy", amount, fill_px, spent, fee, 0, int(self.live), reason, bron))
-        self.push_trade(market, "buy", spent, fill_px, 0, reason)
-        self.log(f"  {'LIVE' if self.live else 'DROOG'} KOOP {market}: €{spent:.2f} @ {fmt_px(fill_px)}", "good")
+            con.execute("INSERT INTO positions(market,amount,entry_price,cost_eur,opened,bron,schaduw) "
+                        "VALUES(?,?,?,?,?,?,?)", (market, amount, fill_px, spent, now(), bron, int(shadow)))
+            con.execute("INSERT INTO trades(ts,market,side,amount,price,eur,fee,pnl,live,reason,bron,schaduw) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (now(), market, "buy", amount, fill_px, spent, fee, 0, int(real), reason, bron, int(shadow)))
+        self.push_trade(market, "buy", spent, fill_px, 0, ("[schaduw] " if shadow else "") + reason)
+        self.log(f"  {self.mode_label(shadow)} KOOP {market}: €{spent:.2f} @ {fmt_px(fill_px)}", "good")
 
     def execute_sell(self, market, reason):
         pos = self.get_positions().get(market)
@@ -475,7 +486,9 @@ class Engine:
             return
         px = self.price(market)
         amount = pos["amount"]
-        if self.live:
+        shadow = bool(pos.get("schaduw"))
+        real = self.live and not shadow
+        if real:
             base = market.split("-")[0]
             bal = self.bv.balance({"symbol": base})
             avail = float(bal[0]["available"]) if isinstance(bal, list) and bal else 0.0
@@ -501,12 +514,12 @@ class Engine:
         pnl = net - pos["cost_eur"]
         with self.db() as con:
             con.execute("DELETE FROM positions WHERE market=?", (market,))
-            con.execute("INSERT INTO trades(ts,market,side,amount,price,eur,fee,pnl,live,reason,bron) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                        (now(), market, "sell", amount, fill_px, net, fee, pnl, int(self.live), reason,
-                         pos.get("bron") or "regels"))
-        self.push_trade(market, "sell", net, fill_px, pnl, reason)
-        self.log(f"  {'LIVE' if self.live else 'DROOG'} VERKOOP {market}: €{net:.2f} (resultaat {pnl:+.2f})",
+            con.execute("INSERT INTO trades(ts,market,side,amount,price,eur,fee,pnl,live,reason,bron,schaduw) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (now(), market, "sell", amount, fill_px, net, fee, pnl, int(real), reason,
+                         pos.get("bron") or "regels", int(shadow)))
+        self.push_trade(market, "sell", net, fill_px, pnl, ("[schaduw] " if shadow else "") + reason)
+        self.log(f"  {self.mode_label(shadow)} VERKOOP {market}: €{net:.2f} (resultaat {pnl:+.2f})",
                  "good" if pnl >= 0 else "bad")
 
     def check_exits(self):
@@ -869,15 +882,16 @@ class Engine:
             b = con.execute("SELECT bot_eur, btc_hold_eur FROM benchmark ORDER BY id DESC LIMIT 1").fetchone()
             day = datetime.now(timezone.utc).strftime("%Y-%m-%d") + "%"
             pnl, sells = con.execute("SELECT COALESCE(SUM(pnl),0), COUNT(*) FROM trades "
-                                     "WHERE side='sell' AND ts LIKE ?", (day,)).fetchone()
-            buys = con.execute("SELECT COUNT(*) FROM trades WHERE side='buy' AND ts LIKE ?", (day,)).fetchone()[0]
+                                     "WHERE side='sell' AND ts LIKE ? AND COALESCE(schaduw,0)=0", (day,)).fetchone()
+            buys = con.execute("SELECT COUNT(*) FROM trades WHERE side='buy' AND ts LIKE ? AND COALESCE(schaduw,0)=0", (day,)).fetchone()[0]
             since = datetime.now(timezone.utc).timestamp() - 30 * 86400
             since = datetime.fromtimestamp(since, timezone.utc).isoformat()
             usd, calls = con.execute("SELECT COALESCE(SUM(usd),0), COUNT(*) FROM api_usage WHERE ts >= ?",
                                      (since,)).fetchone()
             marks = {(r["book"], r["market"]): dict(r) for r in con.execute("SELECT * FROM position_marks")}
             positions = []
-            for r in con.execute("SELECT market, cost_eur, entry_price, opened FROM positions"):
+            for r in con.execute("SELECT market, cost_eur, entry_price, opened, bron, COALESCE(schaduw,0) AS schaduw "
+                                 "FROM positions"):
                 plan = risk_gate.exit_plan(self.rules, r["market"], r["entry_price"])
                 mk = marks.get(("long", r["market"])) or {}
                 positions.append({"market": r["market"], "cost_eur": round(r["cost_eur"], 2),
@@ -886,7 +900,8 @@ class Engine:
                                   "price_now": mk.get("price"), "value_now": round(mk["value_eur"], 2) if mk else None,
                                   "pnl_now": round(mk["pnl_eur"], 2) if mk else None,
                                   "pnl_pct": round(mk["pnl_eur"] / r["cost_eur"] * 100, 2) if mk and r["cost_eur"] else None,
-                                  "marked_at": mk.get("ts")})
+                                  "marked_at": mk.get("ts"), "bron": r["bron"] or "regels",
+                                  "schaduw": bool(r["schaduw"])})
             short_positions = []
             for r in con.execute("SELECT * FROM short_positions"):
                 plan = risk_gate.exit_plan(self.rules, r["market"], r["entry_price"], "short")
@@ -904,12 +919,13 @@ class Engine:
                           for bk in ("long", "short")}
         stats["long"]["open_pnl"], stats["short"]["open_pnl"] = self.open_pnl()
         # Live: gerealiseerd resultaat + actuele waarde van open posities, en BTC vasthouden tegen de koers van nu.
-        open_value = sum(p["value_now"] or 0 for p in positions)
-        open_pnl = sum(p["pnl_now"] or 0 for p in positions)
+        real_pos = [p for p in positions if not p["schaduw"]]  # schaduwtrades zijn geen echt geld
+        open_value = sum(p["value_now"] or 0 for p in real_pos)
+        open_pnl = sum(p["pnl_now"] or 0 for p in real_pos)
         live_bot = live_hold = None
         try:
             with self.db() as con:
-                realized = con.execute("SELECT COALESCE(SUM(pnl),0) FROM trades WHERE side='sell'").fetchone()[0]
+                realized = con.execute("SELECT COALESCE(SUM(pnl),0) FROM trades WHERE side='sell' AND COALESCE(schaduw,0)=0").fetchone()[0]
             live_bot = round(budget + realized + open_pnl, 2)
             start = self.meta_get("btc_start_price")
             if start:
@@ -968,9 +984,10 @@ class Engine:
         budget = float(self.rules["budget_eur"])
         unrealized = 0.0
         for m, p in self.get_positions().items():
-            unrealized += p["amount"] * self.price(m) - p["cost_eur"]
+            if not p.get("schaduw"):
+                unrealized += p["amount"] * self.price(m) - p["cost_eur"]
         with self.db() as con:
-            pnl = con.execute("SELECT COALESCE(SUM(pnl),0) FROM trades WHERE side='sell'").fetchone()[0]
+            pnl = con.execute("SELECT COALESCE(SUM(pnl),0) FROM trades WHERE side='sell' AND COALESCE(schaduw,0)=0").fetchone()[0]
         try:
             btc = self.price("BTC-EUR")
             start = self.meta_get("btc_start_price")
