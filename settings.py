@@ -13,7 +13,8 @@ DEFAULTS = {
     "cycle_minutes": 120,
     "model": "claude-haiku-5-5",
     "model_chief": "",  # leeg = zelfde als model
-    "shorts_sim": True,  # Chief mag shorts kiezen; die worden alleen gesimuleerd
+    "shorts_sim": True,
+    "max_api_usd_month": 5.0,  # 0 = geen limiet  # Chief mag shorts kiezen; die worden alleen gesimuleerd
     "remote": {"enabled": False, "url": "https://pietface-trader-live.lovable.app/api/public/bot-ingest", "token": ""},
     "rules": {
         "budget_eur": 100,

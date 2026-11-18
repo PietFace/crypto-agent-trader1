@@ -40,30 +40,91 @@ EXIT_CHECK_SECONDS = 300  # stop-loss en koersdoel elke 5 minuten
 JSON_RULE = " Antwoord ALLEEN met geldig JSON, geen uitleg eromheen."
 PROMPTS = {
     "charts": "Je bent de Charts-agent: technisch analist voor crypto. Je krijgt indicatoren voor "
-              "1-uurs candles. Geef JSON: {\"richting\": \"omhoog|omlaag|neutraal\", \"score\": -1..1, "
+              "1-uurs candles (koers, RSI14, SMA20, SMA50, verandering 24 uur en 7 dagen, volume). "
+              "Geef een score van -1 (sterk dalend) tot 1 (sterk stijgend) voor de komende uren tot dagen. "
+              "Gebruik het hele bereik: 0 alleen als er echt geen richting is. "
+              "Geef JSON: {\"richting\": \"omhoog|omlaag|neutraal\", \"score\": -1..1, "
               "\"onderbouwing\": \"max 2 zinnen\"}." + JSON_RULE,
     "news": "Je bent de News-agent. Je krijgt recente crypto-koppen en een markt. Beoordeel of er "
-            "nieuws is dat deze munt de komende uren/dagen raakt. Geef JSON: {\"impact\": "
+            "nieuws is dat deze munt de komende uren/dagen raakt. Koersen in koppen staan meestal in "
+            "dollars, de markt is in euro's: dat is geen tegenstrijdigheid. Geef JSON: {\"impact\": "
             "\"positief|negatief|geen\", \"score\": -1..1, \"onderbouwing\": \"max 2 zinnen\"}. "
             "Bij geen relevant nieuws: score 0." + JSON_RULE,
     "sentiment": "Je bent de Sentiment-agent. Je krijgt de Fear & Greed Index (laatste 3 dagen). "
                  "Contrair denken is toegestaan: extreme angst kan een koopkans zijn, extreme hebzucht "
                  "een waarschuwing. Geef JSON: {\"stemming\": \"...\", \"score\": -1..1, "
                  "\"onderbouwing\": \"max 2 zinnen\"}." + JSON_RULE,
-    "skeptic": "Je bent de Skeptic. Je krijgt de rapporten van de andere agents en moet het sterkste "
-               "argument vinden om NIET te handelen. Wees kritisch op zwakke onderbouwing en op "
-               "tegenstrijdigheden. Geef JSON: {\"risico\": \"laag|midden|hoog\", \"sterkste_bezwaar\": "
-               "\"max 2 zinnen\"}." + JSON_RULE,
-    "chief": "Je bent de Chief: je beslist over een kleine portefeuille (ongeveer 100 euro, posities van hooguit 20 euro). "
-             "Je krijgt de rapporten van Charts, News, Sentiment en Skeptic, plus de huidige positie. "
-             "Kies buy, sell, short, cover of hold. buy = kopen omdat je een stijging verwacht; sell = een "
-             "bestaande koop-positie sluiten; short = inzetten op een daling (alleen als er geen short-positie "
-             "is); cover = een bestaande short sluiten. 'hold' is de standaard: handel alleen bij een "
-             "duidelijke edge en als de Skeptic geen zwaarwegend bezwaar heeft. Een kleine portefeuille kan "
-             "zich geen dure foutjes veroorloven. Stop-loss en koersdoel worden automatisch gezet. "
+    "skeptic": "Je bent de Skeptic. Je krijgt de rapporten van de andere agents en de setup die de "
+               "regels hebben gevonden. Zoek het sterkste argument TEGEN deze trade en weeg hoe zwaar het is. "
+               "Gewone onzekerheid hoort bij elke trade en is 'laag' of 'midden'. Gebruik 'hoog' alleen bij "
+               "een concreet, ernstig probleem: groot negatief nieuws over deze munt (hack, delisting, "
+               "rechtszaak), een crash of extreme beweging in de afgelopen uren, of duidelijk foute data. "
+               "Geef JSON: {\"risico\": \"laag|midden|hoog\", \"sterkste_bezwaar\": \"max 2 zinnen\"}."
+               + JSON_RULE,
+    "chief": "Je bent de Chief van een kleine portefeuille (ongeveer 100 euro, posities van hooguit 20 euro). "
+             "Je krijgt de rapporten van Charts, News, Sentiment en Skeptic, de huidige posities en een "
+             "'setup' die vaste regels in code al hebben berekend. Spelregels:\n"
+             "- setup.long is waar en de Skeptic zegt niet 'hoog': kies buy, tenzij je een concreet "
+             "argument hebt dat in de rapporten staat. Geef dan confidence 0.65 tot 0.85.\n"
+             "- setup.short is waar en de Skeptic zegt niet 'hoog': kies short (een gesimuleerde short), "
+             "onder dezelfde voorwaarden.\n"
+             "- Geen setup, of de Skeptic zegt 'hoog': kies hold.\n"
+             "- Je hebt een koop-positie en de charts zijn duidelijk omgeslagen (score onder -0.3): sell. "
+             "Je hebt een short en de charts zijn duidelijk omhoog (score boven 0.3): cover. "
+             "Stop-loss en koersdoel worden verder automatisch bewaakt.\n"
+             "- Bedrag: 20 euro; de risicopoort verkleint het zo nodig.\n"
              "Geef JSON: {\"action\": \"buy|sell|short|cover|hold\", \"amount_eur\": getal "
              "(alleen bij buy of short), \"confidence\": 0..1, \"reason\": \"max 3 zinnen\"}." + JSON_RULE,
 }
+
+
+def setup_for(ind, charts, news):
+    """Vaste regels in code: is er een koop- of short-setup? Geeft dict met long, short en redenen.
+
+    Long:  charts-score >= 0.3, koers boven SMA20, SMA20 niet ver onder SMA50 (trend draait of loopt omhoog),
+           nieuws niet negatief (score >= -0.2), RSI onder 70 (niet overkocht).
+    Short: het spiegelbeeld.
+    """
+    def f(x, default=0.0):
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return default
+    price, sma20, sma50 = f(ind.get("price")), f(ind.get("sma20")), f(ind.get("sma50"))
+    rsi14 = f(ind.get("rsi14"), 50)
+    cs = f(charts.get("score")) if "fout" not in charts else 0.0
+    ns = f(news.get("score")) if "fout" not in news else 0.0
+    checks_long = {
+        f"charts {cs:+.2f} >= +0.30": cs >= 0.3,
+        "koers boven SMA20": price > sma20 > 0,
+        "SMA20 hooguit 1% onder SMA50": sma50 > 0 and sma20 >= sma50 * 0.99,
+        f"nieuws {ns:+.2f} >= -0.20": ns >= -0.2,
+        f"RSI {rsi14:.0f} < 70": rsi14 < 70,
+    }
+    checks_short = {
+        f"charts {cs:+.2f} <= -0.30": cs <= -0.3,
+        "koers onder SMA20": 0 < price < sma20,
+        "SMA20 hooguit 1% boven SMA50": sma50 > 0 and sma20 <= sma50 * 1.01,
+        f"nieuws {ns:+.2f} <= +0.20": ns <= 0.2,
+        f"RSI {rsi14:.0f} > 30": rsi14 > 30,
+    }
+    return {
+        "long": all(checks_long.values()),
+        "short": all(checks_short.values()),
+        "long_checks": checks_long,
+        "short_checks": checks_short,
+    }
+
+
+def setup_text(st):
+    if st["long"]:
+        return "koop-setup ✓"
+    if st["short"]:
+        return "short-setup ✓"
+    best = max(("long", "short"), key=lambda k: sum(st[k + "_checks"].values()))
+    missing = [k for k, ok in st[best + "_checks"].items() if not ok]
+    n = sum(st[best + "_checks"].values())
+    return f"geen setup ({best} {n}/5, mist: {', '.join(missing)})"
 
 
 def now():
@@ -196,6 +257,11 @@ class Engine:
         self.log(f"Bot gestart ({'LIVE' if self.live else 'droog draaien'}): max €{self.rules['max_loss_per_trade_eur']} "
                  f"verlies per trade, max {self.rules['max_positions']} posities, daglimiet "
                  f"€{self.rules['daily_loss_limit_eur']}.", "info")
+        self.log(f"Model: {self.models['charts']}"
+                 + (f", Chief: {self.models['chief']}" if self.models['chief'] != self.models['charts'] else "")
+                 + f"; analyse elke {self.cycle_minutes} min; maandlimiet API "
+                 + (f"${float(self.cfg.get('max_api_usd_month', 5)):.2f}." if float(self.cfg.get('max_api_usd_month', 5) or 0) > 0 else "uit."),
+                 "info")
         self.log("Op afstand meekijken: " + ("aan, de stand gaat naar je telefoon." if self.remote else
                  "uit (zet het aan onder Instellingen > Op afstand meekijken)."), "info" if self.remote else "muted")
         last_cycle = 0.0
@@ -468,7 +534,23 @@ class Engine:
                  f"{borrow:.2f})", "good" if pnl >= 0 else "bad")
 
     # ---------- cyclus ----------
+    def api_cost_this_month(self):
+        month = datetime.now(timezone.utc).strftime("%Y-%m")
+        with self.db() as con:
+            return con.execute("SELECT COALESCE(SUM(usd),0) FROM api_usage WHERE ts LIKE ?",
+                               (month + "%",)).fetchone()[0]
+
     def run_cycle(self):
+        cap = float(self.cfg.get("max_api_usd_month", 5) or 0)
+        if cap > 0:
+            spent = self.api_cost_this_month()
+            if spent >= cap:
+                if not getattr(self, "_cap_warned", False):
+                    self.log(f"Maandlimiet API-kosten bereikt (${spent:.2f} van ${cap:.2f}). Geen nieuwe analyses "
+                             "tot volgende maand; stop-loss en koersdoel worden wel bewaakt.", "bad")
+                    self._cap_warned = True
+                return
+        self._cap_warned = False
         self.log(f"=== Cyclus {datetime.now():%d-%m %H:%M} ({'LIVE' if self.live else 'droog'}) ===", "head")
         self.cycle_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
         news = self.headlines()
@@ -487,10 +569,14 @@ class Engine:
             charts = self.ask("charts", ind)
             news_r = self.ask("news", {"market": market, "headlines": news})
             reports = {"charts": charts, "news": news_r, "sentiment": sentiment}
+            setup = setup_for(ind, charts, news_r)
+            if not self.shorts:
+                setup["short"] = False
+            setup_brief = {"long": setup["long"], "short": setup["short"]}
             skeptic = self.ask("skeptic", {"market": market, "indicatoren": ind, "rapporten": reports,
-                                           "positie": pos})
+                                           "setup": setup_brief, "positie": pos})
             chief_in = {"market": market, "indicatoren": ind, "rapporten": reports,
-                        "skeptic": skeptic, "positie": pos}
+                        "skeptic": skeptic, "setup": setup_brief, "positie": pos}
             if self.shorts:
                 chief_in["short_positie"] = spos
             else:
@@ -501,13 +587,24 @@ class Engine:
                 if "fout" in out and name != "chief":
                     self.log(f"{market}: {name}-agent gaf geen antwoord ({out['fout'][:120]})", "bad")
             self.last_verdict = None
+            self.last_setup = {"long": setup["long"], "short": setup["short"], "tekst": setup_text(setup),
+                               "long_checks": setup["long_checks"], "short_checks": setup["short_checks"]}
             executed = False
             if "fout" in decision:
                 self.log(f"{market}: Chief gaf geen antwoord ({decision['fout'][:120]})", "bad")
                 self.push_decision(market, ind, charts, news_r, sentiment, skeptic, decision, executed)
                 continue
             action = decision.get("action", "hold")
+            self.log(f"{market}: {setup_text(setup)}; Skeptic: {skeptic.get('risico', '?')}", "muted")
             self.log(f"{market}: Chief = {action} (zekerheid {decision.get('confidence')}) - {decision.get('reason')}")
+            if action in ("buy", "short"):
+                ok_setup = setup["long"] if action == "buy" else setup["short"]
+                if not ok_setup:
+                    self.log(f"  geen {'koop' if action == 'buy' else 'short'}-setup volgens de regels: houden", "muted")
+                    action = "hold"
+                elif str(skeptic.get("risico", "")).lower() == "hoog":
+                    self.log("  Skeptic ziet hoog risico: houden", "muted")
+                    action = "hold"
             if action == "buy" and not pos:
                 amount, why = self.risk_check_buy(market, float(decision.get("amount_eur", 0) or 0),
                                                   float(decision.get("confidence", 0) or 0))
@@ -548,7 +645,8 @@ class Engine:
             "indicators": ind, "charts": charts, "news": news_r, "sentiment": sentiment,
             "skeptic": skeptic, "chief": decision,
             "verdict": v["verdict"] if v else None, "verdict_reasons": v["reasons"] if v else [],
-            "amount_eur": v["amount_eur"] if v else None, "executed": executed})
+            "amount_eur": v["amount_eur"] if v else None, "executed": executed,
+            "setup": getattr(self, "last_setup", None)})
 
     def status_snapshot(self, running):
         budget = float(self.rules["budget_eur"])

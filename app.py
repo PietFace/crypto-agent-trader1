@@ -461,7 +461,16 @@ class SettingsPage(QWidget):
         f.addRow("Model Chief", self.model_chief)
         self.shorts_on = QCheckBox("Chief mag ook shorts kiezen (alleen simulatie, geen echt geld)")
         f.addRow("Shorten", self.shorts_on)
-        f.addRow("", lab("Haiku kost ongeveer $1 per maand, Sonnet voor alles ongeveer $20.", "hint", wrap=True))
+        self.api_cap = QDoubleSpinBox()
+        self.api_cap.setRange(0, 500)
+        self.api_cap.setSingleStep(1)
+        self.api_cap.setDecimals(2)
+        self.api_cap.setPrefix("$ ")
+        self.api_cap.setSpecialValueText("geen limiet")
+        f.addRow("Maandlimiet API-kosten", self.api_cap)
+        f.addRow("", lab("Haiku elke 2 uur kost ongeveer $1 per maand; Sonnet elk uur ongeveer $80. "
+                         "Boven de maandlimiet stopt de bot met analyseren (stop-loss blijft werken).",
+                         "hint", wrap=True))
         v.addWidget(g)
 
         # --- Risico
@@ -619,6 +628,7 @@ class SettingsPage(QWidget):
         self.model.setCurrentText(cfg.get("model") or settings.MODELS[0])
         self.model_chief.setCurrentText(cfg.get("model_chief") or "(zelfde als agents)")
         self.shorts_on.setChecked(bool(cfg.get("shorts_sim", True)))
+        self.api_cap.setValue(float(cfg.get("max_api_usd_month", 5.0) or 0))
         for key, s in self.r.items():
             s.setValue(cfg["rules"].get(key, settings.DEFAULTS["rules"][key]))
         sp = cfg["rules"].get("stop_pct", {})
@@ -646,6 +656,7 @@ class SettingsPage(QWidget):
         mc = self.model_chief.currentText()
         cfg["model_chief"] = "" if mc.startswith("(") else mc
         cfg["shorts_sim"] = self.shorts_on.isChecked()
+        cfg["max_api_usd_month"] = round(self.api_cap.value(), 2)
         cfg["rules"] = self.collect_rules()
         cfg["remote"] = {"enabled": self.rm_on.isChecked(), "url": self.rm_url.text().strip(),
                          "token": self.rm_token.text().strip()}
