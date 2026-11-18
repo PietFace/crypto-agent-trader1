@@ -15,11 +15,12 @@ DEFAULTS = {
     "model_chief": "",  # leeg = zelfde als model
     "shorts_sim": True,
     "max_api_usd_month": 5.0,  # 0 = geen limiet
+    "tick_seconds": 30,  # volgers, regels en stop-loss controleren
     "fast_check": True,  # elke 5 minuten zonder AI kijken; AI alleen bij een nieuwe setup
     "fast_cooldown_min": 30,  # per munt hooguit eens per zoveel minuten Skeptic+Chief tussendoor
     "followers": {
-        "enabled": True, "auto": True, "count": 10, "manual": [],
-        "min_traders": 3, "min_consensus": 0.6, "use_as_setup": True,
+        "enabled": True, "auto": True, "count": 20, "manual": [],
+        "min_traders": 4, "min_consensus": 0.6, "use_as_setup": True,
     },  # Chief mag shorts kiezen; die worden alleen gesimuleerd
     "remote": {"enabled": False, "url": "https://pietface-trader-live.lovable.app/api/public/bot-ingest", "token": ""},
     "rules": {
@@ -102,6 +103,9 @@ def _import_env(cfg):
     return False
 
 
+CFG_VERSION = 2
+
+
 def load():
     cfg = copy.deepcopy(DEFAULTS)
     p = config_path()
@@ -110,8 +114,21 @@ def load():
             _merge(cfg, json.load(open(p, encoding="utf-8")))
         except Exception:
             pass
-    elif _import_env(cfg):
-        save(cfg)
+        if int(cfg.get("cfg_version", 1)) < CFG_VERSION:
+            # Versie 2: 20 volgers, minstens 4 dezelfde kant op, elke 30 seconden kijken.
+            cfg["followers"]["count"] = 20
+            cfg["followers"]["min_traders"] = 4
+            cfg["tick_seconds"] = 30
+            # Kosten: Haiku voor alle agents en de grote analyse hooguit elke 2 uur.
+            cfg["model"] = "claude-haiku-5-5"
+            cfg["model_chief"] = ""
+            cfg["cycle_minutes"] = max(120, int(cfg.get("cycle_minutes", 120)))
+            cfg["cfg_version"] = CFG_VERSION
+            save(cfg)
+    else:
+        cfg["cfg_version"] = CFG_VERSION
+        if _import_env(cfg):
+            save(cfg)
     return cfg
 
 

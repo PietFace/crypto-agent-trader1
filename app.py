@@ -410,7 +410,7 @@ class FollowersPage(QWidget):
         self.btn.clicked.connect(self.repick)
         top.addWidget(self.btn)
         v.addLayout(top)
-        v.addWidget(lab("Winstgevende traders op Hyperliquid (openbare gegevens). Elke 5 minuten bekijkt de bot hun "
+        v.addWidget(lab("Winstgevende traders op Hyperliquid (openbare gegevens). Elke 30 seconden bekijkt de bot hun "
                         "posities. Staan genoeg van hen dezelfde kant op, dan is dat een volger-setup. "
                         "Alleen kijken: er wordt niets automatisch gekopieerd.", "hint", wrap=True))
         self.note = lab("", "banner", wrap=True)
@@ -645,7 +645,7 @@ class SettingsPage(QWidget):
         self.fw_auto = QCheckBox("Automatisch kiezen van het leaderboard")
         f.addRow("", self.fw_auto)
         self.fw_count = QSpinBox()
-        self.fw_count.setRange(3, 30)
+        self.fw_count.setRange(3, 50)
         f.addRow("Aantal traders", self.fw_count)
         self.fw_min = QSpinBox()
         self.fw_min.setRange(1, 20)
@@ -662,8 +662,13 @@ class SettingsPage(QWidget):
         f.addRow("", lab("Eensgezindheid 0,6 betekent: van de gevolgde traders met een positie in die munt staat "
                          "een duidelijke meerderheid dezelfde kant op (bijvoorbeeld 4 long, 1 short).",
                          "hint", wrap=True))
-        self.fast_on = QCheckBox("Elke 5 minuten checken; AI alleen bij een nieuwe setup")
+        self.fast_on = QCheckBox("Tussendoor checken; AI alleen bij een nieuwe setup")
         f.addRow("Snelle check", self.fast_on)
+        self.tick = QSpinBox()
+        self.tick.setRange(10, 600)
+        self.tick.setSingleStep(10)
+        self.tick.setSuffix(" seconden")
+        f.addRow("Volgers en regels checken elke", self.tick)
         self.fast_cd = QSpinBox()
         self.fast_cd.setRange(5, 240)
         self.fast_cd.setSuffix(" minuten")
@@ -772,6 +777,7 @@ class SettingsPage(QWidget):
         self.fw_manual.setPlainText("\n".join(fc.get("manual", [])))
         self.fast_on.setChecked(bool(cfg.get("fast_check", True)))
         self.fast_cd.setValue(int(cfg.get("fast_cooldown_min", 30)))
+        self.tick.setValue(int(cfg.get("tick_seconds", 30)))
         self.rm_url.setText(rc.get("url", ""))
         self.rm_token.setText(rc.get("token", ""))
         self.model.setCurrentText(cfg.get("model") or settings.MODELS[0])
@@ -814,6 +820,7 @@ class SettingsPage(QWidget):
                                        if x.strip().startswith("0x")]}
         cfg["fast_check"] = self.fast_on.isChecked()
         cfg["fast_cooldown_min"] = self.fast_cd.value()
+        cfg["tick_seconds"] = self.tick.value()
         cfg["remote"] = {"enabled": self.rm_on.isChecked(), "url": self.rm_url.text().strip(),
                          "token": self.rm_token.text().strip()}
         settings.save(cfg)

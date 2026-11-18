@@ -36,7 +36,8 @@ import settings
 
 FEEDS = ["https://www.coindesk.com/arc/outboundfeeds/rss/",
          "https://cointelegraph.com/rss"]
-EXIT_CHECK_SECONDS = 300
+TICK_SECONDS = 30          # volgers, regels, stop-loss en koersdoel: elke 30 seconden
+STATUS_EVERY_SECONDS = 60  # stand naar de telefoon: hooguit eens per minuut
 EV_WORD = {"open": "opent", "sluit": "sluit", "draait": "draait naar"}  # stop-loss en koersdoel elke 5 minuten
 
 JSON_RULE = " Antwoord ALLEEN met geldig JSON, geen uitleg eromheen."
@@ -275,12 +276,15 @@ class Engine:
                  f"€{self.rules['daily_loss_limit_eur']}.", "info")
         self.log(f"Model: {self.models['charts']}"
                  + (f", Chief: {self.models['chief']}" if self.models['chief'] != self.models['charts'] else "")
-                 + f"; analyse elke {self.cycle_minutes} min; maandlimiet API "
+                 + f"; analyse elke {self.cycle_minutes} min; volgers/regels elke "
+                 + f"{max(10, int(self.cfg.get('tick_seconds', TICK_SECONDS)))} s; maandlimiet API "
                  + (f"${float(self.cfg.get('max_api_usd_month', 5)):.2f}." if float(self.cfg.get('max_api_usd_month', 5) or 0) > 0 else "uit."),
                  "info")
         self.log("Op afstand meekijken: " + ("aan, de stand gaat naar je telefoon." if self.remote else
                  "uit (zet het aan onder Instellingen > Op afstand meekijken)."), "info" if self.remote else "muted")
         last_cycle = 0.0
+        last_status = 0.0
+        tick = max(10, int(self.cfg.get("tick_seconds", TICK_SECONDS)))
         while not self._stop.is_set():
             if Path(settings.stop_path()).exists():
                 self.log("STOP-bestand gevonden, bot stopt. Open posities blijven staan.", "bad")
@@ -300,8 +304,10 @@ class Engine:
             except Exception as e:
                 self.busy = False
                 self.log(f"Fout in loop: {e}", "bad")
-            self.push_status(True)
-            self._stop.wait(EXIT_CHECK_SECONDS)
+            if time.time() - last_status >= STATUS_EVERY_SECONDS:
+                self.push_status(True)
+                last_status = time.time()
+            self._stop.wait(tick)
         self.next_cycle = None
         self.busy = False
         self.push_status(False)

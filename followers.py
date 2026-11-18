@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 import requests
 
 INFO_URL = "https://api.hyperliquid.xyz/info"
+_session = requests.Session()  # één verbinding hergebruiken: sneller bij elke 30 seconden
 LEADERBOARD_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
 LEADERBOARD_MAX_AGE = 24 * 3600
 
@@ -110,7 +111,7 @@ def pick_traders(rows, n=10, min_account=50_000):
 
 # ---------------------------------------------------------------- posities
 def fetch_positions(address, timeout=15):
-    r = requests.post(INFO_URL, json={"type": "clearinghouseState", "user": address}, timeout=timeout)
+    r = _session.post(INFO_URL, json={"type": "clearinghouseState", "user": address}, timeout=timeout)
     r.raise_for_status()
     out = {}
     for ap in r.json().get("assetPositions") or []:
