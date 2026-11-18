@@ -21,6 +21,17 @@ SYMBOLS = {
 EURUSD = "PF_EURUSD"
 
 
+def sym_of(x):
+    """Bitvavo-markt (BTC-EUR) of Kraken-symbool (PF_XBTUSD) -> Kraken-symbool."""
+    return SYMBOLS.get(x, x)
+
+
+def symbol_for_coin(coin):
+    """Hyperliquid-munt (BTC, ETH, HYPE, ...) -> Kraken-perp. Bitcoin heet bij Kraken XBT."""
+    c = str(coin).upper()
+    return "PF_XBTUSD" if c == "BTC" else f"PF_{c}USD"
+
+
 class KrakenPublic:
     """Haalt alle tickers in één keer op en bewaart ze een paar seconden."""
 
@@ -47,12 +58,12 @@ class KrakenPublic:
             return self._tickers
 
     def supported(self, market):
-        sym = SYMBOLS.get(market)
+        sym = sym_of(market)
         t = self.tickers().get(sym) if sym else None
         return bool(t) and not t.get("suspended")
 
     def _ticker(self, market):
-        sym = SYMBOLS.get(market)
+        sym = sym_of(market)
         if not sym:
             raise KeyError(f"{market} heeft geen Kraken-perp")
         t = self.tickers().get(sym)
@@ -175,7 +186,7 @@ class KrakenPrivate:
 
     def size_for(self, market, eur):
         """Aantal munten voor een positie van 'eur' euro, afgerond naar beneden op Krakens stapgrootte."""
-        sym = SYMBOLS[market]
+        sym = sym_of(market)
         units = eur / self.pub.price(market)
         p = self.precision(sym)
         step = 10 ** -p
@@ -187,7 +198,7 @@ class KrakenPrivate:
     # --- orders
     def market_order(self, market, side, size, reduce_only=False):
         """Market-order. Geeft (gevulde hoeveelheid, gemiddelde prijs in EUR, order_id)."""
-        sym = SYMBOLS[market]
+        sym = sym_of(market)
         p = self.precision(sym)
         params = {"orderType": "mkt", "symbol": sym, "side": side, "size": f"{size:.{max(p, 0)}f}"}
         if reduce_only:
@@ -203,7 +214,7 @@ class KrakenPrivate:
 
     def stop_order(self, market, side, size, stop_eur):
         """Stop-loss bij Kraken zelf (reduce-only, op de mark-prijs). Werkt ook als je pc uit staat."""
-        sym = SYMBOLS[market]
+        sym = sym_of(market)
         p = self.precision(sym)
         stop_usd = self.usd_price(market, stop_eur)
         tick = self.tick(sym)

@@ -4,6 +4,7 @@ import os
 import queue
 import sqlite3
 import sys
+import threading
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QTextCursor
@@ -582,6 +583,252 @@ class EquityChart(QWidget):
         qp.drawText(pad + 6, h - 8, "— bot (regels)")
         qp.setPen(QColor(C["info"]))
         qp.drawText(pad + 130, h - 8, "— BTC vasthouden")
+
+
+class CopyPage(QWidget):
+    """Kopieer-modus: traders 1-op-1 volgen op Kraken, plus de vingerafdruk-zoeker voor Invo-traders."""
+
+    def __init__(self, win):
+        super().__init__()
+        self.win = win
+        self._q = queue.Queue()
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        inner.setObjectName("page")
+        v = QVBoxLayout(inner)
+        v.setContentsMargins(28, 24, 28, 24)
+        v.setSpacing(10)
+        scroll.setWidget(inner)
+        outer.addWidget(scroll)
+
+        top = QHBoxLayout()
+        top.addWidget(lab("Kopiëren", "h1"))
+        top.addStretch(1)
+        self.save_btn = QPushButton("Opslaan")
+        self.save_btn.setObjectName("primary")
+        self.save_btn.clicked.connect(self.save)
+        top.addWidget(self.save_btn)
+        v.addLayout(top)
+        v.addWidget(lab("Volgt gekozen traders 1-op-1 op Kraken: opent hij een nieuwe positie, dan opent de bot "
+                        "dezelfde kant; sluit hij, dan sluit de bot ook. Alleen nieuwe posities, nooit instappen in "
+                        "een positie die al openstond. Elke kopie krijgt een noodstop. Wijzigingen gelden na het "
+                        "opnieuw starten van de bot.", "hint", wrap=True))
+
+        g = QGroupBox("Instellingen")
+        f = QFormLayout(g)
+        self.on = QCheckBox("Kopieer-modus aan")
+        f.addRow("", self.on)
+        self.live = QCheckBox("Live: echt geld (werkt alleen als de bot zelf live op Kraken staat)")
+        self.live.toggled.connect(self._confirm_live)
+        f.addRow("", self.live)
+        self.every = QSpinBox(); self.every.setRange(2, 60); self.every.setSuffix(" s")
+        f.addRow("Kijken elke", self.every)
+        self.stake = QDoubleSpinBox(); self.stake.setRange(2, 500); self.stake.setPrefix("€ ")
+        f.addRow("Inzet per trade", self.stake)
+        self.maxlev = QSpinBox(); self.maxlev.setRange(1, 10); self.maxlev.setSuffix("x")
+        f.addRow("Hefboom max", self.maxlev)
+        self.maxpos = QSpinBox(); self.maxpos.setRange(1, 20)
+        f.addRow("Max kopieën tegelijk", self.maxpos)
+        self.dayloss = QDoubleSpinBox(); self.dayloss.setRange(1, 1000); self.dayloss.setPrefix("€ ")
+        f.addRow("Daglimiet verlies", self.dayloss)
+        self.stop_l = QDoubleSpinBox(); self.stop_l.setRange(0.5, 50); self.stop_l.setSuffix(" %")
+        f.addRow("Noodstop lange traders", self.stop_l)
+        self.stop_k = QDoubleSpinBox(); self.stop_k.setRange(0.5, 50); self.stop_k.setSuffix(" %")
+        f.addRow("Noodstop korte traders", self.stop_k)
+        self.hint = lab("", "hint", wrap=True)
+        f.addRow("", self.hint)
+        for w in (self.stake, self.maxlev, self.stop_l, self.stop_k):
+            w.valueChanged.connect(self._update_hint)
+        v.addWidget(g)
+
+        v.addWidget(lab("TRADERS (één per regel: adres naam lang/kort)", "cap"))
+        self.traders = QPlainTextEdit()
+        self.traders.setPlaceholderText("0x1234…abcd blackstallion lang")
+        self.traders.setMaximumHeight(140)
+        v.addWidget(self.traders)
+
+        v.addWidget(lab("INVO-TRADER ZOEKEN (vingerafdruk)", "cap"))
+        v.addWidget(lab("Zoekt in de openbare Invo-trades op Hyperliquid naar het adres dat dezelfde trades deed als "
+                        "op het Invo-profiel. De eerste keer duurt het een paar minuten (30 dagen aan bestanden), "
+                        "daarna gaat het snel. Dubbelklik op een uitkomst om hem bij de traders te zetten.",
+                        "hint", wrap=True))
+        row = QHBoxLayout()
+        import copier
+        self.fp = QComboBox()
+        self.fp.addItems(["Alle van onze lijst"] + list(copier.FINGERPRINTS))
+        row.addWidget(self.fp)
+        self.find_btn = QPushButton("Zoeken")
+        self.find_btn.clicked.connect(self.find)
+        row.addWidget(self.find_btn)
+        row.addStretch(1)
+        v.addLayout(row)
+        self.find_status = lab("", "sub", wrap=True)
+        v.addWidget(self.find_status)
+        self.found = table(["Invo-naam", "Adres", "Treffers", "Account $ nu", "Account $ op Invo", "Stijl"])
+        self.found.setSelectionMode(QTableWidget.SingleSelection)
+        self.found.setSelectionBehavior(QTableWidget.SelectRows)
+        self.found.cellDoubleClicked.connect(self._add_found)
+        self.found.setMinimumHeight(180)
+        v.addWidget(self.found)
+
+        v.addWidget(lab("OPEN KOPIEËN", "cap"))
+        self.open_t = table(["Geopend", "Munt", "Kant", "Hefboom", "Positie", "Instap", "Noodstop", "Trader", "Echt"])
+        self.open_t.setMinimumHeight(140)
+        v.addWidget(self.open_t)
+        v.addWidget(lab("GESLOTEN KOPIEËN (bot naast de trader)", "cap"))
+        self.closed_t = table(["Dicht", "Munt", "Kant", "Trader", "Bot €", "Bot % inzet", "Trader % (zelfde hefboom)",
+                               "Kosten", "Reden"])
+        self.closed_t.setMinimumHeight(220)
+        v.addWidget(self.closed_t)
+        self.total = lab("", "sub", wrap=True)
+        v.addWidget(self.total)
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._poll)
+        self._loading = False
+
+    # --- laden/opslaan
+    def load(self, cfg):
+        self._loading = True
+        c = cfg.get("copy") or settings.DEFAULTS["copy"]
+        d = settings.DEFAULTS["copy"]
+        self.on.setChecked(bool(c.get("enabled")))
+        self.live.setChecked(bool(c.get("live")))
+        self.every.setValue(int(c.get("interval_s", d["interval_s"])))
+        self.stake.setValue(float(c.get("eur_per_trade", d["eur_per_trade"])))
+        self.maxlev.setValue(int(c.get("max_leverage", d["max_leverage"])))
+        self.maxpos.setValue(int(c.get("max_positions", d["max_positions"])))
+        self.dayloss.setValue(float(c.get("daily_loss_eur", d["daily_loss_eur"])))
+        self.stop_l.setValue(float(c.get("stop_pct_lang", d["stop_pct_lang"])))
+        self.stop_k.setValue(float(c.get("stop_pct_kort", d["stop_pct_kort"])))
+        self.traders.setPlainText("\n".join(f"{t['address']} {t.get('name', '')} {t.get('style', 'lang')}"
+                                            for t in c.get("traders", [])))
+        self._loading = False
+        self._update_hint()
+
+    def save(self):
+        traders = []
+        for line in self.traders.toPlainText().splitlines():
+            parts = line.split()
+            if parts and parts[0].lower().startswith("0x") and len(parts[0]) == 42:
+                style = parts[2].lower() if len(parts) > 2 and parts[2].lower() in ("lang", "kort") else "lang"
+                traders.append({"address": parts[0].lower(), "name": parts[1] if len(parts) > 1 else parts[0][:8],
+                                "style": style})
+        self.win.cfg["copy"] = {
+            "enabled": self.on.isChecked(), "live": self.live.isChecked(), "interval_s": self.every.value(),
+            "eur_per_trade": round(self.stake.value(), 2), "max_leverage": self.maxlev.value(),
+            "max_positions": self.maxpos.value(), "daily_loss_eur": round(self.dayloss.value(), 2),
+            "stop_pct_lang": round(self.stop_l.value(), 2), "stop_pct_kort": round(self.stop_k.value(), 2),
+            "traders": traders}
+        settings.save(self.win.cfg)
+        self.win.log(f"Kopieer-instellingen opgeslagen ({len(traders)} traders). Start de bot opnieuw om ze te "
+                     "gebruiken.", "info")
+
+    def _update_hint(self):
+        if self._loading:
+            return
+        lev = self.maxlev.value()
+        pos = self.stake.value() * lev
+        sl = min(self.stop_l.value(), 80 / lev)
+        sk = min(self.stop_k.value(), 80 / lev)
+        self.hint.setText(f"Bij {lev}x: positie €{pos:.0f}. Max verlies per trade ongeveer €{pos * sl / 100:.2f} "
+                          f"(lang) en €{pos * sk / 100:.2f} (kort), plus €{pos * 0.001:.2f} kosten. De noodstop ligt "
+                          f"nooit verder dan 80% van je inzet.")
+
+    def _confirm_live(self, on):
+        if self._loading or not on:
+            return
+        ok = QMessageBox.question(self, "Kopiëren met echt geld",
+                                  "De bot opent en sluit dan echte posities op Kraken, met hefboom, zodra de gekozen "
+                                  "traders dat doen. Heb je het eerst droog getest en is de inzet een bedrag dat je "
+                                  "kunt missen?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if ok != QMessageBox.Yes:
+            self.live.setChecked(False)
+
+    # --- vingerafdruk
+    def find(self):
+        import copier
+        name = self.fp.currentText()
+        names = list(copier.FINGERPRINTS) if name.startswith("Alle") else [name]
+        self.find_btn.setEnabled(False)
+        self.found.setRowCount(0)
+
+        def work():
+            rows = []
+            try:
+                for n in names:
+                    fp = copier.FINGERPRINTS[n]
+                    res = copier.find_trader(fp["trades"], settings.data_dir(), account=fp.get("account"),
+                                             progress=lambda t, n=n: self._q.put(("msg", f"@{n}: {t}")))
+                    for c in res[:3]:
+                        rows.append([n, c["address"], f"{c['matches']} van {c['of']}",
+                                     f"{c['account']:,.0f}" if c["account"] else "?",
+                                     f"{fp['account']:,}" if fp.get("account") else "verborgen", fp["style"]])
+                    if not res:
+                        rows.append([n, "niet gevonden", "", "", "", fp["style"]])
+                    self._q.put(("rows", list(rows)))
+                self._q.put(("done", len(names)))
+            except Exception as e:
+                self._q.put(("err", str(e)))
+        threading.Thread(target=work, daemon=True).start()
+        self._timer.start(300)
+
+    def _poll(self):
+        while True:
+            try:
+                kind, val = self._q.get_nowait()
+            except queue.Empty:
+                return
+            if kind == "msg":
+                self.find_status.setText(val)
+            elif kind == "rows":
+                fill(self.found, val)
+            elif kind == "err":
+                self._timer.stop()
+                self.find_btn.setEnabled(True)
+                self.find_status.setText(f"Zoeken mislukt: {val}")
+            else:
+                self._timer.stop()
+                self.find_btn.setEnabled(True)
+                self.find_status.setText("Klaar. Bovenaan per naam staat de beste match: de meeste treffers en een "
+                                         "accountwaarde die het dichtst bij Invo ligt. Dubbelklik om toe te voegen.")
+
+    def _add_found(self, r, _c):
+        name = self.found.item(r, 0).text()
+        addr = self.found.item(r, 1).text()
+        style = self.found.item(r, 5).text()
+        if not addr.startswith("0x"):
+            return
+        text = self.traders.toPlainText().strip()
+        if addr in text.lower():
+            return
+        self.traders.setPlainText((text + "\n" if text else "") + f"{addr} {name} {style}")
+        self.find_status.setText(f"@{name} toegevoegd. Klik op Opslaan en start de bot opnieuw.")
+
+    # --- tabellen
+    def refresh(self):
+        rows = []
+        for r in query("SELECT opened, coin, side, leverage, cost_eur, entry_price, stop_price, trader_name, echt "
+                       "FROM copy_positions ORDER BY opened DESC"):
+            opened, coin, side, lev, cost, entry, stop, tn, real = r
+            rows.append([local_time(opened), coin, side, f"{lev:.0f}x", eur(cost or 0), fmt_px(entry or 0),
+                         fmt_px(stop or 0), tn, "ja" if real else "droog"])
+        fill(self.open_t, rows)
+        rows, tot, n, wins = [], 0.0, 0, 0
+        for r in query("SELECT closed, coin, side, trader_name, pnl_eur, pnl_pct, trader_pct, fee_eur, reason "
+                       "FROM copy_trades ORDER BY id DESC LIMIT 300"):
+            closed, coin, side, tn, pnl, pct, tpct, fee, reason = r
+            tot += pnl or 0
+            n += 1
+            wins += 1 if (pnl or 0) > 0 else 0
+            rows.append([local_time(closed), coin, side, tn, eur(pnl or 0, True), f"{(pct or 0):+.1f}%",
+                         f"{tpct:+.1f}%" if tpct is not None else "?", eur(fee or 0), reason])
+        fill(self.closed_t, rows)
+        self.total.setText(f"{n} kopieën gesloten, {wins} met winst, totaal {eur(tot, True)}." if n else
+                           "Nog geen gesloten kopieën.")
+
 
 
 def backtest_lines(rows, months, ex):
@@ -1230,8 +1477,9 @@ class MainWindow(QMainWindow):
         self.navs = []
         self.fol = FollowersPage(self)
         self.bt = BacktestPage(self)
+        self.cp = CopyPage(self)
         for i, (name, page) in enumerate([("Bot", self.bot), ("Overzicht", self.over), ("Volgers", self.fol),
-                                          ("Backtest", self.bt), ("Instellingen", self.sets)]):
+                                          ("Kopiëren", self.cp), ("Backtest", self.bt), ("Instellingen", self.sets)]):
             page.setObjectName("page")
             self.stack.addWidget(page)
             b = QPushButton(name)
@@ -1249,9 +1497,10 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
         self.sets.load(self.cfg)
+        self.cp.load(self.cfg)
         self.go(0)
         if not self.cfg["keys"].get("anthropic"):
-            self.go(4)
+            self.go(5)
             self.sets.note.setText("Welkom! Vul eerst je API-keys in en klik op Opslaan. "
                                    "De bot begint altijd met droog draaien (geen echte orders).")
             self.sets.note.show()
@@ -1279,6 +1528,8 @@ class MainWindow(QMainWindow):
             self.over.refresh()
         if i == 2:
             self.fol.refresh()
+        if i == 3:
+            self.cp.refresh()
 
     def log(self, text, kind=""):
         self.msgq.put((text, kind))
@@ -1331,7 +1582,7 @@ class MainWindow(QMainWindow):
         if missing:
             QMessageBox.warning(self, "Kan niet starten", "Eerst nog regelen:\n\n• " + "\n• ".join(missing))
             self.engine = None
-            self.go(4)
+            self.go(5)
             return
         self.engine.start()
         self.refresh()

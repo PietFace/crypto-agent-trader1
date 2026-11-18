@@ -32,6 +32,11 @@ import kosten
 import remote
 from followers import Followers, coin_of, follower_setup, short_addr
 import risk_gate
+
+
+def kraken_sym(market):
+    import kraken
+    return kraken.SYMBOLS.get(market, market)
 import settings
 
 FEEDS = ["https://www.coindesk.com/arc/outboundfeeds/rss/",
@@ -208,6 +213,8 @@ def init_db(path):
                 con.execute(f"ALTER TABLE {t} ADD COLUMN ext_stop TEXT")
             if "echt" not in [r[1] for r in con.execute(f"PRAGMA table_info({t})")]:
                 con.execute(f"ALTER TABLE {t} ADD COLUMN echt INTEGER DEFAULT 0")
+        import copier
+        copier.init_db(con)
 
 
 class Engine:
@@ -222,6 +229,7 @@ class Engine:
         self.live = bool(cfg.get("live"))
         self.kr = None
         self.lev = max(1, int(self.rules.get("leverage", 1) or 1))
+        self.copier = None
         self.kx = None
         if self.exchange == "kraken":
             import kraken
@@ -260,6 +268,10 @@ class Engine:
         self.remote = None
         if rc.get("enabled") and rc.get("url") and rc.get("token"):
             self.remote = remote.Remote(rc["url"], rc["token"], self._ui_log)
+        cc = cfg.get("copy") or {}
+        if cc.get("enabled"):
+            import copier
+            self.copier = copier.CopyEngine(self, cc)
 
     def log(self, text, kind=""):
         self._ui_log(text, kind)
@@ -325,6 +337,8 @@ class Engine:
                  "info")
         self.log("Op afstand meekijken: " + ("aan, de stand gaat naar je telefoon." if self.remote else
                  "uit (zet het aan onder Instellingen > Op afstand meekijken)."), "info" if self.remote else "muted")
+        if self.copier:
+            self.copier.start()
         last_cycle = 0.0
         last_status = 0.0
         tick = max(10, int(self.cfg.get("tick_seconds", TICK_SECONDS)))
@@ -351,6 +365,8 @@ class Engine:
                 self.push_status(True)
                 last_status = time.time()
             self._stop.wait(tick)
+        if self.copier:
+            self.copier.stop()
         self.next_cycle = None
         self.busy = False
         self.push_status(False)
@@ -494,8 +510,21 @@ class Engine:
         return res["amount_eur"], "ok"
 
     # ---------- orders ----------
+    def main_holds_real(self, symbol):
+        """Heeft de hoofdbot een echte Kraken-positie op dit symbool? (voor de kopieer-modus)"""
+        if not self.kx:
+            return False
+        import kraken
+        for book in (self.get_positions(), self.get_short_positions()):
+            for m, p in book.items():
+                if p.get("echt") and kraken.SYMBOLS.get(m) == symbol:
+                    return True
+        return False
+
     def kraken_conflict(self, market, book):
         """Kraken telt long en short op dezelfde munt bij elkaar op. Dus nooit allebei tegelijk echt."""
+        if self.copier and kraken_sym(market) in self.copier.open_symbols(real_only=True):
+            return True
         other = self.get_short_positions() if book == "long" else self.get_positions()
         pos = other.get(market)
         return bool(pos and pos.get("echt"))

@@ -1,0 +1,401 @@
+"""Kopieer-modus: gekozen Hyperliquid-traders 1-op-1 volgen op Kraken.
+
+- Elke paar seconden (standaard 5) de posities van de gekozen traders ophalen.
+- Opent een trader een NIEUWE positie, dan opent de bot dezelfde kant op Kraken (droog of live).
+- Sluit de trader (of draait hij om), dan sluit de bot ook.
+- Altijd een noodstop: op Kraken zelf als je live gaat, en in de bot bij droog draaien.
+- Een vaste inzet per trade, een maximale hefboom en een daglimiet.
+- Per trade wordt bewaard wat de trader deed en wat de bot deed, zodat je ziet hoeveel de bot achterloopt.
+
+Daarnaast: de vingerafdruk-zoeker, die een Invo-trader op Hyperliquid terugvindt aan de hand van een
+paar van zijn trades (munt + prijs) in de openbare builder-bestanden van Invo.
+"""
+import csv
+import io
+import json
+import os
+import sqlite3
+import threading
+import time
+from datetime import datetime, timedelta, timezone
+
+import requests
+
+import kraken
+
+INFO_URL = "https://api.hyperliquid.xyz/info"
+_http = requests.Session()
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def init_db(con):
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS copy_positions(
+        coin TEXT PRIMARY KEY, symbol TEXT, side TEXT, amount REAL, entry_price REAL, cost_eur REAL,
+        leverage REAL, opened TEXT, trader TEXT, trader_name TEXT, trader_entry REAL, stop_price REAL,
+        ext_stop TEXT, echt INTEGER DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS copy_trades(
+        id INTEGER PRIMARY KEY, opened TEXT, closed TEXT, coin TEXT, side TEXT, trader TEXT, trader_name TEXT,
+        cost_eur REAL, leverage REAL, entry REAL, exit REAL, trader_entry REAL, trader_exit REAL,
+        pnl_eur REAL, pnl_pct REAL, trader_pct REAL, fee_eur REAL, reason TEXT, echt INTEGER DEFAULT 0);
+    """)
+
+
+# ---------------------------------------------------------------- Hyperliquid
+def trader_state(address, timeout=10):
+    """{'account': $, 'positions': {coin: {side, size, entry, leverage}}}"""
+    r = _http.post(INFO_URL, json={"type": "clearinghouseState", "user": address}, timeout=timeout)
+    r.raise_for_status()
+    js = r.json()
+    pos = {}
+    for ap in js.get("assetPositions") or []:
+        p = ap.get("position") or {}
+        try:
+            szi = float(p.get("szi") or 0)
+        except (TypeError, ValueError):
+            continue
+        if szi == 0:
+            continue
+        lev = p.get("leverage") or {}
+        pos[str(p.get("coin", "")).upper()] = {
+            "side": "long" if szi > 0 else "short", "size": abs(szi),
+            "entry": float(p.get("entryPx") or 0),
+            "leverage": float(lev.get("value") or 1) if isinstance(lev, dict) else 1.0}
+    acct = float((js.get("marginSummary") or {}).get("accountValue") or 0)
+    return {"account": acct, "positions": pos}
+
+
+# ---------------------------------------------------------------- kopieer-motor
+class CopyEngine:
+    def __init__(self, engine, cfg):
+        self.e = engine            # bot.Engine: log, db, push_trade
+        self.cfg = cfg
+        self.kr = engine.kr or kraken.KrakenPublic()   # koersen: altijd Kraken
+        self.kx = engine.kx                            # orders: alleen als de bot live op Kraken staat
+        self.known = {}            # trader -> {coin: side} van de vorige ronde
+        self.first_round = set()   # traders waarvan we de beginstand al kennen
+        self._stop = threading.Event()
+        self._thread = None
+        with self.e.db() as con:
+            init_db(con)
+
+    # --- instellingen
+    @property
+    def traders(self):
+        out = []
+        for t in self.cfg.get("traders", []):
+            a = str(t.get("address", "")).strip().lower()
+            if a.startswith("0x") and len(a) == 42:
+                out.append({"address": a, "name": t.get("name") or a[:8], "style": t.get("style", "lang")})
+        return out
+
+    def live(self):
+        """Echt geld alleen als de bot live op Kraken staat én kopiëren apart op live is gezet."""
+        return bool(self.kx) and bool(self.cfg.get("live", False))
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+    def _loop(self):
+        every = max(2, int(self.cfg.get("interval_s", 5)))
+        names = ", ".join(t["name"] for t in self.traders) or "(nog geen traders)"
+        self.e.log(f"Kopieer-modus {'LIVE' if self.live() else 'droog'}: elke {every} s kijken naar {names}. "
+                   f"Inzet €{self.cfg.get('eur_per_trade', 10)} per trade, hefboom max "
+                   f"{self.cfg.get('max_leverage', 10)}x. Alleen nieuwe posities worden gekopieerd.", "info")
+        while not self._stop.is_set():
+            try:
+                self.tick()
+            except Exception as ex:
+                self.e.log(f"Kopieer-modus: fout ({ex})", "bad")
+            self._stop.wait(every)
+
+    # --- één ronde
+    def tick(self):
+        if self.live():
+            self.sync_kraken()
+        mine = self.positions()
+        for t in self.traders:
+            try:
+                st = trader_state(t["address"])
+            except Exception as ex:
+                self.e.log(f"Kopieer-modus: {t['name']} niet op te halen ({ex})", "muted")
+                continue
+            now_sides = {c: p["side"] for c, p in st["positions"].items()}
+            before = self.known.get(t["address"])
+            self.known[t["address"]] = now_sides
+            if before is None:
+                continue  # eerste keer: alleen de beginstand onthouden, niet instappen in oude posities
+            # gesloten of omgedraaid -> wij sluiten
+            for coin, side in before.items():
+                if now_sides.get(coin) != side:
+                    pos = mine.get(coin)
+                    if pos and pos["trader"] == t["address"] and pos["side"] == side:
+                        self.close(coin, f"{t['name']} sloot zijn {side}")
+                        mine.pop(coin, None)
+            # nieuw geopend -> wij openen
+            for coin, side in now_sides.items():
+                if before.get(coin) != side and coin not in mine:
+                    p = st["positions"][coin]
+                    if self.open(coin, side, p, t):
+                        mine = self.positions()
+        self.check_stops()
+
+    # --- helpers
+    def positions(self):
+        with self.e.db() as con:
+            return {r["coin"]: dict(r) for r in con.execute("SELECT * FROM copy_positions")}
+
+    def realized_today(self):
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d") + "%"
+        with self.e.db() as con:
+            return con.execute("SELECT COALESCE(SUM(pnl_eur),0) FROM copy_trades WHERE closed LIKE ?",
+                               (day,)).fetchone()[0]
+
+    def stop_pct(self, style):
+        return float(self.cfg.get("stop_pct_lang" if style == "lang" else "stop_pct_kort",
+                                  10 if style == "lang" else 3))
+
+    def open(self, coin, side, their, t):
+        kr = self.kr
+        sym = kraken.symbol_for_coin(coin)
+        try:
+            if not kr.supported(sym):
+                self.e.log(f"Kopie {t['name']}: {coin} {side} — niet te verhandelen op Kraken, overgeslagen.", "muted")
+                return False
+        except Exception as ex:
+            self.e.log(f"Kopie {t['name']}: Kraken niet bereikbaar ({ex})", "bad")
+            return False
+        if len(self.positions()) >= int(self.cfg.get("max_positions", 5)):
+            self.e.log(f"Kopie {t['name']}: {coin} overgeslagen, al {self.cfg.get('max_positions', 5)} kopieën open.",
+                       "muted")
+            return False
+        limit = float(self.cfg.get("daily_loss_eur", 10))
+        if -self.realized_today() >= limit:
+            self.e.log(f"Kopie {t['name']}: {coin} overgeslagen, daglimiet van €{limit:.2f} verlies bereikt.", "bad")
+            return False
+        if self.e.main_holds_real(sym):
+            self.e.log(f"Kopie {t['name']}: {coin} overgeslagen, de hoofdbot heeft daar al een echte positie.", "muted")
+            return False
+        # Zelfde hefboom als de trader, maar nooit boven jouw maximum en nooit boven 10x (EU-grens bij Kraken).
+        lev = max(1.0, min(float(self.cfg.get("max_leverage", 10)), float(their.get("leverage") or 1), 10.0))
+        margin = float(self.cfg.get("eur_per_trade", 10))
+        notional = margin * lev
+        # Noodstop nooit verder weg dan 80% van de inzet (bij 10x dus hooguit 8% koersbeweging): ruim vóór liquidatie.
+        stop_pct = min(self.stop_pct(t["style"]), 80.0 / lev)
+        px = kr.price(sym)
+        ext = None
+        if self.live():
+            try:
+                size, _ = self.kx.size_for(sym, notional)
+                if size <= 0:
+                    self.e.log(f"Kopie {t['name']}: €{notional:.0f} is te weinig voor de kleinste order van {coin}.",
+                               "muted")
+                    return False
+                amount, px, _ = self.kx.market_order(sym, "buy" if side == "long" else "sell", size)
+                stop = px * (1 - stop_pct / 100) if side == "long" else px * (1 + stop_pct / 100)
+                try:
+                    ext = self.kx.stop_order(sym, "sell" if side == "long" else "buy", amount, stop)
+                except Exception as ex:
+                    self.e.log(f"Kopie {t['name']}: noodstop bij Kraken mislukt ({ex}), positie direct gesloten.",
+                               "bad")
+                    self.kx.market_order(sym, "sell" if side == "long" else "buy", amount, reduce_only=True)
+                    return False
+                notional = amount * px
+            except Exception as ex:
+                self.e.log(f"Kopie {t['name']}: openen bij Kraken mislukt ({ex})", "bad")
+                return False
+        else:
+            spread = (kr.spread_pct(sym) or 0) / 100
+            px = px * (1 + spread / 2) if side == "long" else px * (1 - spread / 2)
+            amount = notional / px
+        stop = px * (1 - stop_pct / 100) if side == "long" else px * (1 + stop_pct / 100)
+        with self.e.db() as con:
+            con.execute("INSERT OR REPLACE INTO copy_positions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (coin, sym, side, amount, px, notional, lev, now(), t["address"], t["name"],
+                         float(their.get("entry") or 0), stop, ext, int(self.live())))
+        risk = notional * (stop_pct / 100 + 2 * kraken.TAKER_FEE_PCT / 100)
+        self.e.log(f"{'LIVE' if self.live() else 'DROOG'} KOPIE OPEN {coin} {side} {lev:.0f}x van {t['name']}: "
+                   f"positie €{notional:.2f} (inzet €{notional / lev:.2f}) @ {px:.6g}, noodstop {stop:.6g} "
+                   f"(max verlies ~€{risk:.2f})", "good")
+        self.e.push_trade(f"{coin}-PERP", "buy" if side == "long" else "short", notional / lev, px, 0,
+                          f"[kopie {t['name']}] {coin} {side} {lev:.0f}x", sim=not self.live())
+        return True
+
+    def close(self, coin, reason, exit_px=None):
+        pos = self.positions().get(coin)
+        if not pos:
+            return
+        kr = self.kr
+        sym = pos["symbol"]
+        px = exit_px
+        if pos["echt"] and self.kx and exit_px is None:
+            self.kx.cancel(pos.get("ext_stop"))
+            try:
+                _, px, _ = self.kx.market_order(sym, "sell" if pos["side"] == "long" else "buy", pos["amount"],
+                                                  reduce_only=True)
+            except Exception as ex:
+                if "wouldNotReducePosition" in str(ex):
+                    px, reason = pos["stop_price"], "noodstop (al uitgevoerd bij Kraken)"
+                else:
+                    self.e.log(f"Kopie {coin}: sluiten bij Kraken mislukt ({ex}). Noodstop is mogelijk weg!", "bad")
+                    return
+        if px is None:
+            px = kr.price(sym)
+            spread = (kr.spread_pct(sym) or 0) / 100
+            px = px * (1 - spread / 2) if pos["side"] == "long" else px * (1 + spread / 2)
+        direction = 1 if pos["side"] == "long" else -1
+        gross = direction * (px - pos["entry_price"]) * pos["amount"]
+        fee = (pos["cost_eur"] + pos["amount"] * px) * kraken.TAKER_FEE_PCT / 100
+        pnl = gross - fee
+        margin = pos["cost_eur"] / max(1.0, pos["leverage"])
+        pct = pnl / margin * 100 if margin else 0
+        # Wat de trader zelf haalde op dezelfde hefboom, tegen de koers van nu (zijn exacte uitstap kennen we niet).
+        t_entry = pos.get("trader_entry") or 0
+        t_pct = None
+        if t_entry:
+            try:
+                usd_now = px * kr.eurusd()
+                t_pct = direction * (usd_now - t_entry) / t_entry * pos["leverage"] * 100
+            except Exception:
+                t_pct = None
+        with self.e.db() as con:
+            con.execute("DELETE FROM copy_positions WHERE coin=?", (coin,))
+            con.execute("INSERT INTO copy_trades(opened,closed,coin,side,trader,trader_name,cost_eur,leverage,entry,"
+                        "exit,trader_entry,trader_exit,pnl_eur,pnl_pct,trader_pct,fee_eur,reason,echt) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (pos["opened"], now(), coin, pos["side"], pos["trader"], pos["trader_name"],
+                         pos["cost_eur"], pos["leverage"], pos["entry_price"], px, t_entry, None, pnl, pct, t_pct,
+                         fee, reason, pos["echt"]))
+        extra = f"; {pos['trader_name']} zelf ~{t_pct:+.1f}%" if t_pct is not None else ""
+        self.e.log(f"{'LIVE' if pos['echt'] else 'DROOG'} KOPIE DICHT {coin} {pos['side']}: €{pnl:+.2f} "
+                   f"({pct:+.1f}% op inzet{extra}) — {reason}", "good" if pnl >= 0 else "bad")
+        self.e.push_trade(f"{coin}-PERP", "sell" if pos["side"] == "long" else "cover", pos["amount"] * px / max(1, pos["leverage"]),
+                          px, pnl, f"[kopie {pos['trader_name']}] {reason}", sim=not pos["echt"])
+
+    def check_stops(self):
+        """Noodstop bewaken bij droog draaien (live zit hij bij Kraken zelf)."""
+        for coin, pos in self.positions().items():
+            if pos["echt"]:
+                continue
+            try:
+                px = self.kr.price(pos["symbol"])
+            except Exception:
+                continue
+            hit = px <= pos["stop_price"] if pos["side"] == "long" else px >= pos["stop_price"]
+            if hit:
+                self.close(coin, "noodstop geraakt", exit_px=pos["stop_price"])
+
+    def sync_kraken(self):
+        try:
+            open_at = self.kx.open_positions()
+        except Exception:
+            return
+        for coin, pos in self.positions().items():
+            if pos["echt"] and pos["symbol"] not in open_at:
+                self.close(coin, "noodstop (bij Kraken)", exit_px=pos["stop_price"])
+
+    def open_symbols(self, real_only=True):
+        return {p["symbol"] for p in self.positions().values() if p["echt"] or not real_only}
+
+
+# ---------------------------------------------------------------- vingerafdruk-zoeker
+INVO_BUILDER = "0x557edb253b1d7ed5f15b248a5a3fd919fa5d3c81"
+FILLS_URL = "https://stats-data.hyperliquid.xyz/Mainnet/builder_fills/{b}/{d}.csv.lz4"
+
+# Trades zoals ze op Invo-profielen stonden (18 nov 2026): munt + uitstapprijs in USD.
+# Accountwaarde ($) als die op het profiel zichtbaar was; helpt kopieerders uit te sluiten.
+FINGERPRINTS = {
+    "blackstallion": {"style": "lang", "account": 685079, "trades": [
+        ("OP", 0.1176198), ("UNI", 6.8216759), ("XRP", 1.3573416), ("ENS", 5.5822016)]},
+    "amber_one": {"style": "lang", "account": 115186, "trades": [
+        ("NEAR", 3.1442057), ("VVV", 19.75), ("HYPE", 86.57), ("SUI", 1.0499074), ("VVV", 22.72)]},
+    "bravo": {"style": "lang", "account": 48889, "trades": [
+        ("ETH", 1813.00), ("LIT", 2.7743645), ("LINK", 9.13), ("MEGA", 0.048616), ("VVV", 17.75)]},
+    "mateus": {"style": "lang", "account": None, "trades": [
+        ("TAO", 197.47), ("XRP", 0.969455), ("PAXG", 3787.91), ("XPL", 0.0421819), ("XPL", 0.047643)]},
+    "driftmist": {"style": "lang", "account": 425432, "trades": [
+        ("NEAR", 3.285), ("XMR", 498.63), ("JUP", 0.25617), ("JUP", 0.25929), ("ZRO", 1.4564)]},
+    "retrace": {"style": "kort", "account": None, "trades": [
+        ("BTC", 63691.50), ("BTC", 64190.00), ("BTC", 64282.00), ("BTC", 63866.00), ("BTC", 63920.00)]},
+    "johndrockefeller": {"style": "kort", "account": 5627041, "trades": [
+        ("BTC", 63219.99), ("BTC", 63200.00), ("BTC", 63460.03), ("BTC", 63903.00), ("BTC", 64439.00)]},
+    "apx": {"style": "kort", "account": None, "trades": [
+        ("BTC", 63071.00), ("BTC", 64421.50), ("ETH", 1823.30), ("BTC", 64886.00), ("SOL", 74.98)]},
+    "suv": {"style": "kort", "account": None, "trades": [
+        ("ETH", 1766.21), ("BTC", 63971.50), ("XRP", 0.99795), ("ETH", 1808.45), ("BTC", 64604.00)]},
+    "ferall": {"style": "lang", "account": 107067, "trades": [
+        ("XTEN", 0.1934371), ("LIT", 2.8310369), ("LIT", 2.5582063), ("LIT", 2.4058402), ("ZEC", 891.69)]},
+}
+
+
+def _day_fills(cache_dir, day, timeout=60):
+    """Alle Invo-fills van één dag als lijst (user, coin, px, sz, time). Op schijf bewaard: een dag verandert niet."""
+    import lz4.frame
+    path = os.path.join(cache_dir, f"invo_fills_{day}.json")
+    if os.path.exists(path):
+        try:
+            return json.load(open(path, encoding="utf-8"))
+        except Exception:
+            pass
+    r = requests.get(FILLS_URL.format(b=INVO_BUILDER, d=day), timeout=timeout)
+    if r.status_code != 200:
+        return []
+    text = lz4.frame.decompress(r.content).decode("utf-8", "replace")
+    rows = []
+    for row in csv.DictReader(io.StringIO(text)):
+        row = {k.strip().lower(): v for k, v in row.items() if k}
+        try:
+            rows.append([(row.get("user") or "").lower(), str(row.get("coin") or "").upper(),
+                         float(row.get("px") or 0), float(row.get("sz") or 0), row.get("time") or ""])
+        except ValueError:
+            continue
+    if day != datetime.now(timezone.utc).strftime("%Y%m%d"):
+        json.dump(rows, open(path, "w", encoding="utf-8"))
+    return rows
+
+
+def find_trader(trades, cache_dir, days=30, tol_pct=0.05, account=None, progress=lambda t: None):
+    """Zoek adressen die (bijna) dezelfde trades deden. trades: [(munt, prijs), ...].
+    Geeft kandidaten gesorteerd op aantal treffers, dan op hoe dicht de accountwaarde bij Invo's waarde ligt."""
+    want = [(str(c).upper(), float(p)) for c, p in trades]
+    hits = {}
+    best = {}   # (user, k) -> kleinste prijsverschil in %: het origineel zit meestal precies op de prijs
+    today = datetime.now(timezone.utc).date()
+    for i in range(days):
+        d = (today - timedelta(days=i)).strftime("%Y%m%d")
+        progress(f"Invo-trades van {d[6:]}-{d[4:6]} doorzoeken…")
+        try:
+            rows = _day_fills(cache_dir, d)
+        except Exception:
+            continue
+        for user, coin, px, sz, ts in rows:
+            for k, (c, p) in enumerate(want):
+                if coin == c and p:
+                    diff = abs(px - p) / p * 100
+                    if diff <= tol_pct:
+                        hits.setdefault(user, set()).add(k)
+                        best[(user, k)] = min(best.get((user, k), 99), diff)
+    need = min(len(want), 3)
+    cands = [(u, len(s), sum(best[(u, k)] for k in s)) for u, s in hits.items() if len(s) >= need]
+    cands.sort(key=lambda x: (-x[1], x[2]))
+    out = []
+    for u, n, _diff in cands[:15]:
+        acct = None
+        try:
+            acct = trader_state(u)["account"]
+        except Exception:
+            pass
+        out.append({"address": u, "matches": n, "of": len(want), "account": acct})
+    if account:
+        out.sort(key=lambda c: (-c["matches"], abs((c["account"] or 0) - account)))
+    return out

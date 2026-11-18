@@ -11,7 +11,10 @@ DEFAULTS = {
     "live": False,
     "live_bronnen": ["volgers", "beide"],
     "exchange": "bitvavo",  # "bitvavo" of "kraken" (Kraken-perps, voorlopig alleen droog)
-    "kraken": {"leverage": 3},  # max 5  # alleen deze signalen met echt geld; de rest als schaduwtrade
+    "kraken": {"leverage": 3},  # max 5
+    # Kopieer-modus: gekozen traders 1-op-1 volgen op Kraken. Live alleen als bot live op Kraken staat én "live" aan.
+    "copy": {"enabled": False, "live": False, "interval_s": 5, "eur_per_trade": 10, "max_leverage": 10,
+             "max_positions": 5, "daily_loss_eur": 10, "stop_pct_lang": 10, "stop_pct_kort": 3, "traders": []},  # alleen deze signalen met echt geld; de rest als schaduwtrade
     "markets": ["BTC-EUR", "ETH-EUR", "SOL-EUR", "XRP-EUR"],
     "cycle_minutes": 120,
     "model": "claude-haiku-5-5",
