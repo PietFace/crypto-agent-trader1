@@ -675,6 +675,8 @@ class SettingsPage(QWidget):
         f.addRow("", self.fw_on)
         self.fw_setup = QCheckBox("Volgers mogen zelf een setup geven (naast de vijf regels)")
         f.addRow("", self.fw_setup)
+        self.fw_exit = QCheckBox("Positie sluiten als de volgers duidelijk de andere kant op draaien")
+        f.addRow("", self.fw_exit)
         self.fw_auto = QCheckBox("Automatisch kiezen van het leaderboard")
         f.addRow("", self.fw_auto)
         self.fw_count = QSpinBox()
@@ -804,6 +806,7 @@ class SettingsPage(QWidget):
         self.fw_on.setChecked(bool(fc.get("enabled", True)))
         self.fw_setup.setChecked(bool(fc.get("use_as_setup", True)))
         self.fw_auto.setChecked(bool(fc.get("auto", True)))
+        self.fw_exit.setChecked(bool(fc.get("exit_on_flip", True)))
         self.fw_count.setValue(int(fc.get("count", 10)))
         self.fw_min.setValue(int(fc.get("min_traders", 3)))
         self.fw_cons.setValue(float(fc.get("min_consensus", 0.6)))
@@ -848,6 +851,7 @@ class SettingsPage(QWidget):
         cfg["rules"] = self.collect_rules()
         cfg["followers"] = {"enabled": self.fw_on.isChecked(), "use_as_setup": self.fw_setup.isChecked(),
                             "auto": self.fw_auto.isChecked(), "count": self.fw_count.value(),
+                            "exit_on_flip": self.fw_exit.isChecked(),
                             "min_traders": self.fw_min.value(), "min_consensus": round(self.fw_cons.value(), 1),
                             "manual": [x.strip() for x in self.fw_manual.toPlainText().splitlines()
                                        if x.strip().startswith("0x")]}

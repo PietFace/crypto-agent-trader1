@@ -17,10 +17,12 @@ DEFAULTS = {
     "max_api_usd_month": 5.0,  # 0 = geen limiet
     "tick_seconds": 30,  # volgers, regels en stop-loss controleren
     "fast_check": True,  # elke 5 minuten zonder AI kijken; AI alleen bij een nieuwe setup
-    "fast_cooldown_min": 30,  # per munt hooguit eens per zoveel minuten Skeptic+Chief tussendoor
+    "fast_cooldown_min": 30,
+    "reopen_pause_min": 60,  # na zelf sluiten zo lang niet opnieuw dezelfde kant op  # per munt hooguit eens per zoveel minuten Skeptic+Chief tussendoor
     "followers": {
         "enabled": True, "auto": True, "count": 20, "manual": [],
         "min_traders": 4, "min_consensus": 0.6, "use_as_setup": True,
+        "exit_on_flip": True,  # positie sluiten als de volgers duidelijk de andere kant op draaien
     },  # Chief mag shorts kiezen; die worden alleen gesimuleerd
     "remote": {"enabled": False, "url": "https://pietface-trader-live.lovable.app/api/public/bot-ingest", "token": ""},
     "rules": {

@@ -75,9 +75,9 @@ PROMPTS = {
              "- 'volgers' laat zien hoeveel gevolgde, winstgevende traders op Hyperliquid long of short staan "
              "en wat ze recent deden. Een setup kan van de regels of van de volgers komen; weeg mee hoe vers "
              "en hoe eensgezind hun posities zijn.\n"
-             "- Je hebt een koop-positie en de charts zijn duidelijk omgeslagen (score onder -0.3): sell. "
-             "Je hebt een short en de charts zijn duidelijk omhoog (score boven 0.3): cover. "
-             "Stop-loss en koersdoel worden verder automatisch bewaakt.\n"
+             "- Sluit een positie alleen als de charts duidelijk zijn omgeslagen (koop-positie: score onder -0.3; "
+             "short: score boven 0.3) of als de volgers duidelijk de andere kant op staan. 'Risico beperken' is "
+             "geen reden: stop-loss en koersdoel bewaken de positie al. Anders: hold.\n"
              "- Bedrag: 20 euro; de risicopoort verkleint het zo nodig.\n"
              "Geef JSON: {\"action\": \"buy|sell|short|cover|hold\", \"amount_eur\": getal "
              "(alleen bij buy of short), \"confidence\": 0..1, \"reason\": \"max 3 zinnen\"}." + JSON_RULE,
@@ -232,6 +232,7 @@ class Engine:
         self.fcfg = cfg.get("followers") or {}
         self.fast = bool(cfg.get("fast_check", True))
         self.reports, self.last_state, self.last_decision = {}, {}, {}
+        self.closed_at = {}
         self.followers = None
         if self.fcfg.get("enabled", True):
             self.followers = Followers(self.db_path, settings.data_dir(), self.fcfg, self._ui_log)
@@ -642,6 +643,10 @@ class Engine:
                     self._fw_warned = True
             else:
                 self._fw_warned = False
+        try:
+            self.follower_exits()
+        except Exception as e:
+            self.log(f"Volgers-exit mislukt: {e}", "bad")
         if not self.fast or not self.reports:
             return
         cooldown = float(self.cfg.get("fast_cooldown_min", 30)) * 60
@@ -686,6 +691,62 @@ class Engine:
         if not self.shorts:
             setup["short"] = False
         return setup
+
+    def close_reasons(self, market, side, charts):
+        """Mag een positie op eigen initiatief (Chief of volgers) gesloten worden? Geeft lijst met redenen.
+        side='long' (koop-positie) of 'short'. Leeg = niet sluiten; stop-loss en koersdoel blijven gewoon werken."""
+        why = []
+        try:
+            cs = float(charts.get("score")) if charts and "fout" not in charts else 0.0
+        except (TypeError, ValueError):
+            cs = 0.0
+        if side == "long" and cs <= -0.3:
+            why.append(f"charts omgeslagen ({cs:+.2f})")
+        if side == "short" and cs >= 0.3:
+            why.append(f"charts omgeslagen ({cs:+.2f})")
+        if self.followers:
+            c = self.followers.consensus(coin_of(market))
+            min_tr = int(self.fcfg.get("min_traders", 4))
+            min_sc = float(self.fcfg.get("min_consensus", 0.6))
+            if side == "long" and c["short"] >= min_tr and c["score"] <= -min_sc:
+                why.append(f"volgers draaien naar short ({c['long']} long / {c['short']} short)")
+            if side == "short" and c["long"] >= min_tr and c["score"] >= min_sc:
+                why.append(f"volgers draaien naar long ({c['long']} long / {c['short']} short)")
+        return why
+
+    def followers_still_with(self, market, side):
+        """Staan de volgers nog duidelijk aan dezelfde kant als onze positie?"""
+        if not self.followers:
+            return False
+        c = self.followers.consensus(coin_of(market))
+        min_tr = int(self.fcfg.get("min_traders", 4))
+        min_sc = float(self.fcfg.get("min_consensus", 0.6))
+        if side == "long":
+            return c["long"] >= min_tr and c["score"] >= min_sc
+        return c["short"] >= min_tr and c["score"] <= -min_sc
+
+    def reopen_blocked(self, market, side):
+        """Na zelf sluiten een uur niet opnieuw dezelfde kant op (voorkomt heen-en-weer en fees)."""
+        t = self.closed_at.get((market, side))
+        pause = float(self.cfg.get("reopen_pause_min", 60)) * 60
+        return t is not None and time.time() - t < pause
+
+    def follower_exits(self):
+        """Zonder AI: sluit posities als de volgers duidelijk de andere kant op draaien."""
+        if not self.followers or not self.fcfg.get("exit_on_flip", True):
+            return
+        for market, pos in self.get_positions().items():
+            why = [w for w in self.close_reasons(market, "long", {}) if w.startswith("volgers")]
+            if why:
+                self.log(f"[exit] {market}: {why[0]}", "info")
+                self.execute_sell(market, why[0])
+                self.closed_at[(market, "long")] = time.time()
+        for market, pos in self.get_short_positions().items():
+            why = [w for w in self.close_reasons(market, "short", {}) if w.startswith("volgers")]
+            if why:
+                self.log(f"[exit short] {market}: {why[0]}", "info")
+                self.close_short(market, why[0])
+                self.closed_at[(market, "short")] = time.time()
 
     def decide(self, market, ind, trigger):
         """Skeptic en Chief vragen en de keuze uitvoeren (via de risicopoort)."""
@@ -735,7 +796,11 @@ class Engine:
         self.log(f"{market}: Chief = {action} (zekerheid {decision.get('confidence')}) - {decision.get('reason')}")
         if action in ("buy", "short"):
             ok_setup = setup["long"] if action == "buy" else setup["short"]
-            if not ok_setup:
+            side = "long" if action == "buy" else "short"
+            if ok_setup and self.reopen_blocked(market, side):
+                self.log(f"  {market} is minder dan een uur geleden zelf gesloten: nog niet opnieuw {side}", "muted")
+                action = "hold"
+            elif not ok_setup:
                 self.log(f"  geen {'koop' if action == 'buy' else 'short'}-setup: houden", "muted")
                 action = "hold"
             elif str(skeptic.get("risico", "")).lower() == "hoog":
@@ -750,8 +815,15 @@ class Engine:
             else:
                 self.log(f"  risicopoort blokkeert: {why}", "muted")
         elif action == "sell" and pos:
-            self.execute_sell(market, decision.get("reason", ""))
-            executed = True
+            why = self.close_reasons(market, "long", charts)
+            if why:
+                self.execute_sell(market, f"{decision.get('reason', '')} [{'; '.join(why)}]")
+                self.closed_at[(market, "long")] = time.time()
+                executed = True
+            else:
+                extra = " en de volgers staan nog long" if self.followers_still_with(market, "long") else ""
+                self.log(f"  Chief wil verkopen, maar de charts zijn niet omgeslagen{extra}: positie blijft, "
+                         "stop-loss en koersdoel bewaken hem", "muted")
         elif action == "short" and self.shorts and not spos:
             amount, why = self.risk_check_buy(market, float(decision.get("amount_eur", 0) or 0),
                                               float(decision.get("confidence", 0) or 0), book="short")
@@ -761,8 +833,15 @@ class Engine:
             else:
                 self.log(f"  risicopoort blokkeert short: {why}", "muted")
         elif action == "cover" and spos:
-            self.close_short(market, decision.get("reason", ""))
-            executed = True
+            why = self.close_reasons(market, "short", charts)
+            if why:
+                self.close_short(market, f"{decision.get('reason', '')} [{'; '.join(why)}]")
+                self.closed_at[(market, "short")] = time.time()
+                executed = True
+            else:
+                extra = " en de volgers staan nog short" if self.followers_still_with(market, "short") else ""
+                self.log(f"  Chief wil de short sluiten, maar de charts zijn niet omgeslagen{extra}: short blijft, "
+                         "stop-loss en koersdoel bewaken hem", "muted")
         self.push_decision(market, ind, charts, news_r, sentiment, skeptic, decision, executed)
 
     # ---------- op afstand meekijken ----------
