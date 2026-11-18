@@ -10,6 +10,7 @@ DEFAULTS = {
     "keys": {"anthropic": "", "bitvavo_key": "", "bitvavo_secret": "", "kraken_key": "", "kraken_secret": ""},
     "live": False,
     "live_bronnen": ["volgers", "beide"],
+    "mode": "beide",  # "beide" (gewone bot + kopiëren), "bot" (alleen gewone bot) of "kopie" (alleen kopiëren)
     "exchange": "bitvavo",  # "bitvavo" of "kraken" (Kraken-perps, voorlopig alleen droog)
     "kraken": {"leverage": 3},  # max 5
     # Kopieer-modus: gekozen traders 1-op-1 volgen op Kraken. Live alleen als bot live op Kraken staat én "live" aan.

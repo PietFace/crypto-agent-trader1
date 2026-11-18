@@ -297,8 +297,9 @@ class Engine:
         self.remote = None
         if rc.get("enabled") and rc.get("url") and rc.get("token"):
             self.remote = remote.Remote(rc["url"], rc["token"], self._ui_log)
+        self.mode = cfg.get("mode", "beide")
         cc = cfg.get("copy") or {}
-        if cc.get("enabled"):
+        if self.mode == "kopie" or (cc.get("enabled") and self.mode != "bot"):
             import copier
             self.copier = copier.CopyEngine(self, cc)
 
@@ -311,6 +312,10 @@ class Engine:
     def problems(self):
         """Wat ontbreekt er nog voordat de bot kan starten?"""
         p = []
+        if self.mode == "kopie":
+            if not (self.cfg.get("copy") or {}).get("traders"):
+                p.append("'Alleen kopiëren' staat aan, maar er staan nog geen traders bij Kopiëren")
+            return p
         if not self.cfg["keys"].get("anthropic"):
             p.append("Anthropic API-key ontbreekt")
         if not self.markets:
@@ -355,6 +360,10 @@ class Engine:
                     self.markets = [m for m in self.markets if m not in missing]
             except Exception as e:
                 self.log(f"Kraken niet bereikbaar: {e}", "bad")
+        self.log({"beide": "Modus: gewone bot én kopiëren.", "bot": "Modus: alleen de gewone bot (kopiëren staat uit).",
+                  "kopie": "Modus: alleen kopiëren. De gewone bot opent niets nieuws en gebruikt geen AI; open "
+                           "posities van de gewone bot worden nog wel bewaakt (stop/doel)."}.get(self.mode, ""),
+                 "info")
         self.log(f"Bot gestart ({'LIVE' if self.live else 'droog draaien'}): max €{self.rules['max_loss_per_trade_eur']} "
                  f"verlies per trade, max {self.rules['max_positions']} posities, daglimiet "
                  f"€{self.rules['daily_loss_limit_eur']}.", "info")
@@ -368,7 +377,7 @@ class Engine:
                  "uit (zet het aan onder Instellingen > Op afstand meekijken)."), "info" if self.remote else "muted")
         if self.copier:
             self.copier.start()
-        elif (self.cfg.get("copy") or {}).get("traders"):
+        elif self.mode != "bot" and (self.cfg.get("copy") or {}).get("traders"):
             n = len(self.cfg["copy"]["traders"])
             self.log(f"Kopieer-modus staat UIT: {n} trader(s) klaar bij Kopiëren, maar 'Kopieer-modus aan' is niet "
                      "aangevinkt. Vink het aan, klik Opslaan en start de bot opnieuw.", "bad")
@@ -381,9 +390,11 @@ class Engine:
                 break
             try:
                 self.check_exits()
-                if self.followers or self.fast:
+                if self.mode == "kopie":
+                    pass   # alleen kopiëren: geen nieuwe trades en geen AI-rondes voor de gewone bot
+                elif self.followers or self.fast:
                     self.fast_check()
-                if time.time() - last_cycle >= self.cycle_minutes * 60:
+                if self.mode != "kopie" and time.time() - last_cycle >= self.cycle_minutes * 60:
                     self.busy = True
                     self.push_status(True)
                     self.run_cycle()

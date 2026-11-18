@@ -158,6 +158,14 @@ class BotPage(QWidget):
         top.addStretch(1)
         self.next_lbl = lab("", "sub")
         top.addWidget(self.next_lbl)
+        self.mode = QComboBox()
+        self.MODES = [("beide", "Gewone bot + kopiëren"), ("bot", "Alleen gewone bot"), ("kopie", "Alleen kopiëren")]
+        self.mode.addItems([t for _, t in self.MODES])
+        self.mode.setToolTip("Wat de bot doet als je op Start drukt. Wisselen kan als de bot gestopt is.")
+        cur = win.cfg.get("mode", "beide")
+        self.mode.setCurrentIndex(next((i for i, (k, _) in enumerate(self.MODES) if k == cur), 0))
+        self.mode.currentIndexChanged.connect(self._mode_changed)
+        top.addWidget(self.mode)
         self.reset_btn = QPushButton("Opnieuw beginnen")
         self.reset_btn.clicked.connect(win.reset_all)
         top.addWidget(self.reset_btn)
@@ -196,6 +204,20 @@ class BotPage(QWidget):
         self.log.setReadOnly(True)
         v.addWidget(self.log, 1)
 
+
+    def _mode_changed(self, i):
+        key = self.MODES[i][0]
+        self.win.cfg["mode"] = key
+        if key == "kopie":
+            self.win.cfg.setdefault("copy", {})["enabled"] = True
+        settings.save(self.win.cfg)
+        try:
+            self.win.cp.load(self.win.cfg)
+        except Exception:
+            pass
+        running = bool(self.win.engine and self.win.engine.running)
+        self.win.log(f"Modus: {self.MODES[i][1]}." + (" Geldt na opnieuw starten van de bot." if running else ""),
+                     "info")
     def add_log(self, text, kind):
         color = LOG_COLORS.get(kind, C["text"])
         t = datetime.datetime.now().strftime("%H:%M")
