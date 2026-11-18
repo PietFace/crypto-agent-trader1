@@ -68,6 +68,47 @@ def trader_state(address, timeout=10):
     return {"account": acct, "positions": pos}
 
 
+def trader_style(address, short_hours=4.0, timeout=15):
+    """Lang of kort, bepaald uit zijn eigen recente trades op Hyperliquid (tot 2000 fills).
+    Geeft (stijl, mediane houdtijd in uren, aantal afgesloten posities). Te weinig gegevens: 'lang'."""
+    r = _http.post(INFO_URL, json={"type": "userFills", "user": address}, timeout=timeout)
+    r.raise_for_status()
+    fills = sorted(r.json() or [], key=lambda f: f.get("time", 0))
+    opened, holds = {}, []
+    for f in fills:
+        try:
+            coin = f["coin"]
+            start = float(f.get("startPosition") or 0)
+            sz = float(f.get("sz") or 0)
+            t = int(f.get("time") or 0)
+        except (KeyError, TypeError, ValueError):
+            continue
+        after = start + (sz if f.get("side") == "B" else -sz)
+        eps = max(1e-9, abs(sz) * 1e-6)
+        if abs(start) <= eps:
+            opened[coin] = t                       # positie geopend vanuit niets
+        elif abs(after) <= eps or (start > 0) != (after > 0):
+            if coin in opened:
+                holds.append((t - opened.pop(coin)) / 3600000)
+            if abs(after) > eps:
+                opened[coin] = t                   # omgedraaid: nieuwe positie de andere kant op
+    if len(holds) < 3:
+        return "lang", None, len(holds)
+    holds.sort()
+    med = holds[len(holds) // 2]
+    return ("kort" if med < short_hours else "lang"), med, len(holds)
+
+
+def hold_text(hours):
+    if hours is None:
+        return "onbekend"
+    if hours < 1:
+        return f"{hours * 60:.0f} min"
+    if hours < 48:
+        return f"{hours:.1f} uur"
+    return f"{hours / 24:.1f} dagen"
+
+
 # ---------------------------------------------------------------- kopieer-motor
 class CopyEngine:
     def __init__(self, engine, cfg):

@@ -5,6 +5,7 @@ import queue
 import sqlite3
 import sys
 import threading
+import time
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QTextCursor
@@ -157,6 +158,9 @@ class BotPage(QWidget):
         top.addStretch(1)
         self.next_lbl = lab("", "sub")
         top.addWidget(self.next_lbl)
+        self.reset_btn = QPushButton("Opnieuw beginnen")
+        self.reset_btn.clicked.connect(win.reset_all)
+        top.addWidget(self.reset_btn)
         self.btn = QPushButton("Start bot")
         self.btn.setObjectName("primary")
         self.btn.clicked.connect(win.toggle)
@@ -462,7 +466,9 @@ class FollowersPage(QWidget):
         h = QHBoxLayout()
         left = QVBoxLayout()
         left.addWidget(lab("GEVOLGDE TRADERS", "cap"))
-        self.traders = table(["Trader", "Naam", "Account $", "Winst maand $", "ROI maand", "Bron"])
+        self.traders = table(["Trader", "Naam", "Account $", "Winst maand $", "ROI maand", "Bron", "Stijl"])
+        self._styles = {}      # adres -> (stijl, uren, aantal); op de achtergrond opgehaald
+        self._style_busy = False
         self.traders.setSelectionMode(QTableWidget.ExtendedSelection)
         self.traders.setSelectionBehavior(QTableWidget.SelectRows)
         self._addrs = []
@@ -470,7 +476,7 @@ class FollowersPage(QWidget):
         cp = QHBoxLayout()
         cp.addWidget(lab("Geselecteerde traders", "sub"))
         self.cp_style = QComboBox()
-        self.cp_style.addItems(["lang", "kort"])
+        self.cp_style.addItems(["automatisch", "lang", "kort"])
         cp.addWidget(self.cp_style)
         self.cp_btn = QPushButton("Naar Kopiëren")
         self.cp_btn.clicked.connect(self.to_copy)
@@ -487,6 +493,24 @@ class FollowersPage(QWidget):
         h.addLayout(right, 2)
         v.addLayout(h, 1)
 
+    def _fetch_styles(self, addrs):
+        """Lang of kort per trader op de achtergrond bepalen (eens per sessie per trader)."""
+        todo = [a.lower() for a in addrs if a and a.lower() not in self._styles]
+        if not todo or self._style_busy:
+            return
+        self._style_busy = True
+
+        def work():
+            import copier
+            for a in todo:
+                try:
+                    self._styles[a] = copier.trader_style(a)
+                except Exception:
+                    self._styles[a] = ("lang", None, 0)
+                time.sleep(0.3)
+            self._style_busy = False
+        threading.Thread(target=work, daemon=True).start()
+
     def to_copy(self):
         """Geselecteerde volgers in de lijst van de kopieer-modus zetten en opslaan."""
         picked = sorted({i.row() for i in self.traders.selectedIndexes()})
@@ -495,21 +519,55 @@ class FollowersPage(QWidget):
             return
         cp = self.win.cp
         text = cp.traders.toPlainText().strip()
-        added = []
+        todo = []
         for r in picked:
-            if r >= len(self._addrs):
-                continue
-            addr, name = self._addrs[r]
-            if not addr or addr.lower() in text.lower():
-                continue
-            label = (name or addr[:8]).replace(" ", "_")
-            text = (text + "\n" if text else "") + f"{addr.lower()} {label} {self.cp_style.currentText()}"
-            added.append(label)
-        cp.traders.setPlainText(text)
-        cp.save()
-        self.cp_msg.setText((f"Toegevoegd aan Kopiëren: {', '.join(added)}. " if added else
-                             "Deze traders stonden al bij Kopiëren. ") +
-                            "Zet de kopieer-modus aan bij Kopiëren en start de bot opnieuw.")
+            if r < len(self._addrs):
+                addr, name = self._addrs[r]
+                if addr and addr.lower() not in text.lower():
+                    todo.append((addr.lower(), (name or addr[:8]).replace(" ", "_")))
+        if not todo:
+            self.cp_msg.setText("Deze traders stonden al bij Kopiëren.")
+            return
+        choice = self.cp_style.currentText()
+        self.cp_btn.setEnabled(False)
+        self.cp_msg.setText("Houdtijd van de traders bepalen…" if choice == "automatisch" else "")
+        q = queue.Queue()
+
+        def work():
+            import copier
+            out = []
+            for addr, label in todo:
+                style, hours, n = choice, None, 0
+                if choice == "automatisch":
+                    try:
+                        style, hours, n = self._styles.get(addr) or copier.trader_style(addr)
+                    except Exception:
+                        style = "lang"
+                out.append((addr, label, style, hours, n))
+            q.put(out)
+        threading.Thread(target=work, daemon=True).start()
+
+        def done():
+            try:
+                out = q.get_nowait()
+            except queue.Empty:
+                QTimer.singleShot(300, done)
+                return
+            import copier
+            t = cp.traders.toPlainText().strip()
+            parts = []
+            for addr, label, style, hours, n in out:
+                t = (t + "\n" if t else "") + f"{addr} {label} {style}"
+                parts.append(f"{label}: {style}" + (f" (houdt gemiddeld {copier.hold_text(hours)} vast, {n} trades)"
+                                                     if hours is not None else
+                                                     (" (te weinig trades om te bepalen, daarom lang)"
+                                                      if choice == "automatisch" else "")))
+            cp.traders.setPlainText(t)
+            cp.save()
+            self.cp_btn.setEnabled(True)
+            self.cp_msg.setText("Toegevoegd aan Kopiëren — " + "; ".join(parts) +
+                                ". Zet de kopieer-modus aan bij Kopiëren en start de bot opnieuw.")
+        QTimer.singleShot(300, done)
 
     def repick(self):
         import threading
@@ -562,10 +620,18 @@ class FollowersPage(QWidget):
         data = query("SELECT address, name, account_value, month_pnl, month_roi, source FROM follower_traders "
                      "ORDER BY month_roi DESC")
         self._addrs = [(a, n) for a, n, *_ in data]
+        import copier
+
+        def style(a):
+            st = self._styles.get((a or "").lower())
+            if not st:
+                return "…"
+            return f"{st[0]}, meestal {copier.hold_text(st[1])} open" if st[1] is not None else f"{st[0]} (weinig data)"
         rows = [[(a[:6] + "…" + a[-4:]) if a else "", n, usd(acc or 0), usd(mp or 0), f"{(mr or 0) * 100:.1f}%",
-                 src if src in ("eigen", "invo") else "leaderboard"]
+                 src if src in ("eigen", "invo") else "leaderboard", style(a)]
                 for a, n, acc, mp, mr, src in data]
         fill(self.traders, rows)
+        self._fetch_styles([a for a, *_ in data])
         rows = [[local_time(ts), (a[:6] + "…" + a[-4:]) if a else "", c, f"{e} {sd}", usd(nt or 0)]
                 for ts, a, c, e, sd, nt in query(
             "SELECT ts, address, coin, event, side, notional FROM follower_events ORDER BY id DESC LIMIT 100")]
@@ -1605,6 +1671,32 @@ class MainWindow(QMainWindow):
             self.over.refresh()
         if self.stack.currentIndex() == 2:
             self.fol.refresh()
+
+    def reset_all(self):
+        """Alle trades en posities wissen en opnieuw beginnen op het budget."""
+        from bot import reset_history
+        if self.engine and self.engine.running:
+            QMessageBox.information(self, "Eerst stoppen", "Stop eerst de bot, dan kun je opnieuw beginnen.")
+            return
+        budget = float(self.cfg["rules"]["budget_eur"])
+        ok = QMessageBox.question(
+            self, "Opnieuw beginnen",
+            f"Alle trades, open posities, shorts, kopieën en de vergelijking met BTC worden gewist. De bot begint "
+            f"daarna weer op {eur(budget)}.\n\nBlijft bewaard: je instellingen, keys, gekozen volgers en de "
+            "API-kosten (voor je maandlimiet). Er wordt eerst een reservekopie gemaakt.\n\n"
+            "Staan er nog echte posities open, sluit die dan eerst; de bot weigert anders.\n\nDoorgaan?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if ok != QMessageBox.Yes:
+            return
+        try:
+            backup = reset_history(settings.db_path())
+        except Exception as e:
+            QMessageBox.warning(self, "Niet gelukt", str(e))
+            return
+        self.log(f"Opnieuw begonnen: alles gewist, de bot start weer op {eur(budget)}. Reservekopie: {backup}", "info")
+        self.refresh()
+        self.over.refresh()
+        self.cp.refresh()
 
     def toggle(self):
         if self.engine and self.engine.running:

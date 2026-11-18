@@ -9,6 +9,7 @@ Instellingen staan in %APPDATA%\\CryptoTrader\\config.json (aan te passen in het
 """
 import json
 import math
+import os
 import sqlite3
 import threading
 import time
@@ -215,6 +216,34 @@ def init_db(path):
                 con.execute(f"ALTER TABLE {t} ADD COLUMN echt INTEGER DEFAULT 0")
         import copier
         copier.init_db(con)
+
+
+RESET_TABLES = ("positions", "trades", "short_positions", "short_trades", "position_marks", "benchmark", "risk_log",
+                "copy_positions", "copy_trades")
+RESET_META = ("btc_start_price", "bench_start", "btc_price_now", "marks_ts")
+
+
+def reset_history(db_path):
+    """Opnieuw beginnen: alle trades, posities en de vergelijking met BTC wissen, zodat de bot weer op het
+    budget start. API-kosten (voor de maandlimiet) en de volgerslijst blijven. Eerst een reservekopie.
+    Weigert als er nog echte posities open staan. Geeft het pad van de reservekopie."""
+    import shutil
+    init_db(db_path)
+    with sqlite3.connect(db_path) as con:
+        real = 0
+        for t in ("positions", "short_positions", "copy_positions"):
+            real += con.execute(f"SELECT COUNT(*) FROM {t} WHERE COALESCE(echt,0)=1").fetchone()[0]
+        if real:
+            raise RuntimeError(f"Er staan nog {real} echte posities open. Sluit die eerst (in de bot of op de "
+                               "beurs), anders raakt de bot ze kwijt.")
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = os.path.join(os.path.dirname(db_path), f"trader-reserve-{stamp}.db")
+    shutil.copyfile(db_path, backup)
+    with sqlite3.connect(db_path) as con:
+        for t in RESET_TABLES:
+            con.execute(f"DELETE FROM {t}")
+        con.execute(f"DELETE FROM meta WHERE key IN ({','.join('?' * len(RESET_META))})", RESET_META)
+    return backup
 
 
 class Engine:
