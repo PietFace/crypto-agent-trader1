@@ -368,6 +368,10 @@ class Engine:
                  "uit (zet het aan onder Instellingen > Op afstand meekijken)."), "info" if self.remote else "muted")
         if self.copier:
             self.copier.start()
+        elif (self.cfg.get("copy") or {}).get("traders"):
+            n = len(self.cfg["copy"]["traders"])
+            self.log(f"Kopieer-modus staat UIT: {n} trader(s) klaar bij Kopiëren, maar 'Kopieer-modus aan' is niet "
+                     "aangevinkt. Vink het aan, klik Opslaan en start de bot opnieuw.", "bad")
         last_cycle = 0.0
         last_status = 0.0
         tick = max(10, int(self.cfg.get("tick_seconds", TICK_SECONDS)))

@@ -911,7 +911,12 @@ class CopyPage(QWidget):
         if addr in text.lower():
             return
         self.traders.setPlainText((text + "\n" if text else "") + f"{addr} {name} {style}")
-        self.find_status.setText(f"@{name} toegevoegd. Klik op Opslaan en start de bot opnieuw.")
+        if not self.on.isChecked():
+            self.on.setChecked(True)          # droog, dus veilig: anders gebeurt er niets
+        self.save()
+        self.find_status.setText(f"@{name} toegevoegd en opgeslagen; de kopieer-modus staat aan "
+                                 f"({'LIVE' if self.live.isChecked() else 'droog'}). Stop en start de bot om te "
+                                 "beginnen. In het logboek staat dan 'Kopieer-modus … kijken naar …'.")
 
     # --- tabellen
     def refresh(self):

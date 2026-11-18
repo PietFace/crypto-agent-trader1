@@ -124,7 +124,7 @@ def fetch_invo_users(cache_path, days=7, timeout=60, log=lambda *a: None):
     return vol
 
 
-def pick_traders(rows, n=10, min_account=50_000):
+def pick_traders(rows, n=10, min_account=50_000, max_vol_x=100):
     """Kies traders die al langer goed draaien, geen market makers of gokkers.
 
     - minstens min_account dollar op het account
@@ -142,7 +142,7 @@ def pick_traders(rows, n=10, min_account=50_000):
             continue
         if m["pnl"] <= 0 or a["pnl"] <= 0 or w["roi"] < -0.15:
             continue
-        if m["vlm"] > acct * 100 or m["roi"] > 3:
+        if (max_vol_x and m["vlm"] > acct * max_vol_x) or m["roi"] > 3:
             continue
         ok.append(r)
     ok.sort(key=lambda r: r["month"]["roi"], reverse=True)
@@ -219,7 +219,12 @@ class Followers:
             # Maximaal de helft van de plekken voor Invo-traders; zelfde filters, wel kleinere accounts toegestaan.
             invo_rows = [r for r in rows if r.get("address") and r["address"].lower() in invo]
             room = max(0, n // 2)
-            for r in pick_traders(invo_rows, n=room + len(manual), min_account=10_000):
+            # Invo-traders zijn echte mensen via een app, geen market makers: het volumefilter mag weg,
+            # zodat ook actieve (korte) traders meedoen. Winst-eisen blijven.
+            invo_ok = pick_traders(invo_rows, n=room + len(manual), min_account=10_000, max_vol_x=None)
+            self.log(f"Volgers: {len(invo)} Invo-adressen, waarvan {len(invo_rows)} op het leaderboard en "
+                     f"{len(invo_ok)} door de winst-filters", "info")
+            for r in invo_ok:
                 if r["address"].lower() not in manual and sum(1 for _, s in chosen if s == "invo") < room \
                         and len(chosen) < n:
                     chosen.append((r, "invo"))
