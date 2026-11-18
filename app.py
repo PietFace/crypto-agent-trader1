@@ -780,10 +780,10 @@ class CopyPage(QWidget):
         self.found.setMinimumHeight(180)
         v.addWidget(self.found)
         addrow = QHBoxLayout()
-        self.add_btn = QPushButton("Geselecteerde toevoegen")
+        self.add_btn = QPushButton("Aangevinkte toevoegen")
         self.add_btn.clicked.connect(self._add_selected)
         addrow.addWidget(self.add_btn)
-        addrow.addWidget(lab("Klik een regel aan (Ctrl-klik voor meer) en druk op deze knop. Dubbelklikken kan ook.",
+        addrow.addWidget(lab("Vink de blokjes voor de namen aan en druk op deze knop. Dubbelklikken op een naam kan ook.",
                              "hint"))
         addrow.addStretch(1)
         v.addLayout(addrow)
@@ -913,7 +913,13 @@ class CopyPage(QWidget):
             if kind == "msg":
                 self.find_status.setText(val)
             elif kind == "rows":
+                checked = self._checked_addrs()
                 fill(self.found, val)
+                for r in range(self.found.rowCount()):
+                    it, ad = self.found.item(r, 0), self.found.item(r, 1)
+                    if it and ad and ad.text().startswith("0x"):
+                        it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+                        it.setCheckState(Qt.Checked if ad.text() in checked else Qt.Unchecked)
             elif kind == "err":
                 self._timer.stop()
                 self.find_btn.setEnabled(True)
@@ -927,10 +933,21 @@ class CopyPage(QWidget):
     def _add_found(self, r, _c):
         self._add_rows([r])
 
+    def _checked_addrs(self):
+        out = set()
+        for r in range(self.found.rowCount()):
+            it, ad = self.found.item(r, 0), self.found.item(r, 1)
+            if it and ad and it.checkState() == Qt.Checked:
+                out.add(ad.text())
+        return out
+
     def _add_selected(self):
-        rows = sorted({i.row() for i in self.found.selectedIndexes()})
+        rows = [r for r in range(self.found.rowCount())
+                if self.found.item(r, 0) and self.found.item(r, 0).checkState() == Qt.Checked]
         if not rows:
-            self.find_status.setText("Klik eerst een gevonden trader aan in de tabel.")
+            rows = sorted({i.row() for i in self.found.selectedIndexes()})
+        if not rows:
+            self.find_status.setText("Vink eerst een of meer gevonden traders aan.")
             return
         self._add_rows(rows)
 
