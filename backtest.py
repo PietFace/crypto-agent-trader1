@@ -154,6 +154,15 @@ def run(data, rules, shorts=True, start_budget=None, progress=None, cycle_minute
             if k is None or k < 60:
                 continue
             st, cs = setup_at(closes[m], k)
+            if rules.get("daily_trend"):
+                # Trend op dagbasis: koers t.o.v. het gemiddelde van de laatste 20 dagen (480 uurkaarsen).
+                win = closes[m][max(0, k - 479): k + 1]
+                sma_d = sum(win) / len(win)
+                st = dict(st)
+                if closes[m][k] < sma_d:
+                    st["long"] = False
+                if closes[m][k] > sma_d:
+                    st["short"] = False
             state = ("long" if st["long"] else "") + ("short" if st["short"] and shorts else "")
             prev = last_state.get(m, "")
             last_state[m] = state
@@ -238,3 +247,44 @@ def max_drawdown(equity):
         peak = max(peak, v)
         dd = min(dd, v - peak)
     return dd
+
+
+# ------------------------------------------------------------------ varianten naast elkaar
+VARIANTS = [
+    ("Zoals nu", {}),
+    ("Doel 3x het risico", {"reward_risk": 3.0}),
+    ("Trend op dagbasis", {"daily_trend": True}),
+    ("Pauze 48 uur na stop", {"cooldown_hours_after_stop": 48}),
+    ("Max 2 instappen per dag", {"max_buys_per_day": 2}),
+    ("Alles samen", {"reward_risk": 3.0, "daily_trend": True, "cooldown_hours_after_stop": 48,
+                     "max_buys_per_day": 2}),
+]
+
+
+def run_variants(data, rules, shorts=True, cycle_minutes=120, progress=None):
+    """Dezelfde koersen met een paar instellingen naast elkaar. Geeft een lijst met korte uitkomsten."""
+    out = []
+    for i, (name, change) in enumerate(VARIANTS):
+        if progress:
+            progress(f"Variant {i + 1}/{len(VARIANTS)}: {name}")
+        r = dict(rules)
+        r.update(change)
+        res = run(data, r, shorts=shorts, cycle_minutes=cycle_minutes)
+        st = res["stats"]
+        out.append({"name": name, "change": change, "final": round(res["final"], 2),
+                    "result": round(res["final"] - res["budget"], 2),
+                    "vs_hold": round(res["final"] - res["hold_final"], 2) if res["hold_final"] is not None else None,
+                    "trades": st["all"]["trades"], "winrate": st["all"]["winrate"],
+                    "long": round(st["long"]["total"], 2), "short": round(st["short"]["total"], 2),
+                    "max_drawdown": round(res["max_drawdown"], 2)})
+    return out
+
+
+def variants_text(rows, months, exchange):
+    """Korte tekst voor het logboek (ook op je telefoon te zien)."""
+    lines = [f"Varianten-test {months} maanden ({exchange}), van beste naar slechtste:"]
+    for r in sorted(rows, key=lambda r: r["final"], reverse=True):
+        wr = f"{r['winrate'] * 100:.0f}%" if r["winrate"] is not None else "-"
+        lines.append(f"{r['name']}: eindstand €{r['final']:.2f} ({r['result']:+.2f}), {r['trades']} trades, "
+                     f"winrate {wr}, grootste daling €{r['max_drawdown']:.2f}")
+    return lines

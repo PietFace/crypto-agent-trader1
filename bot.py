@@ -203,6 +203,11 @@ def init_db(path):
                 con.execute(f"ALTER TABLE {t} ADD COLUMN bron TEXT DEFAULT 'regels'")
             if "schaduw" not in [r[1] for r in con.execute(f"PRAGMA table_info({t})")]:
                 con.execute(f"ALTER TABLE {t} ADD COLUMN schaduw INTEGER DEFAULT 0")
+        for t in ("positions", "short_positions"):
+            if "ext_stop" not in [r[1] for r in con.execute(f"PRAGMA table_info({t})")]:
+                con.execute(f"ALTER TABLE {t} ADD COLUMN ext_stop TEXT")
+            if "echt" not in [r[1] for r in con.execute(f"PRAGMA table_info({t})")]:
+                con.execute(f"ALTER TABLE {t} ADD COLUMN echt INTEGER DEFAULT 0")
 
 
 class Engine:
@@ -217,10 +222,14 @@ class Engine:
         self.live = bool(cfg.get("live"))
         self.kr = None
         self.lev = max(1, int(self.rules.get("leverage", 1) or 1))
+        self.kx = None
         if self.exchange == "kraken":
             import kraken
             self.kr = kraken.KrakenPublic()
-            self.live = False  # Kraken-orders zitten er nog niet in: altijd droog
+            k = cfg.get("keys", {})
+            if self.live and k.get("kraken_key") and k.get("kraken_secret"):
+                self.kx = kraken.KrakenPrivate(k["kraken_key"], k["kraken_secret"], public=self.kr)
+            self.live = bool(self.kx)  # zonder Kraken-key nooit live, en zeker nooit via Bitvavo
         self.markets = list(cfg.get("markets") or [])
         self.cycle_minutes = int(cfg.get("cycle_minutes", 120))
         self.models = {a: cfg.get("model") or "claude-haiku-5-5"
@@ -265,7 +274,10 @@ class Engine:
             p.append("Anthropic API-key ontbreekt")
         if not self.markets:
             p.append("geen markten gekozen")
-        if self.live and not (self.cfg["keys"].get("bitvavo_key") and self.cfg["keys"].get("bitvavo_secret")):
+        if self.exchange == "kraken":
+            if self.cfg.get("live") and not self.kx:
+                p.append("Live staat aan, maar de Kraken-key of -secret ontbreekt")
+        elif self.live and not (self.cfg["keys"].get("bitvavo_key") and self.cfg["keys"].get("bitvavo_secret")):
             p.append("Live staat aan, maar de Bitvavo-key of -secret ontbreekt")
         return p
 
@@ -286,10 +298,15 @@ class Engine:
     def _loop(self):
         if self.kr:
             lev = self.rules.get("leverage", 1)
-            self.log(f"Beurs: Kraken-perps (droog), hefboom max {lev}x, kosten {self.rules['fee_pct']}% per kant, "
-                     "shorts zonder leenkosten. Koersen in USD, omgerekend naar euro.", "info")
-            if self.cfg.get("live"):
-                self.log("Live staat aan, maar Kraken-orders zitten er nog niet in: de bot draait droog.", "bad")
+            self.log(f"Beurs: Kraken-perps ({'LIVE' if self.kx else 'droog'}), hefboom max {lev}x, kosten "
+                     f"{self.rules['fee_pct']}% per kant, shorts {'echt' if self.kx else 'gesimuleerd'} en zonder "
+                     "leenkosten. Elke positie krijgt een stop-loss bij Kraken zelf.", "info")
+            if self.kx:
+                try:
+                    total, free = self.kx.collateral_usd()
+                    self.log(f"Kraken-account: ${total:.2f} totaal, ${free:.2f} vrij voor nieuwe posities.", "info")
+                except Exception as e:
+                    self.log(f"Kraken-account niet te lezen: {e}", "bad")
             try:
                 missing = [m for m in self.markets if not self.kr.supported(m)]
                 if missing:
@@ -477,12 +494,57 @@ class Engine:
         return res["amount_eur"], "ok"
 
     # ---------- orders ----------
+    def kraken_conflict(self, market, book):
+        """Kraken telt long en short op dezelfde munt bij elkaar op. Dus nooit allebei tegelijk echt."""
+        other = self.get_short_positions() if book == "long" else self.get_positions()
+        pos = other.get(market)
+        return bool(pos and pos.get("echt"))
+
+    def kraken_open(self, market, side, eur, book):
+        """Echte positie openen bij Kraken plus stop-loss bij Kraken. Geeft (aantal, prijs, stop_id)."""
+        size, _ = self.kx.size_for(market, eur)
+        if size <= 0:
+            raise RuntimeError(f"€{eur:.2f} is te weinig voor de kleinste ordergrootte van {market}")
+        amount, fill_px, _ = self.kx.market_order(market, side, size)
+        plan = risk_gate.exit_plan(self.rules, market, fill_px, book)
+        try:
+            stop_id = self.kx.stop_order(market, "sell" if side == "buy" else "buy", amount, plan["stop_price"])
+        except Exception as e:
+            self.log(f"  Stop-loss bij Kraken mislukt ({e}): positie meteen weer gesloten", "bad")
+            self.kx.market_order(market, "sell" if side == "buy" else "buy", amount, reduce_only=True)
+            raise
+        return amount, fill_px, stop_id
+
+    def kraken_close(self, market, side, pos):
+        """Echte positie sluiten. Geeft (aantal, prijs) of None als Kraken hem al gesloten had."""
+        self.kx.cancel(pos.get("ext_stop"))
+        try:
+            amount, fill_px, _ = self.kx.market_order(market, side, pos["amount"], reduce_only=True)
+            return amount, fill_px
+        except Exception as e:
+            if "wouldNotReducePosition" in str(e):
+                return None
+            raise
+
     def execute_buy(self, market, eur, reason, bron="regels"):
         px = self.price(market)
         fee_rate = self.rules["fee_pct"] / 100
         shadow = self.is_shadow(bron)
         real = self.live and not shadow
-        if real:
+        ext_stop = None
+        if real and self.kx:
+            if self.kraken_conflict(market, "long"):
+                self.log(f"  {market}: er staat al een echte short, Kraken kan niet tegelijk long. Overgeslagen.", "muted")
+                return
+            try:
+                amount, fill_px, ext_stop = self.kraken_open(market, "buy", eur, "long")
+            except Exception as e:
+                self.log(f"  KOOP bij Kraken mislukt: {e}", "bad")
+                return
+            spent = amount * fill_px
+            fee = spent * fee_rate
+            spent += fee
+        elif real:
             res = self.bv.placeOrder(market, "buy", "market", {"amountQuote": f"{eur:.2f}"})
             if res.get("errorCode") == 307:
                 self.log("  KOOP mislukt: Bitvavo weigert dit IP-adres (307). Controleer de IP-whitelist van je key.", "bad")
@@ -499,8 +561,9 @@ class Engine:
             amount = (eur - fee) / px
             spent, fill_px = eur, px
         with self.db() as con:
-            con.execute("INSERT INTO positions(market,amount,entry_price,cost_eur,opened,bron,schaduw) "
-                        "VALUES(?,?,?,?,?,?,?)", (market, amount, fill_px, spent, now(), bron, int(shadow)))
+            con.execute("INSERT INTO positions(market,amount,entry_price,cost_eur,opened,bron,schaduw,ext_stop,echt) "
+                        "VALUES(?,?,?,?,?,?,?,?,?)",
+                        (market, amount, fill_px, spent, now(), bron, int(shadow), ext_stop, int(real)))
             con.execute("INSERT INTO trades(ts,market,side,amount,price,eur,fee,pnl,live,reason,bron,schaduw) "
                         "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                         (now(), market, "buy", amount, fill_px, spent, fee, 0, int(real), reason, bron, int(shadow)))
@@ -514,8 +577,22 @@ class Engine:
         px = self.price(market)
         amount = pos["amount"]
         shadow = bool(pos.get("schaduw"))
-        real = self.live and not shadow
-        if real:
+        real = bool(pos.get("echt")) if self.kx else (self.live and not shadow)
+        if real and self.kx:
+            try:
+                done = self.kraken_close(market, "sell", pos)
+            except Exception as e:
+                self.log(f"  VERKOOP bij Kraken mislukt: {e}. De stop-loss bij Kraken is mogelijk weg!", "bad")
+                return
+            if done is None:
+                fill_px = risk_gate.exit_plan(self.rules, market, pos["entry_price"])["stop_price"]
+                reason = "stop-loss (al uitgevoerd bij Kraken)"
+            else:
+                amount, fill_px = done
+            gross = amount * fill_px
+            fee = gross * self.rules["fee_pct"] / 100
+            net = gross - fee
+        elif real:
             base = market.split("-")[0]
             bal = self.bv.balance({"symbol": base})
             avail = float(bal[0]["available"]) if isinstance(bal, list) and bal else 0.0
@@ -551,6 +628,8 @@ class Engine:
 
     def check_exits(self):
         """Stop-loss en koersdoel, en de actuele waarde van elke open positie. Verkopen wordt nooit geblokkeerd."""
+        if self.kx:
+            self.sync_kraken()
         fee = self.rules["fee_pct"] / 100
         marks = []
         for market, pos in self.get_positions().items():
@@ -579,23 +658,39 @@ class Engine:
             con.executemany("INSERT INTO position_marks(book,market,price,value_eur,pnl_eur,ts) VALUES(?,?,?,?,?,?)",
                             [(b, m, px, v, p, now()) for b, m, px, v, p in marks])
 
-    # ---------- shorts (altijd simulatie) ----------
+    # ---------- shorts (gesimuleerd, behalve op Kraken live) ----------
     def get_short_positions(self):
         with self.db() as con:
             return {r["market"]: dict(r) for r in con.execute("SELECT * FROM short_positions")}
 
     def open_short(self, market, eur, reason, bron="regels"):
-        """Gesimuleerde short: je 'leent' de munt en verkoopt hem tegen de huidige koers."""
+        """Short. Bitvavo en droog: gesimuleerd. Kraken live: echt, met stop-loss bij Kraken."""
         px = self.price(market)
+        shadow = self.is_shadow(bron)
+        real = bool(self.kx) and not shadow
+        ext_stop = None
+        if real:
+            if self.kraken_conflict(market, "short"):
+                self.log(f"  {market}: er staat al een echte long, Kraken kan niet tegelijk short. Overgeslagen.", "muted")
+                return
+            try:
+                amount, px, ext_stop = self.kraken_open(market, "sell", eur, "short")
+            except Exception as e:
+                self.log(f"  SHORT bij Kraken mislukt: {e}", "bad")
+                return
+            eur = amount * px
+        else:
+            amount = eur / px
         fee = eur * self.rules["fee_pct"] / 100
-        amount = eur / px
         with self.db() as con:
-            con.execute("INSERT INTO short_positions(market,amount,entry_price,cost_eur,opened,bron) "
-                        "VALUES(?,?,?,?,?,?)", (market, amount, px, eur, now(), bron))
-            con.execute("INSERT INTO short_trades(ts,market,side,amount,price,eur,fee,pnl,reason,bron) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?)", (now(), market, "short", amount, px, eur, fee, 0, reason, bron))
-        self.push_trade(market, "short", eur, px, 0, reason, sim=True)
-        self.log(f"  SIM SHORT {market}: €{eur:.2f} @ {fmt_px(px)}", "good")
+            con.execute("INSERT INTO short_positions(market,amount,entry_price,cost_eur,opened,bron,schaduw,ext_stop,echt) "
+                        "VALUES(?,?,?,?,?,?,?,?,?)",
+                        (market, amount, px, eur, now(), bron, int(shadow and bool(self.kx)), ext_stop, int(real)))
+            con.execute("INSERT INTO short_trades(ts,market,side,amount,price,eur,fee,pnl,reason,bron,schaduw) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        (now(), market, "short", amount, px, eur, fee, 0, reason, bron, int(shadow and bool(self.kx))))
+        self.push_trade(market, "short", eur, px, 0, reason, sim=not real)
+        self.log(f"  {'LIVE' if real else 'SIM'} SHORT {market}: €{eur:.2f} @ {fmt_px(px)}", "good")
 
     def short_pnl(self, pos, px):
         """Resultaat van een short bij koers px: koersdaling min fees en leenkosten."""
@@ -611,16 +706,45 @@ class Engine:
         if not pos:
             return
         px = self.price(market)
+        real = bool(pos.get("echt")) and bool(self.kx)
+        if real:
+            try:
+                done = self.kraken_close(market, "buy", pos)
+            except Exception as e:
+                self.log(f"  SHORT SLUITEN bij Kraken mislukt: {e}. De stop-loss bij Kraken is mogelijk weg!", "bad")
+                return
+            if done is None:
+                px = risk_gate.exit_plan(self.rules, market, pos["entry_price"], "short")["stop_price"]
+                reason = "stop-loss (al uitgevoerd bij Kraken)"
+            else:
+                px = done[1]
         pnl, fees, borrow = self.short_pnl(pos, px)
         with self.db() as con:
             con.execute("DELETE FROM short_positions WHERE market=?", (market,))
-            con.execute("INSERT INTO short_trades(ts,market,side,amount,price,eur,fee,pnl,reason,bron) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            con.execute("INSERT INTO short_trades(ts,market,side,amount,price,eur,fee,pnl,reason,bron,schaduw) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                         (now(), market, "cover", pos["amount"], px, pos["amount"] * px, fees + borrow, pnl, reason,
-                         pos.get("bron") or "regels"))
-        self.push_trade(market, "cover", pos["amount"] * px, px, pnl, reason, sim=True)
-        self.log(f"  SIM SHORT SLUITEN {market} @ {fmt_px(px)} (resultaat {pnl:+.2f}, waarvan leenkosten "
-                 f"{borrow:.2f})", "good" if pnl >= 0 else "bad")
+                         pos.get("bron") or "regels", pos.get("schaduw") or 0))
+        self.push_trade(market, "cover", pos["amount"] * px, px, pnl, reason, sim=not real)
+        self.log(f"  {'LIVE' if real else 'SIM'} SHORT SLUITEN {market} @ {fmt_px(px)} (resultaat {pnl:+.2f}"
+                 + (f", waarvan leenkosten {borrow:.2f})" if borrow else ")"), "good" if pnl >= 0 else "bad")
+
+    def sync_kraken(self):
+        """Posities die Kraken zelf gesloten heeft (stop-loss geraakt terwijl de bot niet keek) bijwerken."""
+        try:
+            open_at_kraken = self.kx.open_positions()
+        except Exception as e:
+            self.log(f"Kraken-posities niet te lezen: {e}", "bad")
+            return
+        import kraken
+        for market, pos in self.get_positions().items():
+            if pos.get("echt") and kraken.SYMBOLS.get(market) not in open_at_kraken:
+                self.log(f"[Kraken] {market}: positie is bij Kraken gesloten (stop-loss)", "bad")
+                self.execute_sell(market, "stop-loss (bij Kraken)")
+        for market, pos in self.get_short_positions().items():
+            if pos.get("echt") and kraken.SYMBOLS.get(market) not in open_at_kraken:
+                self.log(f"[Kraken] {market}: short is bij Kraken gesloten (stop-loss)", "bad")
+                self.close_short(market, "stop-loss (bij Kraken)")
 
     # ---------- cyclus ----------
     def api_cost_this_month(self):

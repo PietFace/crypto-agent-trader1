@@ -7,7 +7,7 @@ import sys
 APP_NAME = "CryptoTrader"
 
 DEFAULTS = {
-    "keys": {"anthropic": "", "bitvavo_key": "", "bitvavo_secret": ""},
+    "keys": {"anthropic": "", "bitvavo_key": "", "bitvavo_secret": "", "kraken_key": "", "kraken_secret": ""},
     "live": False,
     "live_bronnen": ["volgers", "beide"],
     "exchange": "bitvavo",  # "bitvavo" of "kraken" (Kraken-perps, voorlopig alleen droog)

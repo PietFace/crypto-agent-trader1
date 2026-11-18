@@ -205,8 +205,9 @@ class BotPage(QWidget):
         rules = cfg["rules"]
         budget = float(rules["budget_eur"])
         kr = cfg.get("exchange") == "kraken"
-        live = bool(cfg.get("live")) and not kr
-        self.badge.setText("LIVE: ECHTE ORDERS" if live else ("KRAKEN · DROOG" if kr else "DROOG DRAAIEN"))
+        live = bool(cfg.get("live")) and (not kr or bool(cfg["keys"].get("kraken_key")))
+        where = "KRAKEN" if kr else "BITVAVO"
+        self.badge.setText(f"LIVE {where}: ECHTE ORDERS" if live else (f"{where} · DROOG"))
         self.badge.setObjectName("badge_live" if live else "badge_dry")
         self.badge.setStyleSheet(self.badge.styleSheet())
         self.badge.style().unpolish(self.badge)
@@ -282,11 +283,11 @@ class BotPage(QWidget):
             mk = marks.get(("long", market))
             rows.append(["kopen (schaduw)" if shadow else "kopen", market, eur(cost_eur), fmt_px(entry), *live_cols(mk, cost_eur),
                          fmt_px(plan['stop_price']), fmt_px(plan['target_price']), local_time(opened)])
-        for market, amount, entry, cost_eur, opened in query(
-                "SELECT market, amount, entry_price, cost_eur, opened FROM short_positions"):
+        for market, amount, entry, cost_eur, opened, real in query(
+                "SELECT market, amount, entry_price, cost_eur, opened, COALESCE(echt,0) FROM short_positions"):
             plan = risk_gate.exit_plan(rules, market, entry, "short")
             mk = marks.get(("short", market))
-            rows.append(["short (sim)", market, eur(cost_eur), fmt_px(entry), *live_cols(mk, cost_eur),
+            rows.append(["short" if real else "short (sim)", market, eur(cost_eur), fmt_px(entry), *live_cols(mk, cost_eur),
                          fmt_px(plan['stop_price']), fmt_px(plan['target_price']), local_time(opened)])
         fill(self.pos, rows)
         from PySide6.QtGui import QColor
@@ -583,6 +584,11 @@ class EquityChart(QWidget):
         qp.drawText(pad + 130, h - 8, "— BTC vasthouden")
 
 
+def backtest_lines(rows, months, ex):
+    import backtest
+    return backtest.variants_text(rows, months, ex)
+
+
 class BacktestPage(QWidget):
     def __init__(self, win):
         super().__init__()
@@ -609,6 +615,9 @@ class BacktestPage(QWidget):
         self.with_shorts = QCheckBox("Met shorts")
         self.with_shorts.setChecked(True)
         top.addWidget(self.with_shorts)
+        self.with_var = QCheckBox("Varianten vergelijken")
+        self.with_var.setChecked(True)
+        top.addWidget(self.with_var)
         self.btn = QPushButton("Test starten")
         self.btn.setObjectName("primary")
         self.btn.clicked.connect(self.start)
@@ -616,6 +625,7 @@ class BacktestPage(QWidget):
         v.addLayout(top)
         v.addWidget(lab("Speelt de vaste regels uur voor uur na op echte koersen van Bitvavo, met jouw instellingen: "
                         "de vijf instapregels, positiegrootte, stop-loss, koersdoel, daglimiet en fees. "
+                        "Varianten: dezelfde test nog eens met telkens één instelling anders, zodat je kunt vergelijken. "
                         "Niet mee te testen: de AI (de Charts-score wordt een rekenscore op dezelfde indicatoren, "
                         "nieuws telt als neutraal, geen Skeptic/Chief) en de volgers. Kost geen API-tegoed.",
                         "hint", wrap=True))
@@ -647,6 +657,11 @@ class BacktestPage(QWidget):
         h.addLayout(left, 1)
         h.addLayout(right, 1)
         v.addLayout(h)
+        v.addWidget(lab("VARIANTEN (zelfde koersen, één instelling anders)", "cap"))
+        self.var = table(["Variant", "Eindstand", "Resultaat", "t.o.v. BTC", "Trades", "Winrate", "Kopen",
+                          "Shorten", "Grootste daling"])
+        self.var.setMinimumHeight(240)
+        v.addWidget(self.var)
         self._q = queue.Queue()
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll)
@@ -659,6 +674,7 @@ class BacktestPage(QWidget):
             markets = ["BTC-EUR"] + markets
         rules = settings.effective_rules(self.win.cfg)
         shorts = self.with_shorts.isChecked()
+        with_var = self.with_var.isChecked()
         self.btn.setEnabled(False)
         self.status.setText("Koersen ophalen bij Bitvavo…")
 
@@ -674,6 +690,10 @@ class BacktestPage(QWidget):
                 res = backtest.run(data, rules, shorts=shorts, progress=lambda t: self._q.put(("msg", t)),
                                    cycle_minutes=int(self.win.cfg.get("cycle_minutes", 120)))
                 res["months"] = months
+                if with_var:
+                    res["variants"] = backtest.run_variants(
+                        data, rules, shorts=shorts, cycle_minutes=int(self.win.cfg.get("cycle_minutes", 120)),
+                        progress=lambda t: self._q.put(("msg", t)))
                 self._q.put(("done", res))
             except Exception as e:
                 self._q.put(("err", str(e)))
@@ -697,6 +717,15 @@ class BacktestPage(QWidget):
                 self.btn.setEnabled(True)
                 self.show_result(val)
 
+    def show_variants(self, rows):
+        o = lambda x: eur(x, True) if x is not None else "–"
+        data = []
+        for x in sorted(rows, key=lambda x: x["final"], reverse=True):
+            data.append([x["name"], eur(x["final"]), o(x["result"]), o(x["vs_hold"]), x["trades"],
+                         f"{x['winrate'] * 100:.0f}%" if x["winrate"] is not None else "–",
+                         o(x["long"]), o(x["short"]), eur(x["max_drawdown"])])
+        fill(self.var, data)
+
     def show_result(self, r):
         def d(ts):
             return datetime.datetime.fromtimestamp(ts / 1000).strftime("%d-%m-%Y") if ts else "?"
@@ -711,6 +740,11 @@ class BacktestPage(QWidget):
         self.t_trades.set(str(st["trades"]), f"{st['winrate'] * 100:.0f}% winst" if st["winrate"] is not None else "")
         self.t_dd.set(eur(r["max_drawdown"]), "van hoogste naar laagste stand", C["bad"] if r["max_drawdown"] < 0 else None)
         self.chart.set([(C["accent"], r["equity"]), (C["info"], r["hold"])])
+        if r.get("variants"):
+            self.show_variants(r["variants"])
+            ex = "Kraken" if self.win.cfg.get("exchange") == "kraken" else "Bitvavo"
+            for line in backtest_lines(r["variants"], r["months"], ex):
+                self.win.log(line, "info")
 
         def row(name, s):
             o = lambda x: eur(x, True) if x is not None else "–"
@@ -761,6 +795,15 @@ class SettingsPage(QWidget):
         f.addRow("Anthropic API-key", self.k_ant)
         f.addRow("Bitvavo API-key", self.k_bv)
         f.addRow("Bitvavo API-secret", self.k_bvs)
+        self.k_kr = self._secret()
+        self.k_krs = self._secret()
+        f.addRow("Kraken futures API-key", self.k_kr)
+        f.addRow("Kraken futures API-secret", self.k_krs)
+        self.kr_test = QPushButton("Kraken-verbinding testen")
+        self.kr_test.clicked.connect(self._test_kraken)
+        self.kr_result = lab("", "hint", wrap=True)
+        f.addRow("", self.kr_test)
+        f.addRow("", self.kr_result)
         self.show_keys = QCheckBox("Keys tonen")
         self.show_keys.toggled.connect(self._toggle_keys)
         f.addRow("", self.show_keys)
@@ -775,14 +818,16 @@ class SettingsPage(QWidget):
         self.exch = QComboBox()
         self.exch.addItems(["Bitvavo", "Kraken-perps (droog)"])
         f.addRow("Beurs", self.exch)
+        self.exch.currentIndexChanged.connect(self._exchange_changed)
         self.lev = QSpinBox()
         self.lev.setRange(1, 5)
         self.lev.setSuffix("x")
         f.addRow("Hefboom (Kraken)", self.lev)
-        f.addRow("", lab("Kraken: 0,05% kosten per kant in plaats van 0,25%, echte shorts zonder leenkosten. "
-                         "Nog alleen droog: er gaan geen echte Kraken-orders uit. Hefboom maakt posities groter, "
-                         "maar het maximale verlies per trade blijft je ingestelde bedrag.", "hint", wrap=True))
-        self.live = QCheckBox("Live: echte orders plaatsen op Bitvavo")
+        f.addRow("", lab("Kraken: 0,05% kosten per kant in plaats van 0,25%, shorts zonder leenkosten. Met Live en een "
+                         "Kraken-key gaan longs én shorts echt, elk met een stop-loss bij Kraken zelf. Hefboom maakt "
+                         "posities groter, maar het maximale verlies per trade blijft je ingestelde bedrag.",
+                         "hint", wrap=True))
+        self.live = QCheckBox("Live: echte orders plaatsen (op de gekozen beurs)")
         self.live.toggled.connect(self._confirm_live)
         f.addRow("", self.live)
         lb = QWidget()
@@ -977,15 +1022,40 @@ class SettingsPage(QWidget):
         self.rm_result.setStyleSheet(f"color: {C['good'] if ok else C['bad']};")
 
     def _toggle_keys(self, on):
-        for e in (self.k_ant, self.k_bv, self.k_bvs, self.rm_token):
+        for e in (self.k_ant, self.k_bv, self.k_bvs, self.k_kr, self.k_krs, self.rm_token):
             e.setEchoMode(QLineEdit.Normal if on else QLineEdit.Password)
+
+    def _test_kraken(self):
+        import kraken
+        try:
+            kx = kraken.KrakenPrivate(self.k_kr.text(), self.k_krs.text())
+            total, free = kx.collateral_usd()
+            rate = kx.pub.eurusd()
+            pos = kx.open_positions()
+            self.kr_result.setText(f"Verbonden. Futures-account: {eur(total / rate)} (${total:.2f}), "
+                                   f"vrij: {eur(free / rate)}. Open posities bij Kraken: {len(pos)}.")
+        except Exception as e:
+            self.kr_result.setText(f"Lukt niet: {e}")
+
+    def _exchange_changed(self, _i):
+        if self._loading or not self.live.isChecked():
+            return
+        self._loading = True
+        self.live.setChecked(False)
+        self._loading = False
+        QMessageBox.information(self, "Andere beurs",
+                                "Live is uitgezet omdat je van beurs wisselt. Zet hem bewust weer aan als je "
+                                "op de nieuwe beurs met echt geld wilt handelen.")
 
     def _confirm_live(self, on):
         if self._loading or not on:
             return
+        kr = self.exch.currentIndex() == 1
         ok = QMessageBox.question(
             self, "Live handelen",
-            "Met Live plaatst de bot echte orders met echt geld op Bitvavo.\n\n"
+            ("Met Live plaatst de bot echte orders met echt geld op Kraken: longs én shorts, met hefboom tot "
+             f"{self.lev.value()}x en een stop-loss bij Kraken zelf.\n\n" if kr else
+             "Met Live plaatst de bot echte orders met echt geld op Bitvavo.\n\n") +
             "Heb je de bot eerst een tijd droog laten draaien en is het budget een bedrag dat je kunt missen?",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if ok != QMessageBox.Yes:
@@ -1017,6 +1087,8 @@ class SettingsPage(QWidget):
         self.k_ant.setText(k.get("anthropic", ""))
         self.k_bv.setText(k.get("bitvavo_key", ""))
         self.k_bvs.setText(k.get("bitvavo_secret", ""))
+        self.k_kr.setText(k.get("kraken_key", ""))
+        self.k_krs.setText(k.get("kraken_secret", ""))
         self.live.setChecked(bool(cfg.get("live")))
         for m, c in self.m_checks.items():
             c.setChecked(m in cfg.get("markets", []))
@@ -1065,7 +1137,8 @@ class SettingsPage(QWidget):
     def save(self):
         cfg = self.win.cfg
         cfg["keys"] = {"anthropic": self.k_ant.text().strip(), "bitvavo_key": self.k_bv.text().strip(),
-                       "bitvavo_secret": self.k_bvs.text().strip()}
+                       "bitvavo_secret": self.k_bvs.text().strip(),
+                       "kraken_key": self.k_kr.text().strip(), "kraken_secret": self.k_krs.text().strip()}
         cfg["live"] = self.live.isChecked()
         cfg["live_bronnen"] = [k for k, c in self.lb_checks.items() if c.isChecked()]
         cfg["exchange"] = "kraken" if self.exch.currentIndex() == 1 else "bitvavo"
