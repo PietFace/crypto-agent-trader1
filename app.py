@@ -463,7 +463,22 @@ class FollowersPage(QWidget):
         left = QVBoxLayout()
         left.addWidget(lab("GEVOLGDE TRADERS", "cap"))
         self.traders = table(["Trader", "Naam", "Account $", "Winst maand $", "ROI maand", "Bron"])
+        self.traders.setSelectionMode(QTableWidget.ExtendedSelection)
+        self.traders.setSelectionBehavior(QTableWidget.SelectRows)
+        self._addrs = []
         left.addWidget(self.traders)
+        cp = QHBoxLayout()
+        cp.addWidget(lab("Geselecteerde traders", "sub"))
+        self.cp_style = QComboBox()
+        self.cp_style.addItems(["lang", "kort"])
+        cp.addWidget(self.cp_style)
+        self.cp_btn = QPushButton("Naar Kopiëren")
+        self.cp_btn.clicked.connect(self.to_copy)
+        cp.addWidget(self.cp_btn)
+        cp.addStretch(1)
+        left.addLayout(cp)
+        self.cp_msg = lab("", "hint", wrap=True)
+        left.addWidget(self.cp_msg)
         right = QVBoxLayout()
         right.addWidget(lab("RECENTE ACTIES", "cap"))
         self.events = table(["Tijd", "Trader", "Munt", "Actie", "Grootte $"])
@@ -471,6 +486,30 @@ class FollowersPage(QWidget):
         h.addLayout(left, 3)
         h.addLayout(right, 2)
         v.addLayout(h, 1)
+
+    def to_copy(self):
+        """Geselecteerde volgers in de lijst van de kopieer-modus zetten en opslaan."""
+        picked = sorted({i.row() for i in self.traders.selectedIndexes()})
+        if not picked:
+            self.cp_msg.setText("Selecteer eerst een of meer traders in de tabel (Ctrl-klik voor meerdere).")
+            return
+        cp = self.win.cp
+        text = cp.traders.toPlainText().strip()
+        added = []
+        for r in picked:
+            if r >= len(self._addrs):
+                continue
+            addr, name = self._addrs[r]
+            if not addr or addr.lower() in text.lower():
+                continue
+            label = (name or addr[:8]).replace(" ", "_")
+            text = (text + "\n" if text else "") + f"{addr.lower()} {label} {self.cp_style.currentText()}"
+            added.append(label)
+        cp.traders.setPlainText(text)
+        cp.save()
+        self.cp_msg.setText((f"Toegevoegd aan Kopiëren: {', '.join(added)}. " if added else
+                             "Deze traders stonden al bij Kopiëren. ") +
+                            "Zet de kopieer-modus aan bij Kopiëren en start de bot opnieuw.")
 
     def repick(self):
         import threading
@@ -520,11 +559,12 @@ class FollowersPage(QWidget):
             rows.append([coin, nl, ns, f"{score:+.2f}", usd(tl), usd(ts_),
                          f"{sum(levs) / len(levs):.1f}x" if levs else "", last_txt])
         fill(self.cons, rows)
+        data = query("SELECT address, name, account_value, month_pnl, month_roi, source FROM follower_traders "
+                     "ORDER BY month_roi DESC")
+        self._addrs = [(a, n) for a, n, *_ in data]
         rows = [[(a[:6] + "…" + a[-4:]) if a else "", n, usd(acc or 0), usd(mp or 0), f"{(mr or 0) * 100:.1f}%",
-                 "eigen" if src == "eigen" else "leaderboard"]
-                for a, n, acc, mp, mr, src in query(
-            "SELECT address, name, account_value, month_pnl, month_roi, source FROM follower_traders "
-            "ORDER BY month_roi DESC")]
+                 src if src in ("eigen", "invo") else "leaderboard"]
+                for a, n, acc, mp, mr, src in data]
         fill(self.traders, rows)
         rows = [[local_time(ts), (a[:6] + "…" + a[-4:]) if a else "", c, f"{e} {sd}", usd(nt or 0)]
                 for ts, a, c, e, sd, nt in query(
