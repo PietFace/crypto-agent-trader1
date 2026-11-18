@@ -208,13 +208,28 @@ def exit_signal(rules, market, entry_price, price, side="long"):
     return None
 
 
-def book_stats(con, book="long"):
-    """Losse statistieken per boek: gesloten trades, winrate, totaal, beste/slechtste."""
+def book_stats(con, book="long", bron=None):
+    """Losse statistieken per boek (en eventueel per bron): gesloten trades, winrate, totaal, beste/slechtste.
+    bron: 'regels', 'volgers' of 'beide' (None = alles)."""
     b = BOOKS[book]
-    pnls = [r[0] or 0.0 for r in con.execute(f"SELECT pnl FROM {b['trades']} WHERE side=?", (b["close"],))]
+    q, args = f"SELECT pnl FROM {b['trades']} WHERE side=?", [b["close"]]
+    if bron:
+        q += " AND COALESCE(bron,'regels')=?"
+        args.append(bron)
+    try:
+        pnls = [r[0] or 0.0 for r in con.execute(q, args)]
+    except sqlite3.OperationalError:
+        pnls = []
     wins = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p <= 0]
-    n_open = con.execute(f"SELECT COUNT(*) FROM {b['positions']}").fetchone()[0]
+    q2, args2 = f"SELECT COUNT(*) FROM {b['positions']}", []
+    if bron:
+        q2 += " WHERE COALESCE(bron,'regels')=?"
+        args2.append(bron)
+    try:
+        n_open = con.execute(q2, args2).fetchone()[0]
+    except sqlite3.OperationalError:
+        n_open = 0
     return {
         "trades": len(pnls), "wins": len(wins), "losses": len(losses),
         "winrate": round(len(wins) / len(pnls), 3) if pnls else None,

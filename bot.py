@@ -30,12 +30,14 @@ except Exception:
 
 import kosten
 import remote
+from followers import Followers, coin_of, follower_setup, short_addr
 import risk_gate
 import settings
 
 FEEDS = ["https://www.coindesk.com/arc/outboundfeeds/rss/",
          "https://cointelegraph.com/rss"]
-EXIT_CHECK_SECONDS = 300  # stop-loss en koersdoel elke 5 minuten
+EXIT_CHECK_SECONDS = 300
+EV_WORD = {"open": "opent", "sluit": "sluit", "draait": "draait naar"}  # stop-loss en koersdoel elke 5 minuten
 
 JSON_RULE = " Antwoord ALLEEN met geldig JSON, geen uitleg eromheen."
 PROMPTS = {
@@ -69,6 +71,9 @@ PROMPTS = {
              "- setup.short is waar en de Skeptic zegt niet 'hoog': kies short (een gesimuleerde short), "
              "onder dezelfde voorwaarden.\n"
              "- Geen setup, of de Skeptic zegt 'hoog': kies hold.\n"
+             "- 'volgers' laat zien hoeveel gevolgde, winstgevende traders op Hyperliquid long of short staan "
+             "en wat ze recent deden. Een setup kan van de regels of van de volgers komen; weeg mee hoe vers "
+             "en hoe eensgezind hun posities zijn.\n"
              "- Je hebt een koop-positie en de charts zijn duidelijk omgeslagen (score onder -0.3): sell. "
              "Je hebt een short en de charts zijn duidelijk omhoog (score boven 0.3): cover. "
              "Stop-loss en koersdoel worden verder automatisch bewaakt.\n"
@@ -118,9 +123,9 @@ def setup_for(ind, charts, news):
 
 def setup_text(st):
     if st["long"]:
-        return "koop-setup ✓"
+        return "koop-setup ✓" + (f" ({st['bron_long']})" if st.get("bron_long") else "")
     if st["short"]:
-        return "short-setup ✓"
+        return "short-setup ✓" + (f" ({st['bron_short']})" if st.get("bron_short") else "")
     best = max(("long", "short"), key=lambda k: sum(st[k + "_checks"].values()))
     missing = [k for k, ok in st[best + "_checks"].items() if not ok]
     n = sum(st[best + "_checks"].values())
@@ -187,6 +192,11 @@ def init_db(path):
         cols = [r[1] for r in con.execute("PRAGMA table_info(risk_log)")]
         if "book" not in cols:
             con.execute("ALTER TABLE risk_log ADD COLUMN book TEXT DEFAULT 'long'")
+        import followers as _fw
+        _fw.init_db(con)
+        for t in ("positions", "trades", "short_positions", "short_trades"):
+            if "bron" not in [r[1] for r in con.execute(f"PRAGMA table_info({t})")]:
+                con.execute(f"ALTER TABLE {t} ADD COLUMN bron TEXT DEFAULT 'regels'")
 
 
 class Engine:
@@ -215,6 +225,12 @@ class Engine:
         self.busy = False
         self.cycle_id = None
         self.shorts = bool(cfg.get("shorts_sim", True))
+        self.fcfg = cfg.get("followers") or {}
+        self.fast = bool(cfg.get("fast_check", True))
+        self.reports, self.last_state, self.last_decision = {}, {}, {}
+        self.followers = None
+        if self.fcfg.get("enabled", True):
+            self.followers = Followers(self.db_path, settings.data_dir(), self.fcfg, self._ui_log)
         self._thinking_ok = True
         init_db(self.db_path)
         rc = cfg.get("remote") or {}
@@ -271,6 +287,8 @@ class Engine:
                 break
             try:
                 self.check_exits()
+                if self.followers or self.fast:
+                    self.fast_check()
                 if time.time() - last_cycle >= self.cycle_minutes * 60:
                     self.busy = True
                     self.push_status(True)
@@ -413,7 +431,7 @@ class Engine:
         return res["amount_eur"], "ok"
 
     # ---------- orders ----------
-    def execute_buy(self, market, eur, reason):
+    def execute_buy(self, market, eur, reason, bron="regels"):
         px = self.price(market)
         fee_rate = self.rules["fee_pct"] / 100
         if self.live:
@@ -433,10 +451,11 @@ class Engine:
             amount = (eur - fee) / px
             spent, fill_px = eur, px
         with self.db() as con:
-            con.execute("INSERT INTO positions VALUES(?,?,?,?,?)", (market, amount, fill_px, spent, now()))
-            con.execute("INSERT INTO trades(ts,market,side,amount,price,eur,fee,pnl,live,reason) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                        (now(), market, "buy", amount, fill_px, spent, fee, 0, int(self.live), reason))
+            con.execute("INSERT INTO positions(market,amount,entry_price,cost_eur,opened,bron) VALUES(?,?,?,?,?,?)",
+                        (market, amount, fill_px, spent, now(), bron))
+            con.execute("INSERT INTO trades(ts,market,side,amount,price,eur,fee,pnl,live,reason,bron) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        (now(), market, "buy", amount, fill_px, spent, fee, 0, int(self.live), reason, bron))
         self.push_trade(market, "buy", spent, fill_px, 0, reason)
         self.log(f"  {'LIVE' if self.live else 'DROOG'} KOOP {market}: €{spent:.2f} @ {fmt_px(fill_px)}", "good")
 
@@ -472,9 +491,10 @@ class Engine:
         pnl = net - pos["cost_eur"]
         with self.db() as con:
             con.execute("DELETE FROM positions WHERE market=?", (market,))
-            con.execute("INSERT INTO trades(ts,market,side,amount,price,eur,fee,pnl,live,reason) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                        (now(), market, "sell", amount, fill_px, net, fee, pnl, int(self.live), reason))
+            con.execute("INSERT INTO trades(ts,market,side,amount,price,eur,fee,pnl,live,reason,bron) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        (now(), market, "sell", amount, fill_px, net, fee, pnl, int(self.live), reason,
+                         pos.get("bron") or "regels"))
         self.push_trade(market, "sell", net, fill_px, pnl, reason)
         self.log(f"  {'LIVE' if self.live else 'DROOG'} VERKOOP {market}: €{net:.2f} (resultaat {pnl:+.2f})",
                  "good" if pnl >= 0 else "bad")
@@ -497,15 +517,16 @@ class Engine:
         with self.db() as con:
             return {r["market"]: dict(r) for r in con.execute("SELECT * FROM short_positions")}
 
-    def open_short(self, market, eur, reason):
+    def open_short(self, market, eur, reason, bron="regels"):
         """Gesimuleerde short: je 'leent' de munt en verkoopt hem tegen de huidige koers."""
         px = self.price(market)
         fee = eur * self.rules["fee_pct"] / 100
         amount = eur / px
         with self.db() as con:
-            con.execute("INSERT INTO short_positions VALUES(?,?,?,?,?)", (market, amount, px, eur, now()))
-            con.execute("INSERT INTO short_trades(ts,market,side,amount,price,eur,fee,pnl,reason) "
-                        "VALUES(?,?,?,?,?,?,?,?,?)", (now(), market, "short", amount, px, eur, fee, 0, reason))
+            con.execute("INSERT INTO short_positions(market,amount,entry_price,cost_eur,opened,bron) "
+                        "VALUES(?,?,?,?,?,?)", (market, amount, px, eur, now(), bron))
+            con.execute("INSERT INTO short_trades(ts,market,side,amount,price,eur,fee,pnl,reason,bron) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?)", (now(), market, "short", amount, px, eur, fee, 0, reason, bron))
         self.push_trade(market, "short", eur, px, 0, reason, sim=True)
         self.log(f"  SIM SHORT {market}: €{eur:.2f} @ {fmt_px(px)}", "good")
 
@@ -526,9 +547,10 @@ class Engine:
         pnl, fees, borrow = self.short_pnl(pos, px)
         with self.db() as con:
             con.execute("DELETE FROM short_positions WHERE market=?", (market,))
-            con.execute("INSERT INTO short_trades(ts,market,side,amount,price,eur,fee,pnl,reason) "
-                        "VALUES(?,?,?,?,?,?,?,?,?)",
-                        (now(), market, "cover", pos["amount"], px, pos["amount"] * px, fees + borrow, pnl, reason))
+            con.execute("INSERT INTO short_trades(ts,market,side,amount,price,eur,fee,pnl,reason,bron) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        (now(), market, "cover", pos["amount"], px, pos["amount"] * px, fees + borrow, pnl, reason,
+                         pos.get("bron") or "regels"))
         self.push_trade(market, "cover", pos["amount"] * px, px, pnl, reason, sim=True)
         self.log(f"  SIM SHORT SLUITEN {market} @ {fmt_px(px)} (resultaat {pnl:+.2f}, waarvan leenkosten "
                  f"{borrow:.2f})", "good" if pnl >= 0 else "bad")
@@ -540,7 +562,7 @@ class Engine:
             return con.execute("SELECT COALESCE(SUM(usd),0) FROM api_usage WHERE ts LIKE ?",
                                (month + "%",)).fetchone()[0]
 
-    def run_cycle(self):
+    def cap_reached(self):
         cap = float(self.cfg.get("max_api_usd_month", 5) or 0)
         if cap > 0:
             spent = self.api_cost_this_month()
@@ -549,8 +571,14 @@ class Engine:
                     self.log(f"Maandlimiet API-kosten bereikt (${spent:.2f} van ${cap:.2f}). Geen nieuwe analyses "
                              "tot volgende maand; stop-loss en koersdoel worden wel bewaakt.", "bad")
                     self._cap_warned = True
-                return
+                return True
         self._cap_warned = False
+        return False
+
+    def run_cycle(self):
+        """Grote ronde (elke cycle_minutes): nieuws, sentiment en charts per munt, daarna een beslissing."""
+        if self.cap_reached():
+            return
         self.log(f"=== Cyclus {datetime.now():%d-%m %H:%M} ({'LIVE' if self.live else 'droog'}) ===", "head")
         self.cycle_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
         news = self.headlines()
@@ -564,70 +592,152 @@ class Engine:
             except Exception as e:
                 self.log(f"{market}: data-fout {e}", "bad")
                 continue
-            pos = self.get_positions().get(market)
-            spos = self.get_short_positions().get(market) if self.shorts else None
             charts = self.ask("charts", ind)
             news_r = self.ask("news", {"market": market, "headlines": news})
-            reports = {"charts": charts, "news": news_r, "sentiment": sentiment}
-            setup = setup_for(ind, charts, news_r)
-            if not self.shorts:
-                setup["short"] = False
-            setup_brief = {"long": setup["long"], "short": setup["short"]}
-            skeptic = self.ask("skeptic", {"market": market, "indicatoren": ind, "rapporten": reports,
-                                           "setup": setup_brief, "positie": pos})
-            chief_in = {"market": market, "indicatoren": ind, "rapporten": reports,
-                        "skeptic": skeptic, "setup": setup_brief, "positie": pos}
-            if self.shorts:
-                chief_in["short_positie"] = spos
-            else:
-                chief_in["let_op"] = "short en cover zijn uitgeschakeld"
-            decision = self.ask("chief", chief_in)
-            for name, out in [("charts", charts), ("news", news_r), ("skeptic", skeptic), ("chief", decision)]:
+            self.reports[market] = {"charts": charts, "news": news_r, "sentiment": sentiment, "t": time.time()}
+            for name, out in [("charts", charts), ("news", news_r)]:
                 self.log_agent(market, name, out)
-                if "fout" in out and name != "chief":
+                if "fout" in out:
                     self.log(f"{market}: {name}-agent gaf geen antwoord ({out['fout'][:120]})", "bad")
-            self.last_verdict = None
-            self.last_setup = {"long": setup["long"], "short": setup["short"], "tekst": setup_text(setup),
-                               "long_checks": setup["long_checks"], "short_checks": setup["short_checks"]}
-            executed = False
-            if "fout" in decision:
-                self.log(f"{market}: Chief gaf geen antwoord ({decision['fout'][:120]})", "bad")
-                self.push_decision(market, ind, charts, news_r, sentiment, skeptic, decision, executed)
+            self.decide(market, ind, "cyclus")
+
+    def fast_check(self):
+        """Snelle ronde (elke 5 minuten, zonder AI): volgers en regels bekijken.
+        Alleen als er voor een munt een NIEUWE setup ontstaat, worden Skeptic en Chief gevraagd."""
+        if self.followers:
+            try:
+                events = self.followers.update([coin_of(m) for m in self.markets])
+                for ev in events:
+                    self.log(f"Volger {short_addr(ev['address'])} {EV_WORD.get(ev['event'], ev['event'])} {ev['side'].upper()} {ev['coin']} "
+                             f"(${ev['notional']:,})".replace(",", "."), "info")
+            except Exception as e:
+                if not getattr(self, "_fw_warned", False):
+                    self.log(f"Volgers: posities niet op te halen ({e})", "bad")
+                    self._fw_warned = True
+            else:
+                self._fw_warned = False
+        if not self.fast or not self.reports:
+            return
+        cooldown = float(self.cfg.get("fast_cooldown_min", 30)) * 60
+        for market in self.markets:
+            rep = self.reports.get(market)
+            if not rep or self._stop.is_set():
                 continue
-            action = decision.get("action", "hold")
-            self.log(f"{market}: {setup_text(setup)}; Skeptic: {skeptic.get('risico', '?')}", "muted")
-            self.log(f"{market}: Chief = {action} (zekerheid {decision.get('confidence')}) - {decision.get('reason')}")
-            if action in ("buy", "short"):
-                ok_setup = setup["long"] if action == "buy" else setup["short"]
-                if not ok_setup:
-                    self.log(f"  geen {'koop' if action == 'buy' else 'short'}-setup volgens de regels: houden", "muted")
-                    action = "hold"
-                elif str(skeptic.get("risico", "")).lower() == "hoog":
-                    self.log("  Skeptic ziet hoog risico: houden", "muted")
-                    action = "hold"
-            if action == "buy" and not pos:
-                amount, why = self.risk_check_buy(market, float(decision.get("amount_eur", 0) or 0),
-                                                  float(decision.get("confidence", 0) or 0))
-                if amount:
-                    self.execute_buy(market, amount, decision.get("reason", ""))
-                    executed = True
-                else:
-                    self.log(f"  risicopoort blokkeert: {why}", "muted")
-            elif action == "sell" and pos:
-                self.execute_sell(market, decision.get("reason", ""))
-                executed = True
-            elif action == "short" and self.shorts and not spos:
-                amount, why = self.risk_check_buy(market, float(decision.get("amount_eur", 0) or 0),
-                                                  float(decision.get("confidence", 0) or 0), book="short")
-                if amount:
-                    self.open_short(market, amount, decision.get("reason", ""))
-                    executed = True
-                else:
-                    self.log(f"  risicopoort blokkeert short: {why}", "muted")
-            elif action == "cover" and spos:
-                self.close_short(market, decision.get("reason", ""))
-                executed = True
+            try:
+                ind = self.indicators(market)
+            except Exception:
+                continue
+            setup = self.combined_setup(market, ind, rep["charts"], rep["news"])
+            state = ("long" if setup["long"] else "") + ("short" if setup["short"] else "")
+            prev = self.last_state.get(market, "")
+            self.last_state[market] = state
+            if not state or state == prev:
+                continue
+            if time.time() - self.last_decision.get(market, 0) < cooldown:
+                continue
+            if self.cap_reached():
+                return
+            self.log(f"{market}: nieuwe setup tussendoor ({setup_text(setup)}): Skeptic en Chief gevraagd", "head")
+            self.cycle_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+            self.decide(market, ind, "snelle check")
+
+    def combined_setup(self, market, ind, charts, news_r):
+        """Setup volgens de regels én volgens de volgers. Geeft ook aan welke bron het signaal gaf."""
+        setup = setup_for(ind, charts, news_r)
+        setup["bron_long"] = "regels" if setup["long"] else ""
+        setup["bron_short"] = "regels" if setup["short"] else ""
+        setup["volgers"] = None
+        if self.followers:
+            cons = self.followers.consensus(coin_of(market))
+            fs = follower_setup(cons, ind, charts, self.fcfg)
+            setup["volgers"] = cons
+            setup["volger_checks"] = {"long": fs["long_checks"], "short": fs["short_checks"]}
+            if self.fcfg.get("use_as_setup", True):
+                for side in ("long", "short"):
+                    if fs[side]:
+                        setup["bron_" + side] = "beide" if setup[side] else "volgers"
+                        setup[side] = True
+        if not self.shorts:
+            setup["short"] = False
+        return setup
+
+    def decide(self, market, ind, trigger):
+        """Skeptic en Chief vragen en de keuze uitvoeren (via de risicopoort)."""
+        rep = self.reports.get(market) or {}
+        charts, news_r, sentiment = rep.get("charts", {}), rep.get("news", {}), rep.get("sentiment", {})
+        pos = self.get_positions().get(market)
+        spos = self.get_short_positions().get(market) if self.shorts else None
+        reports = {"charts": charts, "news": news_r, "sentiment": sentiment}
+        setup = self.combined_setup(market, ind, charts, news_r)
+        setup_brief = {"long": setup["long"], "short": setup["short"]}
+        volgers = None
+        if setup.get("volgers"):
+            c = setup["volgers"]
+            volgers = {"long": c["long"], "short": c["short"], "consensus": c["score"],
+                       "van_de": c["volgers"], "recent": c["recent"][:3]}
+        skeptic = self.ask("skeptic", {"market": market, "indicatoren": ind, "rapporten": reports,
+                                       "volgers": volgers, "setup": setup_brief, "positie": pos})
+        chief_in = {"market": market, "indicatoren": ind, "rapporten": reports, "volgers": volgers,
+                    "skeptic": skeptic, "setup": setup_brief, "positie": pos}
+        if self.shorts:
+            chief_in["short_positie"] = spos
+        else:
+            chief_in["let_op"] = "short en cover zijn uitgeschakeld"
+        decision = self.ask("chief", chief_in)
+        self.last_decision[market] = time.time()
+        for name, out in [("skeptic", skeptic), ("chief", decision)]:
+            self.log_agent(market, name, out)
+        if "fout" in skeptic:
+            self.log(f"{market}: skeptic-agent gaf geen antwoord ({skeptic['fout'][:120]})", "bad")
+        self.last_verdict = None
+        self.last_setup = {"long": setup["long"], "short": setup["short"], "tekst": setup_text(setup),
+                           "long_checks": setup["long_checks"], "short_checks": setup["short_checks"],
+                           "bron_long": setup["bron_long"], "bron_short": setup["bron_short"],
+                           "volgers": setup.get("volgers"), "volger_checks": setup.get("volger_checks"),
+                           "trigger": trigger}
+        executed = False
+        if "fout" in decision:
+            self.log(f"{market}: Chief gaf geen antwoord ({decision['fout'][:120]})", "bad")
             self.push_decision(market, ind, charts, news_r, sentiment, skeptic, decision, executed)
+            return
+        action = decision.get("action", "hold")
+        vtxt = ""
+        if setup.get("volgers"):
+            c = setup["volgers"]
+            vtxt = f"; volgers {c['long']} long / {c['short']} short"
+        self.log(f"{market}: {setup_text(setup)}{vtxt}; Skeptic: {skeptic.get('risico', '?')}", "muted")
+        self.log(f"{market}: Chief = {action} (zekerheid {decision.get('confidence')}) - {decision.get('reason')}")
+        if action in ("buy", "short"):
+            ok_setup = setup["long"] if action == "buy" else setup["short"]
+            if not ok_setup:
+                self.log(f"  geen {'koop' if action == 'buy' else 'short'}-setup: houden", "muted")
+                action = "hold"
+            elif str(skeptic.get("risico", "")).lower() == "hoog":
+                self.log("  Skeptic ziet hoog risico: houden", "muted")
+                action = "hold"
+        if action == "buy" and not pos:
+            amount, why = self.risk_check_buy(market, float(decision.get("amount_eur", 0) or 0),
+                                              float(decision.get("confidence", 0) or 0))
+            if amount:
+                self.execute_buy(market, amount, decision.get("reason", ""), bron=setup["bron_long"])
+                executed = True
+            else:
+                self.log(f"  risicopoort blokkeert: {why}", "muted")
+        elif action == "sell" and pos:
+            self.execute_sell(market, decision.get("reason", ""))
+            executed = True
+        elif action == "short" and self.shorts and not spos:
+            amount, why = self.risk_check_buy(market, float(decision.get("amount_eur", 0) or 0),
+                                              float(decision.get("confidence", 0) or 0), book="short")
+            if amount:
+                self.open_short(market, amount, decision.get("reason", ""), bron=setup["bron_short"])
+                executed = True
+            else:
+                self.log(f"  risicopoort blokkeert short: {why}", "muted")
+        elif action == "cover" and spos:
+            self.close_short(market, decision.get("reason", ""))
+            executed = True
+        self.push_decision(market, ind, charts, news_r, sentiment, skeptic, decision, executed)
 
     # ---------- op afstand meekijken ----------
     def push_trade(self, market, side, eur_amount, price, pnl, reason, sim=False):
@@ -673,6 +783,8 @@ class Engine:
                                         "entry": r["entry_price"], "stop": plan["stop_price"],
                                         "target": plan["target_price"], "opened": r["opened"]})
             stats = {"long": risk_gate.book_stats(con, "long"), "short": risk_gate.book_stats(con, "short")}
+            stats_bron = {bk: {br: risk_gate.book_stats(con, bk, br) for br in ("regels", "volgers", "beide")}
+                          for bk in ("long", "short")}
         stats["long"]["open_pnl"], stats["short"]["open_pnl"] = self.open_pnl()
         nxt = None
         if running and self.next_cycle:
@@ -682,7 +794,25 @@ class Engine:
                 "btc_hold_eur": b["btc_hold_eur"] if b else None, "today_pnl": round(pnl, 2),
                 "buys_today": buys, "sells_today": sells, "daily_limit": self.rules["daily_loss_limit_eur"],
                 "api_usd_30d": round(usd, 4), "api_calls_30d": calls, "markets": self.markets,
-                "positions": positions, "short_positions": short_positions, "stats": stats}
+                "positions": positions, "short_positions": short_positions, "stats": stats,
+                "stats_bron": stats_bron, "followers": self.follower_snapshot()}
+
+    def follower_snapshot(self):
+        if not self.followers:
+            return None
+        try:
+            traders = [{"address": t["address"], "kort": short_addr(t["address"]), "naam": t["name"],
+                        "account": round(t["account_value"] or 0), "maand_pnl": round(t["month_pnl"] or 0),
+                        "maand_roi": round((t["month_roi"] or 0) * 100, 1), "bron": t["source"]}
+                       for t in self.followers.traders()]
+            cons = {coin_of(m): self.followers.consensus(coin_of(m)) for m in self.markets}
+            with self.db() as con:
+                evs = [{"ts": r[0], "trader": short_addr(r[1]), "coin": r[2], "event": r[3], "side": r[4],
+                        "usd": round(r[5] or 0)} for r in con.execute(
+                    "SELECT ts,address,coin,event,side,notional FROM follower_events ORDER BY id DESC LIMIT 20")]
+            return {"traders": traders, "consensus": cons, "events": evs}
+        except Exception:
+            return None
 
     def open_pnl(self):
         """Open resultaat (long, short) tegen de huidige koersen."""

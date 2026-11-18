@@ -10,7 +10,7 @@ from PySide6.QtGui import QIcon, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QFrame, QGridLayout, QGroupBox,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton, QScrollArea,
-    QSpinBox, QStackedWidget, QTableWidget, QTableWidgetItem, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
+    QPlainTextEdit, QSpinBox, QStackedWidget, QTableWidget, QTableWidgetItem, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 
 import risk_gate
@@ -50,7 +50,7 @@ QPushButton#danger {{ background: transparent; border: 1px solid {C['bad']}; col
 QTextEdit {{ background: {C['card']}; border: 1px solid {C['line']}; border-radius: 12px; padding: 8px; font-size: 13px; }}
 QGroupBox {{ background: {C['card']}; border: 1px solid {C['line']}; border-radius: 12px; margin-top: 22px; padding: 16px 14px 12px 14px; font-weight: 600; }}
 QGroupBox::title {{ subcontrol-origin: margin; left: 4px; top: 0px; color: {C['accent2']}; font-size: 13px; }}
-QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {{ background: {C['bg']}; border: 1px solid {C['line']}; border-radius: 6px; padding: 5px 8px; min-height: 20px; }}
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QPlainTextEdit {{ background: {C['bg']}; border: 1px solid {C['line']}; border-radius: 6px; padding: 5px 8px; min-height: 20px; }}
 QComboBox QAbstractItemView {{ background: {C['card2']}; selection-background-color: {C['accent']}; selection-color: #000; }}
 QCheckBox {{ spacing: 8px; }}
 QScrollArea {{ border: none; background: transparent; }}
@@ -302,7 +302,9 @@ class OverviewPage(QWidget):
             for i, (key, label) in enumerate([("trades", "Gesloten trades"), ("wl", "Winst / verlies"),
                                               ("winrate", "Winrate"), ("avg_win", "Gem. winst"),
                                               ("avg_loss", "Gem. verlies"), ("best", "Beste trade"),
-                                              ("worst", "Slechtste trade"), ("open", "Open posities")]):
+                                              ("worst", "Slechtste trade"), ("open", "Open posities"),
+                                              ("b_regels", "Via de regels"), ("b_volgers", "Via de volgers"),
+                                              ("b_beide", "Regels én volgers")]):
                 grid.addWidget(lab(label, "sub"), i, 0)
                 vl = lab("–")
                 vl.setAlignment(Qt.AlignRight)
@@ -351,6 +353,8 @@ class OverviewPage(QWidget):
         try:
             con = sqlite3.connect(settings.db_path())
             stats = {b: risk_gate.book_stats(con, b) for b in ("long", "short")}
+            for b in ("long", "short"):
+                stats[b]["per_bron"] = {br: risk_gate.book_stats(con, b, br) for br in ("regels", "volgers", "beide")}
             con.close()
         except Exception:
             stats = {}
@@ -369,6 +373,10 @@ class OverviewPage(QWidget):
             vals["best"].setText(opt(st["best"]))
             vals["worst"].setText(opt(st["worst"]))
             vals["open"].setText(str(st["open_positions"]))
+            for br in ("regels", "volgers", "beide"):
+                sb = st["per_bron"][br]
+                wr = f", {sb['winrate'] * 100:.0f}% raak" if sb["winrate"] is not None else ""
+                vals["b_" + br].setText(f"{eur(sb['total_pnl'], True)} ({sb['trades']} trades{wr})")
 
         rows = [[a, c, f"{i:.0f}", f"{o:.0f}", f"{u:.4f}"] for a, c, i, o, u in query(
             "SELECT agent, COUNT(*), AVG(input_tokens), AVG(output_tokens), SUM(usd) FROM api_usage "
@@ -388,6 +396,103 @@ class OverviewPage(QWidget):
 
 
 # ======================================================================
+class FollowersPage(QWidget):
+    def __init__(self, win):
+        super().__init__()
+        self.win = win
+        v = QVBoxLayout(self)
+        v.setContentsMargins(28, 24, 28, 24)
+        v.setSpacing(10)
+        top = QHBoxLayout()
+        top.addWidget(lab("Volgers", "h1"))
+        top.addStretch(1)
+        self.btn = QPushButton("Traders opnieuw kiezen")
+        self.btn.clicked.connect(self.repick)
+        top.addWidget(self.btn)
+        v.addLayout(top)
+        v.addWidget(lab("Winstgevende traders op Hyperliquid (openbare gegevens). Elke 5 minuten bekijkt de bot hun "
+                        "posities. Staan genoeg van hen dezelfde kant op, dan is dat een volger-setup. "
+                        "Alleen kijken: er wordt niets automatisch gekopieerd.", "hint", wrap=True))
+        self.note = lab("", "banner", wrap=True)
+        self.note.hide()
+        v.addWidget(self.note)
+        v.addWidget(lab("PER MUNT", "cap"))
+        self.cons = table(["Munt", "Long", "Short", "Consensus", "Long $", "Short $", "Gem. hefboom", "Laatste actie"])
+        self.cons.setMaximumHeight(230)
+        v.addWidget(self.cons)
+        h = QHBoxLayout()
+        left = QVBoxLayout()
+        left.addWidget(lab("GEVOLGDE TRADERS", "cap"))
+        self.traders = table(["Trader", "Naam", "Account $", "Winst maand $", "ROI maand", "Bron"])
+        left.addWidget(self.traders)
+        right = QVBoxLayout()
+        right.addWidget(lab("RECENTE ACTIES", "cap"))
+        self.events = table(["Tijd", "Trader", "Munt", "Actie", "Grootte $"])
+        right.addWidget(self.events)
+        h.addLayout(left, 3)
+        h.addLayout(right, 2)
+        v.addLayout(h, 1)
+
+    def repick(self):
+        import threading
+        from followers import Followers
+        self.btn.setEnabled(False)
+        self.note.setText("Bezig met kiezen…")
+        self.note.show()
+        fcfg = dict(self.win.cfg.get("followers") or {})
+
+        def work():
+            try:
+                f = Followers(settings.db_path(), settings.data_dir(), fcfg, self.win.log)
+                if os.path.exists(f.cache):
+                    os.remove(f.cache)
+                f.choose(force=True)
+                self.win.log("Volgers opnieuw gekozen. Hun posities worden bij de volgende ronde opgehaald.", "info")
+            except Exception as e:
+                self.win.log(f"Volgers kiezen mislukt: {e}", "bad")
+            self._done = True
+        self._done = False
+        threading.Thread(target=work, daemon=True).start()
+
+        def check():
+            if self._done:
+                self.btn.setEnabled(True)
+                self.note.hide()
+                self.refresh()
+            else:
+                QTimer.singleShot(500, check)
+        QTimer.singleShot(500, check)
+
+    def refresh(self):
+        def usd(x):
+            return f"{x:,.0f}".replace(",", ".")
+        markets = [m.split("-")[0] for m in self.win.cfg.get("markets", [])]
+        rows = []
+        for coin in markets:
+            r = query("SELECT side, COUNT(*), COALESCE(SUM(notional),0), AVG(leverage) FROM follower_positions "
+                      "WHERE coin=? AND notional >= 1000 GROUP BY side", (coin,))
+            d = {side: (n, tot, lev) for side, n, tot, lev in r}
+            nl, tl, ll = d.get("long", (0, 0, None))
+            ns, ts_, ls = d.get("short", (0, 0, None))
+            score = (nl - ns) / (nl + ns) if (nl + ns) else 0
+            levs = [x for x in (ll, ls) if x]
+            last = query("SELECT ts, event, side FROM follower_events WHERE coin=? ORDER BY id DESC LIMIT 1", (coin,))
+            last_txt = f"{local_time(last[0][0])} {last[0][1]} {last[0][2]}" if last else ""
+            rows.append([coin, nl, ns, f"{score:+.2f}", usd(tl), usd(ts_),
+                         f"{sum(levs) / len(levs):.1f}x" if levs else "", last_txt])
+        fill(self.cons, rows)
+        rows = [[(a[:6] + "…" + a[-4:]) if a else "", n, usd(acc or 0), usd(mp or 0), f"{(mr or 0) * 100:.1f}%",
+                 "eigen" if src == "eigen" else "leaderboard"]
+                for a, n, acc, mp, mr, src in query(
+            "SELECT address, name, account_value, month_pnl, month_roi, source FROM follower_traders "
+            "ORDER BY month_roi DESC")]
+        fill(self.traders, rows)
+        rows = [[local_time(ts), (a[:6] + "…" + a[-4:]) if a else "", c, f"{e} {sd}", usd(nt or 0)]
+                for ts, a, c, e, sd, nt in query(
+            "SELECT ts, address, coin, event, side, notional FROM follower_events ORDER BY id DESC LIMIT 100")]
+        fill(self.events, rows)
+
+
 class SettingsPage(QWidget):
     def __init__(self, win):
         super().__init__()
@@ -531,6 +636,40 @@ class SettingsPage(QWidget):
             self.stop_form.addRow("Overige munten" if m == "default" else m, s)
         v.addWidget(g)
 
+        g = QGroupBox("Volgers (Hyperliquid)")
+        f = QFormLayout(g)
+        self.fw_on = QCheckBox("Posities van winstgevende traders volgen (gratis, geen AI)")
+        f.addRow("", self.fw_on)
+        self.fw_setup = QCheckBox("Volgers mogen zelf een setup geven (naast de vijf regels)")
+        f.addRow("", self.fw_setup)
+        self.fw_auto = QCheckBox("Automatisch kiezen van het leaderboard")
+        f.addRow("", self.fw_auto)
+        self.fw_count = QSpinBox()
+        self.fw_count.setRange(3, 30)
+        f.addRow("Aantal traders", self.fw_count)
+        self.fw_min = QSpinBox()
+        self.fw_min.setRange(1, 20)
+        f.addRow("Minstens zoveel dezelfde kant op", self.fw_min)
+        self.fw_cons = QDoubleSpinBox()
+        self.fw_cons.setRange(0.2, 1.0)
+        self.fw_cons.setSingleStep(0.1)
+        self.fw_cons.setDecimals(1)
+        f.addRow("Minimale eensgezindheid", self.fw_cons)
+        self.fw_manual = QPlainTextEdit()
+        self.fw_manual.setPlaceholderText("Eigen adressen, één per regel (0x…)")
+        self.fw_manual.setFixedHeight(70)
+        f.addRow("Eigen traders", self.fw_manual)
+        f.addRow("", lab("Eensgezindheid 0,6 betekent: van de gevolgde traders met een positie in die munt staat "
+                         "een duidelijke meerderheid dezelfde kant op (bijvoorbeeld 4 long, 1 short).",
+                         "hint", wrap=True))
+        self.fast_on = QCheckBox("Elke 5 minuten checken; AI alleen bij een nieuwe setup")
+        f.addRow("Snelle check", self.fast_on)
+        self.fast_cd = QSpinBox()
+        self.fast_cd.setRange(5, 240)
+        self.fast_cd.setSuffix(" minuten")
+        f.addRow("Per munt hooguit eens per", self.fast_cd)
+        v.addWidget(g)
+
         g = QGroupBox("Op afstand meekijken")
         f = QFormLayout(g)
         self.rm_on = QCheckBox("Stand, keuzes en logboek naar het online dashboard sturen")
@@ -623,6 +762,16 @@ class SettingsPage(QWidget):
         self.cycle.setValue(int(cfg.get("cycle_minutes", 120)))
         rc = cfg.get("remote") or {}
         self.rm_on.setChecked(bool(rc.get("enabled")))
+        fc = cfg.get("followers") or {}
+        self.fw_on.setChecked(bool(fc.get("enabled", True)))
+        self.fw_setup.setChecked(bool(fc.get("use_as_setup", True)))
+        self.fw_auto.setChecked(bool(fc.get("auto", True)))
+        self.fw_count.setValue(int(fc.get("count", 10)))
+        self.fw_min.setValue(int(fc.get("min_traders", 3)))
+        self.fw_cons.setValue(float(fc.get("min_consensus", 0.6)))
+        self.fw_manual.setPlainText("\n".join(fc.get("manual", [])))
+        self.fast_on.setChecked(bool(cfg.get("fast_check", True)))
+        self.fast_cd.setValue(int(cfg.get("fast_cooldown_min", 30)))
         self.rm_url.setText(rc.get("url", ""))
         self.rm_token.setText(rc.get("token", ""))
         self.model.setCurrentText(cfg.get("model") or settings.MODELS[0])
@@ -658,6 +807,13 @@ class SettingsPage(QWidget):
         cfg["shorts_sim"] = self.shorts_on.isChecked()
         cfg["max_api_usd_month"] = round(self.api_cap.value(), 2)
         cfg["rules"] = self.collect_rules()
+        cfg["followers"] = {"enabled": self.fw_on.isChecked(), "use_as_setup": self.fw_setup.isChecked(),
+                            "auto": self.fw_auto.isChecked(), "count": self.fw_count.value(),
+                            "min_traders": self.fw_min.value(), "min_consensus": round(self.fw_cons.value(), 1),
+                            "manual": [x.strip() for x in self.fw_manual.toPlainText().splitlines()
+                                       if x.strip().startswith("0x")]}
+        cfg["fast_check"] = self.fast_on.isChecked()
+        cfg["fast_cooldown_min"] = self.fast_cd.value()
         cfg["remote"] = {"enabled": self.rm_on.isChecked(), "url": self.rm_url.text().strip(),
                          "token": self.rm_token.text().strip()}
         settings.save(cfg)
@@ -722,7 +878,9 @@ class MainWindow(QMainWindow):
         self.over = OverviewPage(self)
         self.sets = SettingsPage(self)
         self.navs = []
-        for i, (name, page) in enumerate([("Bot", self.bot), ("Overzicht", self.over), ("Instellingen", self.sets)]):
+        self.fol = FollowersPage(self)
+        for i, (name, page) in enumerate([("Bot", self.bot), ("Overzicht", self.over), ("Volgers", self.fol),
+                                          ("Instellingen", self.sets)]):
             page.setObjectName("page")
             self.stack.addWidget(page)
             b = QPushButton(name)
@@ -742,7 +900,7 @@ class MainWindow(QMainWindow):
         self.sets.load(self.cfg)
         self.go(0)
         if not self.cfg["keys"].get("anthropic"):
-            self.go(2)
+            self.go(3)
             self.sets.note.setText("Welkom! Vul eerst je API-keys in en klik op Opslaan. "
                                    "De bot begint altijd met droog draaien (geen echte orders).")
             self.sets.note.show()
@@ -761,6 +919,8 @@ class MainWindow(QMainWindow):
             b.setChecked(i == j)
         if i == 1:
             self.over.refresh()
+        if i == 2:
+            self.fol.refresh()
 
     def log(self, text, kind=""):
         self.msgq.put((text, kind))
@@ -794,6 +954,8 @@ class MainWindow(QMainWindow):
         self.bot.refresh()
         if self.stack.currentIndex() == 1:
             self.over.refresh()
+        if self.stack.currentIndex() == 2:
+            self.fol.refresh()
 
     def toggle(self):
         if self.engine and self.engine.running:
@@ -811,7 +973,7 @@ class MainWindow(QMainWindow):
         if missing:
             QMessageBox.warning(self, "Kan niet starten", "Eerst nog regelen:\n\n• " + "\n• ".join(missing))
             self.engine = None
-            self.go(2)
+            self.go(3)
             return
         self.engine.start()
         self.refresh()
