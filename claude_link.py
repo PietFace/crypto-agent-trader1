@@ -144,9 +144,16 @@ class ClaudeLink:
         if kind == "zoek":
             copier.LAST_DIAG.clear()
             trades = [(c, float(p)) for c, p in job["trades"]]
+            opts = {}
+            if job.get("tol_acct") is not None:
+                opts["tol_acct"] = min(float(job["tol_acct"]), 0.3)
+            if job.get("max_check") is not None:
+                opts["max_check"] = min(int(job["max_check"]), 400)
+            if job.get("vers"):
+                opts["fresh"] = True
             res = copier.find_trader(trades, settings.data_dir(), days=int(job.get("days", 60)),
                                      account=job.get("account"),
-                                     progress=lambda t: self._progress(stem, t))
+                                     progress=lambda t: self._progress(stem, t), acct_opts=opts)
             conf = copier.confidence(res)
             out = []
             for c in res[:6]:

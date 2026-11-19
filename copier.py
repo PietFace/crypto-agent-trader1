@@ -582,7 +582,7 @@ def _ts(v):
         return None
 
 
-def find_trader(trades, cache_dir, days=60, tol_pct=0.05, account=None, progress=lambda t: None):
+def find_trader(trades, cache_dir, days=60, tol_pct=0.05, account=None, progress=lambda t: None, acct_opts=None):
     """Zoek het Hyperliquid-adres dat dezelfde trades deed als op het Invo-profiel. trades: [(munt, prijs), ...].
 
     - Invo toont vaak een GEMIDDELDE uitstapprijs als een order in stukjes is gevuld. Daarom vergelijken we niet
@@ -668,7 +668,8 @@ def find_trader(trades, cache_dir, days=60, tol_pct=0.05, account=None, progress
         # Live Portfolio's handelen vaak buiten Invo om: altijd ook op accountwaarde zoeken. Een kandidaat met een
         # account dat veel kleiner is dan op Invo is vrijwel zeker een kopieerder, niet het origineel.
         try:
-            extra = find_by_account(trades, account, cache_dir, tol_pct=tol_pct, progress=progress)
+            extra = find_by_account(trades, account, cache_dir, tol_pct=tol_pct, progress=progress,
+                                    **(acct_opts or {}))
         except Exception as e:
             LAST_DIAG["fout"] = str(e)
             extra = []
@@ -712,12 +713,15 @@ def fills_since(address, days=60, max_pages=5):
 
 
 def find_by_account(trades, account, cache_dir, tol_acct=0.10, tol_pct=0.05, max_check=40,
-                    progress=lambda t: None):
+                    progress=lambda t: None, fresh=False):
     """Voor 'Live Portfolio's op Invo: die handelen vaak rechtstreeks op Hyperliquid (niet via Invo), dus ze staan
     niet in Invo's builder-bestanden. Wel zien we hun accountwaarde. Zoek in het leaderboard naar accounts met
     (bijna) dezelfde waarde en controleer hun eigen trades op de vingerafdruk."""
     import followers
-    rows = followers.fetch_leaderboard(os.path.join(cache_dir, "leaderboard.json"))
+    lb = os.path.join(cache_dir, "leaderboard.json")
+    if fresh and os.path.exists(lb) and time.time() - os.path.getmtime(lb) > 1800:
+        os.remove(lb)               # verse accountwaarden: die schuiven met winst/verlies en opnames
+    rows = followers.fetch_leaderboard(lb)
     near = [r for r in rows if r.get("address") and r.get("account_value")
             and abs(r["account_value"] - account) / account <= tol_acct]
     near.sort(key=lambda r: abs(r["account_value"] - account))
