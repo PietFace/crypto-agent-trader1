@@ -1334,8 +1334,8 @@ class Engine:
                     "FROM copy_trades ORDER BY id DESC LIMIT 30")]
                 rows = con.execute("SELECT trader_name, pnl_eur, pnl_pct, trader_pct FROM copy_trades").fetchall()
                 tpos = [dict(r) for r in con.execute(
-                    "SELECT name, coin, side, size, entry, leverage, account, ts FROM copy_trader_positions "
-                    "ORDER BY name, coin")]
+                    "SELECT address, name, coin, side, size, entry, leverage, account, ts FROM copy_trader_positions "
+                    "ORDER BY name, address, coin")]
         except Exception:
             return None
         kr = self.copier.kr if self.copier else self.kr

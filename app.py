@@ -929,7 +929,7 @@ class CopyPage(QWidget):
         v.addWidget(lab("Leg dit naast het tabblad 'Open' op hun Invo-profiel. Zelfde munten, kant, hefboom en (bijna) "
                         "dezelfde instapprijs = de bot volgt de juiste persoon. Klopt het niet, haal die trader dan weg "
                         "en zoek hem opnieuw.", "hint", wrap=True))
-        self.tpos = table(["Trader", "Munt", "Kant", "Hefboom", "Instapprijs $", "Positie $", "Account $",
+        self.tpos = table(["Trader", "Adres", "Munt", "Kant", "Hefboom", "Instapprijs $", "Positie $", "Account $",
                            "Bijgewerkt", "Gekopieerd?"])
         self.tpos.setMinimumHeight(160)
         v.addWidget(self.tpos)
@@ -1221,17 +1221,18 @@ class CopyPage(QWidget):
     def _trader_positions(self):
         mine = {r[0]: (r[1], r[2]) for r in query("SELECT coin, side, trader_name FROM copy_positions")}
         rows = []
-        for name, coin, side, size, entry, lev, acct, ts in query(
-                "SELECT name, coin, side, size, entry, leverage, account, ts FROM copy_trader_positions "
-                "ORDER BY name, coin"):
+        for addr, name, coin, side, size, entry, lev, acct, ts in query(
+                "SELECT address, name, coin, side, size, entry, leverage, account, ts FROM copy_trader_positions "
+                "ORDER BY name, address, coin"):
+            short = (addr[:6] + "…" + addr[-4:]) if addr else ""
             if not coin:
-                rows.append([name, "geen open posities", "", "", "", "", f"{acct:,.0f}" if acct else "?",
+                rows.append([name, short, "geen open posities", "", "", "", "", f"{acct:,.0f}" if acct else "?",
                              local_time(ts), ""])
                 continue
             got = mine.get(coin)
             copied = ("ja" if got and got[0] == side and got[1] == name else
                       "andere trader" if got else "nee (stond al open bij start, of overgeslagen)")
-            rows.append([name, coin, side, f"{lev:.0f}x", fmt_px(entry or 0), f"{(size or 0) * (entry or 0):,.0f}",
+            rows.append([name, short, coin, side, f"{lev:.0f}x", fmt_px(entry or 0), f"{(size or 0) * (entry or 0):,.0f}",
                          f"{acct:,.0f}" if acct else "?", local_time(ts), copied])
         fill(self.tpos, rows)
 
