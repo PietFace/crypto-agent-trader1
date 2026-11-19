@@ -11,7 +11,8 @@ Opdrachten:
   {"type": "tape", "coin": "BTC", "van": "2026-11-19T18:30:00+01:00", "tot": "2026-11-19T18:35:00+01:00",
    "richting": "verkoop", "px_min": 63000, "px_max": 63200, "min_bedrag": 1000, "controleer": 10}
   {"type": "tape_status"}
-  {"type": "leiders", "days": 2}   (wie volgen de Invo-kopieerders? zie tape.leaders)
+  {"type": "leiders", "days": 2}
+  {"type": "posmatch", "account": 346920, "positions": [["ZRO", "long"], ["LIT", "long"]], "tol_acct": 0.05}   (wie volgen de Invo-kopieerders? zie tape.leaders)
   {"type": "info", "requests": [{"type": "portfolio", "user": "0x..."}]}   (alleen openbare leesverzoeken)
   {"type": "voorstel", "name": "missed", "address": "0x...", "style": "lang", "reden": "..."}
 """
@@ -205,6 +206,49 @@ class ClaudeLink:
                     out.append({"fout": str(e)})
                 time.sleep(0.5)
             return out
+        if kind == "posmatch":
+            # Live Portfolio met zichtbaar bedrag en open posities: zoek accounts van ongeveer dat bedrag die precies
+            # dezelfde munten aan dezelfde kant open hebben. clearinghouseState is goedkoop, dus honderden kan.
+            import followers
+            account = float(job["account"])
+            tol = min(float(job.get("tol_acct", 0.05)), 0.3)
+            want = {str(c).upper(): str(sd).lower() for c, sd in job["positions"]}
+            rows = followers.fetch_leaderboard(os.path.join(settings.data_dir(), "leaderboard.json"))
+            near = [r for r in rows if r.get("address") and r.get("account_value")
+                    and abs(r["account_value"] - account) / account <= tol]
+            near.sort(key=lambda r: abs(r["account_value"] - account))
+            near = near[:min(int(job.get("max_check", 400)), 1000)]
+            hits, checked = [], 0
+            for i, r in enumerate(near):
+                if i % 10 == 0:
+                    self._progress(stem, f"{i}/{len(near)} accounts gecontroleerd, {len(hits)} treffers")
+                try:
+                    st = copier._post_retry({"type": "clearinghouseState", "user": r["address"]})
+                except Exception:
+                    continue
+                checked += 1
+                pos = {}
+                for ap in st.get("assetPositions") or []:
+                    p_ = ap.get("position") or {}
+                    try:
+                        szi = float(p_.get("szi") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if szi:
+                        pos[str(p_.get("coin")).upper()] = {"side": "long" if szi > 0 else "short",
+                                                             "entry": p_.get("entryPx"),
+                                                             "lev": (p_.get("leverage") or {}).get("value"),
+                                                             "pnl": p_.get("unrealizedPnl")}
+                ok = sum(1 for c, sd in want.items() if c in pos and (sd in ("", "?") or pos[c]["side"] == sd))
+                if ok == len(want):
+                    hits.append({"address": r["address"].lower(), "leaderboard_account": r["account_value"],
+                                 "posities": pos})
+                time.sleep(0.15)
+            try:
+                os.remove(stem + ".voortgang.txt")
+            except Exception:
+                pass
+            return {"in_buurt": len(near), "gecontroleerd": checked, "treffers": hits}
         if kind == "leiders":
             import tape as tp
             return tp.leaders(settings.data_dir(), days=int(job.get("days", 2)),
