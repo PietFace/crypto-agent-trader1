@@ -365,7 +365,8 @@ class CopyEngine:
                    f"positie €{notional:.2f} (inzet €{notional / lev:.2f}, grens: {why}) @ {px:.6g}, noodstop "
                    f"{stop:.6g} (max verlies ~€{risk:.2f})", "good")
         self.e.push_trade(f"{coin}-PERP", "buy" if side == "long" else "short", notional / lev, px, 0,
-                          f"[kopie {t['name']}] {coin} {side} {lev:.0f}x", sim=not self.live())
+                          f"[kopie {t['name']}] {coin} {side} {lev:.0f}x", sim=not self.live(), kind="kopie",
+                          trader=t["name"])
         return True
 
     def close(self, coin, reason, exit_px=None):
@@ -417,7 +418,8 @@ class CopyEngine:
         self.e.log(f"{'LIVE' if pos['echt'] else 'DROOG'} KOPIE DICHT {coin} {pos['side']}: €{pnl:+.2f} "
                    f"({pct:+.1f}% op inzet{extra}) — {reason}", "good" if pnl >= 0 else "bad")
         self.e.push_trade(f"{coin}-PERP", "sell" if pos["side"] == "long" else "cover", pos["amount"] * px / max(1, pos["leverage"]),
-                          px, pnl, f"[kopie {pos['trader_name']}] {reason}", sim=not pos["echt"])
+                          px, pnl, f"[kopie {pos['trader_name']}] {reason}", sim=not pos["echt"], kind="kopie",
+                          trader=pos["trader_name"])
 
     def check_stops(self):
         """Noodstop bewaken bij droog draaien (live zit hij bij Kraken zelf)."""

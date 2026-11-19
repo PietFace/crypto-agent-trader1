@@ -686,7 +686,8 @@ class Engine:
             con.execute("INSERT INTO trades(ts,market,side,amount,price,eur,fee,pnl,live,reason,bron,schaduw) "
                         "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                         (now(), market, "buy", amount, fill_px, spent, fee, 0, int(real), reason, bron, int(shadow)))
-        self.push_trade(market, "buy", spent, fill_px, 0, ("[schaduw] " if shadow else "") + reason)
+        self.push_trade(market, "buy", spent, fill_px, 0, ("[schaduw] " if shadow else "") + reason, sim=not real,
+                        schaduw=shadow)
         self.log(f"  {self.mode_label(shadow)} KOOP {market}: €{spent:.2f} @ {fmt_px(fill_px)}", "good")
 
     def execute_sell(self, market, reason):
@@ -741,7 +742,8 @@ class Engine:
                         "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                         (now(), market, "sell", amount, fill_px, net, fee, pnl, int(real), reason,
                          pos.get("bron") or "regels", int(shadow)))
-        self.push_trade(market, "sell", net, fill_px, pnl, ("[schaduw] " if shadow else "") + reason)
+        self.push_trade(market, "sell", net, fill_px, pnl, ("[schaduw] " if shadow else "") + reason, sim=not real,
+                        schaduw=shadow)
         self.log(f"  {self.mode_label(shadow)} VERKOOP {market}: €{net:.2f} (resultaat {pnl:+.2f})",
                  "good" if pnl >= 0 else "bad")
 
@@ -1155,11 +1157,13 @@ class Engine:
         self.push_decision(market, ind, charts, news_r, sentiment, skeptic, decision, executed)
 
     # ---------- op afstand meekijken ----------
-    def push_trade(self, market, side, eur_amount, price, pnl, reason, sim=False):
+    def push_trade(self, market, side, eur_amount, price, pnl, reason, sim=False, kind="bot", trader=None,
+                   schaduw=False):
         if self.remote:
             self.remote.push("trade", {"ts": now(), "market": market, "side": side, "eur": round(eur_amount, 2),
                                        "price": price, "pnl": round(pnl, 2), "live": self.live and not sim,
-                                       "sim": sim, "reason": reason})
+                                       "sim": sim, "reason": reason, "kind": kind, "trader": trader,
+                                       "schaduw": schaduw})
 
     def push_decision(self, market, ind, charts, news_r, sentiment, skeptic, decision, executed):
         if not self.remote:
@@ -1212,7 +1216,10 @@ class Engine:
                                         "value_now": round(mk["value_eur"], 2) if mk else None,
                                         "pnl_now": round(mk["pnl_eur"], 2) if mk else None,
                                         "pnl_pct": round(mk["pnl_eur"] / r["cost_eur"] * 100, 2) if mk and r["cost_eur"] else None,
-                                        "marked_at": mk.get("ts")})
+                                        "marked_at": mk.get("ts"),
+                                        "bron": (r["bron"] if "bron" in r.keys() else None) or "regels",
+                                        "schaduw": bool(r["schaduw"]) if "schaduw" in r.keys() else False,
+                                        "echt": bool(r["echt"]) if "echt" in r.keys() else False})
             stats = {"long": risk_gate.book_stats(con, "long"), "short": risk_gate.book_stats(con, "short")}
             stats_bron = {bk: {br: risk_gate.book_stats(con, bk, br) for br in ("regels", "volgers", "beide")}
                           for bk in ("long", "short")}
