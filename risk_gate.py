@@ -118,6 +118,34 @@ def day_stats(con, rules, book="long"):
     return realized, buys, open_risk
 
 
+def copy_day(con):
+    """Kopieer-modus vandaag: gerealiseerd resultaat en open risico (tot de noodstop, plus kosten)."""
+    try:
+        realized = con.execute("SELECT COALESCE(SUM(pnl_eur),0) FROM copy_trades WHERE closed LIKE ?",
+                               (_today_utc() + "%",)).fetchone()[0]
+        open_risk = 0.0
+        for cost, entry, stop in con.execute("SELECT cost_eur, entry_price, stop_price FROM copy_positions"):
+            if entry:
+                open_risk += cost * (abs(entry - stop) / entry + 0.001)
+        return realized, open_risk
+    except sqlite3.OperationalError:
+        return 0.0, 0.0
+
+
+def day_risk_all(con, rules):
+    """Eén daglimiet voor alles: (verlies vandaag, open risico) van gewone bot (long + short) en kopiëren samen."""
+    realized = open_risk = 0.0
+    for book in BOOKS:
+        try:
+            r, _b, o = day_stats(con, rules, book)
+            realized += r
+            open_risk += o
+        except sqlite3.OperationalError:
+            pass
+    cr, co = copy_day(con)
+    return max(0.0, -(realized + cr)), open_risk + co
+
+
 def last_stop_loss(con, market, book="long"):
     b = BOOKS[book]
     r = con.execute(
@@ -180,7 +208,8 @@ def check_buy(con, market, wanted_eur, confidence, spread, stop_file="STOP", rul
             pass
     amount, decider = size_buy(rules, market, wanted_eur, invested, realized_total)
     new_risk = amount * risk_per_eur(rules, market)
-    loss_so_far = max(0.0, -realized)
+    # Eén daglimiet voor alles: ook de andere kant (long/short) en de kopieer-modus tellen mee.
+    loss_so_far, open_risk = day_risk_all(con, rules)
     if loss_so_far + open_risk + new_risk > rules["daily_loss_limit_eur"]:
         reasons.append(
             f"dagrisico te hoog: verlies vandaag €{loss_so_far:.2f} + open risico "

@@ -1244,11 +1244,22 @@ class Engine:
                 "stats_bron": stats_bron, "followers": self.follower_snapshot(),
                 # Extra voor de website (modus, beurs, kopiëren, limieten, reset)
                 "mode": self.mode, "exchange": self.exchange, "leverage": self.lev,
+                "total_budget": float(self.cfg["rules"]["budget_eur"]),
+                "copy_budget": settings.budgets(self.cfg)[1],
                 "kraken_account": getattr(self, "kraken_account", None),
                 "copy": self.copy_snapshot(), "reset_at": self.meta_get("reset_at"),
-                "limits": {"bot_today_pnl": round(pnl, 2), "bot_daily_limit": self.rules["daily_loss_limit_eur"],
-                           "copy_today_pnl": round(self.copier.realized_today(), 2) if self.copier else None,
-                           "copy_daily_limit": (self.cfg.get("copy") or {}).get("daily_loss_eur")}}
+                "limits": self.limits_snapshot()}
+
+    def limits_snapshot(self):
+        """Eén daglimiet voor alles: hoeveel is er vandaag al gebruikt?"""
+        try:
+            with self.db() as con:
+                loss, open_risk = risk_gate.day_risk_all(con, self.rules)
+            return {"daily_limit": self.rules["daily_loss_limit_eur"], "loss_today": round(loss, 2),
+                    "open_risk": round(open_risk, 2),
+                    "room": round(max(0.0, self.rules["daily_loss_limit_eur"] - loss - open_risk), 2)}
+        except Exception:
+            return None
 
     def weekly_report(self, force=False):
         """Elke maandag vanaf 8:00 (eigen tijd) een overzicht van de afgelopen 7 dagen: in het logboek (ook op je

@@ -216,8 +216,9 @@ class CopyEngine:
         every = max(2, int(self.cfg.get("interval_s", 5)))
         names = ", ".join(t["name"] for t in self.traders) or "(nog geen traders)"
         self.e.log(f"Kopieer-modus {'LIVE' if self.live() else 'droog'}: elke {every} s kijken naar {names}. "
-                   f"Inzet €{self.cfg.get('eur_per_trade', 10)} per trade, hefboom max "
-                   f"{self.cfg.get('max_leverage', 10)}x. Alleen nieuwe posities worden gekopieerd.", "info")
+                   f"Budget €{self.budget():.0f}, max verlies €{self.e.rules['max_loss_per_trade_eur']} per trade, "
+                   f"hefboom max {self.cfg.get('max_leverage', 10)}x. Alleen nieuwe posities worden gekopieerd.",
+                   "info")
         while not self._stop.is_set():
             try:
                 self.tick()
@@ -271,6 +272,17 @@ class CopyEngine:
             return con.execute("SELECT COALESCE(SUM(pnl_eur),0) FROM copy_trades WHERE closed LIKE ?",
                                (day,)).fetchone()[0]
 
+    def budget(self):
+        import settings
+        return settings.budgets(self.e.cfg)[1]
+
+    def budget_room(self):
+        """Vrij in het kopieer-budget: budget + eventueel verlies tot nu toe − inzet in open kopieën."""
+        with self.e.db() as con:
+            realized = con.execute("SELECT COALESCE(SUM(pnl_eur),0) FROM copy_trades").fetchone()[0]
+            used = con.execute("SELECT COALESCE(SUM(cost_eur / MAX(leverage, 1)),0) FROM copy_positions").fetchone()[0]
+        return self.budget() + min(0.0, realized) - used
+
     def stop_pct(self, style):
         return float(self.cfg.get("stop_pct_lang" if style == "lang" else "stop_pct_kort",
                                   10 if style == "lang" else 3))
@@ -289,19 +301,34 @@ class CopyEngine:
             self.e.log(f"Kopie {t['name']}: {coin} overgeslagen, al {self.cfg.get('max_positions', 5)} kopieën open.",
                        "muted")
             return False
-        limit = float(self.cfg.get("daily_loss_eur", 10))
-        if -self.realized_today() >= limit:
-            self.e.log(f"Kopie {t['name']}: {coin} overgeslagen, daglimiet van €{limit:.2f} verlies bereikt.", "bad")
-            return False
+        rules = self.e.rules
+        limit = float(rules["daily_loss_limit_eur"])
         if self.e.main_holds_real(sym):
             self.e.log(f"Kopie {t['name']}: {coin} overgeslagen, de hoofdbot heeft daar al een echte positie.", "muted")
             return False
         # Zelfde hefboom als de trader, maar nooit boven jouw maximum en nooit boven 10x (EU-grens bij Kraken).
         lev = max(1.0, min(float(self.cfg.get("max_leverage", 10)), float(their.get("leverage") or 1), 10.0))
-        margin = float(self.cfg.get("eur_per_trade", 10))
-        notional = margin * lev
         # Noodstop nooit verder weg dan 80% van de inzet (bij 10x dus hooguit 8% koersbeweging): ruim vóór liquidatie.
         stop_pct = min(self.stop_pct(t["style"]), 80.0 / lev)
+        # Grootte zoals bij de gewone bot: terugrekenen vanuit het max verlies per trade (incl. kosten),
+        # begrensd door 'max per aankoop' x hefboom en door wat er nog vrij is in het kopieer-budget.
+        fee2 = 2 * kraken.TAKER_FEE_PCT / 100
+        by_risk = float(rules["max_loss_per_trade_eur"]) / (stop_pct / 100 + fee2)
+        room = self.budget_room()
+        notional = min(by_risk, float(rules["max_trade_eur"]) * lev, max(0.0, room) * lev)
+        why = ("max verlies per trade" if notional == by_risk else
+               "max per aankoop" if notional == float(rules["max_trade_eur"]) * lev else "kopieer-budget")
+        if notional < 5:
+            self.e.log(f"Kopie {t['name']}: {coin} overgeslagen, kopieer-budget op (nog €{room:.2f} vrij).", "muted")
+            return False
+        with self.e.db() as con:
+            import risk_gate
+            loss, open_risk = risk_gate.day_risk_all(con, rules)
+        new_risk = notional * (stop_pct / 100 + fee2)
+        if loss + open_risk + new_risk > limit:
+            self.e.log(f"Kopie {t['name']}: {coin} overgeslagen, daglimiet: verlies vandaag €{loss:.2f} + open "
+                       f"risico €{open_risk:.2f} + deze €{new_risk:.2f} > €{limit:.2f}", "muted")
+            return False
         px = kr.price(sym)
         ext = None
         if self.live():
@@ -333,10 +360,10 @@ class CopyEngine:
             con.execute("INSERT OR REPLACE INTO copy_positions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (coin, sym, side, amount, px, notional, lev, now(), t["address"], t["name"],
                          float(their.get("entry") or 0), stop, ext, int(self.live())))
-        risk = notional * (stop_pct / 100 + 2 * kraken.TAKER_FEE_PCT / 100)
+        risk = notional * (stop_pct / 100 + fee2)
         self.e.log(f"{'LIVE' if self.live() else 'DROOG'} KOPIE OPEN {coin} {side} {lev:.0f}x van {t['name']}: "
-                   f"positie €{notional:.2f} (inzet €{notional / lev:.2f}) @ {px:.6g}, noodstop {stop:.6g} "
-                   f"(max verlies ~€{risk:.2f})", "good")
+                   f"positie €{notional:.2f} (inzet €{notional / lev:.2f}, grens: {why}) @ {px:.6g}, noodstop "
+                   f"{stop:.6g} (max verlies ~€{risk:.2f})", "good")
         self.e.push_trade(f"{coin}-PERP", "buy" if side == "long" else "short", notional / lev, px, 0,
                           f"[kopie {t['name']}] {coin} {side} {lev:.0f}x", sim=not self.live())
         return True

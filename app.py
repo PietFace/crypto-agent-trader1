@@ -756,14 +756,14 @@ class CopyPage(QWidget):
         f.addRow("Kijken elke", self.every)
         self.rt = QCheckBox("Live-verbinding: Hyperliquid meldt trades direct (binnen ~1 s, max 10 traders)")
         f.addRow("", self.rt)
-        self.stake = QDoubleSpinBox(); self.stake.setRange(2, 500); self.stake.setPrefix("€ ")
-        f.addRow("Inzet per trade", self.stake)
+        self.stake = QDoubleSpinBox(); self.stake.setRange(2, 500); self.stake.setPrefix("€ ")   # oud, niet meer gebruikt
+        self.budget_info = lab("", "sub", wrap=True)
+        f.addRow("Budget en risico", self.budget_info)
         self.maxlev = QSpinBox(); self.maxlev.setRange(1, 10); self.maxlev.setSuffix("x")
         f.addRow("Hefboom max", self.maxlev)
         self.maxpos = QSpinBox(); self.maxpos.setRange(1, 20)
         f.addRow("Max kopieën tegelijk", self.maxpos)
-        self.dayloss = QDoubleSpinBox(); self.dayloss.setRange(1, 1000); self.dayloss.setPrefix("€ ")
-        f.addRow("Daglimiet verlies", self.dayloss)
+        self.dayloss = QDoubleSpinBox(); self.dayloss.setRange(1, 1000); self.dayloss.setPrefix("€ ")  # oud
         self.stop_l = QDoubleSpinBox(); self.stop_l.setRange(0.5, 50); self.stop_l.setSuffix(" %")
         f.addRow("Noodstop lange traders", self.stop_l)
         self.stop_k = QDoubleSpinBox(); self.stop_k.setRange(0.5, 50); self.stop_k.setSuffix(" %")
@@ -882,13 +882,24 @@ class CopyPage(QWidget):
     def _update_hint(self):
         if self._loading:
             return
+        cfg = self.win.cfg
+        r = cfg["rules"]
+        bot_b, copy_b = settings.budgets(cfg)
         lev = self.maxlev.value()
-        pos = self.stake.value() * lev
-        sl = min(self.stop_l.value(), 80 / lev)
-        sk = min(self.stop_k.value(), 80 / lev)
-        self.hint.setText(f"Bij {lev}x: positie €{pos:.0f}. Max verlies per trade ongeveer €{pos * sl / 100:.2f} "
-                          f"(lang) en €{pos * sk / 100:.2f} (kort), plus €{pos * 0.001:.2f} kosten. De noodstop ligt "
-                          f"nooit verder dan 80% van je inzet.")
+        ml = float(r["max_loss_per_trade_eur"])
+        self.budget_info.setText(
+            f"Kopieer-budget €{copy_b:.0f} van totaal €{float(r['budget_eur']):.0f} (in te stellen bij Instellingen). "
+            f"Zelfde regels als de gewone bot: max €{ml:.2f} verlies per trade en één daglimiet van "
+            f"€{float(r['daily_loss_limit_eur']):.2f} voor alles samen.")
+        def size(stop):
+            st = min(stop, 80 / lev)
+            return min(ml / (st / 100 + 0.001), float(r["max_trade_eur"]) * lev), st
+        nl, sl = size(self.stop_l.value())
+        nk, sk = size(self.stop_k.value())
+        self.hint.setText(f"Bij {lev}x: lange trader → positie ~€{nl:.0f} (inzet €{nl / lev:.2f}, noodstop {sl:.1f}%); "
+                          f"korte trader → positie ~€{nk:.0f} (inzet €{nk / lev:.2f}, noodstop {sk:.1f}%). "
+                          "Kleinere stop = grotere positie, maar het verlies bij de stop blijft max "
+                          f"€{ml:.2f}.")
 
     def _confirm_live(self, on):
         if self._loading or not on:
@@ -1062,6 +1073,7 @@ class CopyPage(QWidget):
 
     # --- tabellen
     def refresh(self):
+        self._update_hint()
         rows = []
         for r in query("SELECT opened, coin, side, leverage, cost_eur, entry_price, stop_price, trader_name, echt "
                        "FROM copy_positions ORDER BY opened DESC"):
@@ -1403,7 +1415,10 @@ class SettingsPage(QWidget):
             self.r[key] = s
             f.addRow(label, s)
 
-        money("budget_eur", "Totaalbudget", 10, 100000, 10, 0)
+        money("budget_eur", "Totaalbudget (bot + kopiëren)", 10, 100000, 10, 0)
+        self.share = QSpinBox(); self.share.setRange(0, 100); self.share.setSuffix(" % voor kopiëren")
+        self.share.setToolTip("Bij modus 'Gewone bot + kopiëren'. Alleen bot of alleen kopiëren krijgt het hele budget.")
+        f.addRow("Verdeling", self.share)
         money("max_trade_eur", "Max per aankoop", 5, 10000, 5, 0)
         money("max_loss_per_trade_eur", "Max verlies per trade", 0.1, 1000, 0.25)
         money("daily_loss_limit_eur", "Daglimiet (verlies + open risico)", 1, 10000, 1, 0)
@@ -1632,6 +1647,7 @@ class SettingsPage(QWidget):
         self.model_chief.setCurrentText(cfg.get("model_chief") or "(zelfde als agents)")
         self.shorts_on.setChecked(bool(cfg.get("shorts_sim", True)))
         self.dtrend.setChecked(bool(cfg["rules"].get("daily_trend", False)))
+        self.share.setValue(int(round(float(cfg.get("copy_share", 0.5)) * 100)))
         self.exch.setCurrentIndex(1 if cfg.get("exchange") == "kraken" else 0)
         self.lev.setValue(int((cfg.get("kraken") or {}).get("leverage", 3)))
         lbs = cfg.get("live_bronnen") or ["volgers", "beide"]
@@ -1670,6 +1686,7 @@ class SettingsPage(QWidget):
         mc = self.model_chief.currentText()
         cfg["model_chief"] = "" if mc.startswith("(") else mc
         cfg["shorts_sim"] = self.shorts_on.isChecked()
+        cfg["copy_share"] = self.share.value() / 100
         cfg["max_api_usd_month"] = round(self.api_cap.value(), 2)
         cfg["rules"] = self.collect_rules()
         cfg["followers"] = {"enabled": self.fw_on.isChecked(), "use_as_setup": self.fw_setup.isChecked(),

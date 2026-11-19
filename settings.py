@@ -10,7 +10,9 @@ DEFAULTS = {
     "keys": {"anthropic": "", "bitvavo_key": "", "bitvavo_secret": "", "kraken_key": "", "kraken_secret": ""},
     "live": False,
     "live_bronnen": ["volgers", "beide"],
-    "mode": "beide",  # "beide" (gewone bot + kopiëren), "bot" (alleen gewone bot) of "kopie" (alleen kopiëren)
+    "mode": "beide",
+    # Eén budget voor alles: rules.budget_eur is het TOTAAL; copy_share is het deel voor de kopieer-modus.
+    "copy_share": 0.5,  # "beide" (gewone bot + kopiëren), "bot" (alleen gewone bot) of "kopie" (alleen kopiëren)
     "exchange": "bitvavo",  # "bitvavo" of "kraken" (Kraken-perps, voorlopig alleen droog)
     "kraken": {"leverage": 3},  # max 5
     # Kopieer-modus: gekozen traders 1-op-1 volgen op Kraken. Live alleen als bot live op Kraken staat én "live" aan.
@@ -34,7 +36,7 @@ DEFAULTS = {
     },  # Chief mag shorts kiezen; die worden alleen gesimuleerd
     "remote": {"enabled": False, "url": "https://pietface-trader-live.lovable.app/api/public/bot-ingest", "token": ""},
     "rules": {
-        "budget_eur": 100,
+        "budget_eur": 200,
         "max_trade_eur": 20,
         "min_order_eur": 5,
         "max_positions": 3,
@@ -114,12 +116,26 @@ def _import_env(cfg):
     return False
 
 
-CFG_VERSION = 2
+CFG_VERSION = 3
+
+
+def budgets(cfg):
+    """(budget gewone bot, budget kopiëren) uit het totaal, de verdeling en de modus."""
+    total = float(cfg["rules"]["budget_eur"])
+    share = min(1.0, max(0.0, float(cfg.get("copy_share", 0.5))))
+    mode = cfg.get("mode", "beide")
+    if mode == "bot":
+        return total, 0.0
+    if mode == "kopie":
+        return 0.0, total
+    return total * (1 - share), total * share
 
 
 def effective_rules(cfg):
     """Regels zoals de bot ze gebruikt. Op Kraken: lagere kosten, geen leenkosten voor shorts, hefboom."""
     rules = copy.deepcopy(cfg["rules"])
+    rules["total_budget_eur"] = float(cfg["rules"]["budget_eur"])
+    rules["budget_eur"] = budgets(cfg)[0] or rules["total_budget_eur"]   # deel voor de gewone bot
     if cfg.get("exchange") == "kraken":
         import kraken
         rules["fee_pct"] = kraken.TAKER_FEE_PCT
@@ -139,7 +155,7 @@ def load():
             _merge(cfg, json.load(open(p, encoding="utf-8")))
         except Exception:
             pass
-        if int(cfg.get("cfg_version", 1)) < CFG_VERSION:
+        if int(cfg.get("cfg_version", 1)) < 2:
             # Versie 2: 20 volgers, minstens 4 dezelfde kant op, elke 30 seconden kijken.
             cfg["followers"]["count"] = 20
             cfg["followers"]["min_traders"] = 4
@@ -148,6 +164,11 @@ def load():
             cfg["model"] = "claude-haiku-5-5"
             cfg["model_chief"] = ""
             cfg["cycle_minutes"] = max(120, int(cfg.get("cycle_minutes", 120)))
+        if int(cfg.get("cfg_version", 1)) < 3:
+            # Versie 3: één budget voor gewone bot + kopiëren: €200 totaal, 50/50.
+            cfg["rules"]["budget_eur"] = 200
+            cfg["copy_share"] = 0.5
+        if int(cfg.get("cfg_version", 1)) < CFG_VERSION:
             cfg["cfg_version"] = CFG_VERSION
             save(cfg)
     else:
