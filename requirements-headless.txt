@@ -1,0 +1,6 @@
+anthropic
+python-bitvavo-api
+feedparser
+requests
+lz4
+websocket-client

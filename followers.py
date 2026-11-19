@@ -149,6 +149,65 @@ def pick_traders(rows, n=10, min_account=50_000, max_vol_x=100):
     return ok[:n]
 
 
+# ---------------------------------------------------------------- kwaliteitsscore
+def quality_score(address, timeout=15):
+    """Hoe gelijkmatig wint deze trader? Uit zijn winstverloop van de afgelopen maand (Hyperliquid 'portfolio').
+    score = rendement / (maximale daling + 5%) x (0,5 + aandeel winstdagen), met een korting als hij korter dan
+    twee maanden actief is. Hoger = beter. Geeft (score, info-dict) of (None, {}) als er te weinig data is."""
+    r = _session.post(INFO_URL, json={"type": "portfolio", "user": address}, timeout=timeout)
+    r.raise_for_status()
+    windows = {w: d for w, d in (r.json() or []) if isinstance(d, dict)}
+    month = windows.get("month") or {}
+    pnl = [(int(t), float(v)) for t, v in month.get("pnlHistory") or []]
+    acct = [float(v) for _, v in month.get("accountValueHistory") or []]
+    if len(pnl) < 5 or not acct:
+        return None, {}
+    base = max(1.0, sum(acct) / len(acct))
+    vals = [v for _, v in pnl]
+    total = (vals[-1] - vals[0]) / base
+    peak, dd = vals[0], 0.0
+    for v in vals:
+        peak = max(peak, v)
+        dd = max(dd, (peak - v) / base)
+    steps = [b - a for a, b in zip(vals, vals[1:]) if b != a]
+    pos = sum(1 for x in steps if x > 0) / len(steps) if steps else 0.0
+    score = total / (dd + 0.05) * (0.5 + pos)
+    alltime = (windows.get("allTime") or {}).get("pnlHistory") or []
+    days_active = (int(alltime[-1][0]) - int(alltime[0][0])) / 86_400_000 if len(alltime) > 1 else 0
+    if days_active < 60:
+        score *= 0.7
+    return score, {"rendement": total, "daling": dd, "winst_stappen": pos, "dagen_actief": days_active}
+
+
+def rank_by_quality(rows, cache_path, log=lambda *a: None, max_check=45):
+    """Sorteer kandidaten op kwaliteitsscore (gecachet per dag). Zonder score: achteraan, op maand-ROI."""
+    cache = {}
+    if os.path.exists(cache_path) and time.time() - os.path.getmtime(cache_path) < LEADERBOARD_MAX_AGE:
+        try:
+            cache = json.load(open(cache_path, encoding="utf-8"))
+        except Exception:
+            cache = {}
+    checked = 0
+    for r in rows[:max_check]:
+        a = r["address"].lower()
+        if a not in cache:
+            try:
+                cache[a] = quality_score(a)[0]
+            except Exception:
+                cache[a] = None
+            checked += 1
+            time.sleep(1.1)   # 'portfolio' weegt zwaar bij Hyperliquid: rustig aan, binnen de limiet
+    try:
+        json.dump(cache, open(cache_path, "w", encoding="utf-8"))
+    except Exception:
+        pass
+    for r in rows:
+        r["quality"] = cache.get(r["address"].lower())
+    if checked:
+        log(f"Volgers: kwaliteitsscore berekend voor {checked} kandidaten", "info")
+    return sorted(rows, key=lambda r: (r.get("quality") is None, -(r.get("quality") or 0), -r["month"]["roi"]))
+
+
 # ---------------------------------------------------------------- posities
 def fetch_positions(address, timeout=15):
     r = _session.post(INFO_URL, json={"type": "clearinghouseState", "user": address}, timeout=timeout)
@@ -178,6 +237,7 @@ class Followers:
     def __init__(self, db_path, data_dir, cfg, log=lambda *a: None):
         self.db_path = db_path
         self.cache = os.path.join(data_dir, "leaderboard.json")
+        self.qcache = os.path.join(data_dir, "quality.json")
         self.cfg = cfg
         self.log = log
         self.last_refresh = 0.0
@@ -221,7 +281,9 @@ class Followers:
             room = max(0, n // 2)
             # Invo-traders zijn echte mensen via een app, geen market makers: het volumefilter mag weg,
             # zodat ook actieve (korte) traders meedoen. Winst-eisen blijven.
-            invo_ok = pick_traders(invo_rows, n=room + len(manual), min_account=10_000, max_vol_x=None)
+            invo_ok = pick_traders(invo_rows, n=3 * room + len(manual), min_account=10_000, max_vol_x=None)
+            if self.cfg.get("quality", True):
+                invo_ok = rank_by_quality(invo_ok, self.qcache, self.log)
             self.log(f"Volgers: {len(invo)} Invo-adressen, waarvan {len(invo_rows)} op het leaderboard en "
                      f"{len(invo_ok)} door de winst-filters", "info")
             for r in invo_ok:
@@ -230,7 +292,10 @@ class Followers:
                     chosen.append((r, "invo"))
         taken = {r["address"].lower() for r, _ in chosen}
         if self.cfg.get("auto", True):
-            for r in pick_traders(rows, n=n + len(taken)):
+            pool = pick_traders(rows, n=3 * n + len(taken))
+            if self.cfg.get("quality", True):
+                pool = rank_by_quality(pool, self.qcache, self.log)
+            for r in pool:
                 if r["address"].lower() in taken:
                     continue
                 if r["address"].lower() not in manual and len(chosen) < n:
@@ -306,15 +371,24 @@ class Followers:
         coin = coin.upper()
         with sqlite3.connect(self.db_path) as con:
             rows = con.execute("SELECT p.address, p.side, p.notional, p.leverage, p.since, p.entry, p.upnl, "
-                               "t.name FROM follower_positions p JOIN follower_traders t ON t.address=p.address "
+                               "t.name, t.account_value FROM follower_positions p "
+                               "JOIN follower_traders t ON t.address=p.address "
                                "WHERE p.coin=? AND p.notional >= ?", (coin, min_notional)).fetchall()
             n_traders = con.execute("SELECT COUNT(*) FROM follower_traders").fetchone()[0]
             recent = con.execute("SELECT ts, address, event, side, notional FROM follower_events "
                                  "WHERE coin=? ORDER BY id DESC LIMIT 5", (coin,)).fetchall()
         longs = [r for r in rows if r[1] == "long"]
         shorts = [r for r in rows if r[1] == "short"]
-        # Elke trader telt even zwaar (anders bepaalt één walvis alles); grootte alleen als info.
-        score = (len(longs) - len(shorts)) / max(1, len(longs) + len(shorts)) if rows else 0.0
+        if self.cfg.get("conviction", True):
+            # Gewicht naar overtuiging: wie een groter deel van zijn EIGEN account inzet, telt zwaarder.
+            # 5% van het account = gewicht 1, begrensd tussen 0,5 en 2 (zodat één trader nooit alles bepaalt).
+            def w(r):
+                acct = r[8] or 0
+                return max(0.5, min(2.0, (r[2] / acct) / 0.05)) if acct > 0 else 1.0
+            wl, ws = sum(w(r) for r in longs), sum(w(r) for r in shorts)
+            score = (wl - ws) / (wl + ws) if rows else 0.0
+        else:
+            score = (len(longs) - len(shorts)) / max(1, len(longs) + len(shorts)) if rows else 0.0
         return {
             "coin": coin, "volgers": n_traders, "long": len(longs), "short": len(shorts),
             "score": round(score, 2),

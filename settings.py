@@ -14,7 +14,7 @@ DEFAULTS = {
     "exchange": "bitvavo",  # "bitvavo" of "kraken" (Kraken-perps, voorlopig alleen droog)
     "kraken": {"leverage": 3},  # max 5
     # Kopieer-modus: gekozen traders 1-op-1 volgen op Kraken. Live alleen als bot live op Kraken staat én "live" aan.
-    "copy": {"enabled": False, "live": False, "interval_s": 5, "eur_per_trade": 10, "max_leverage": 10,
+    "copy": {"enabled": False, "live": False, "realtime": True, "interval_s": 5, "eur_per_trade": 10, "max_leverage": 10,
              "max_positions": 5, "daily_loss_eur": 10, "stop_pct_lang": 10, "stop_pct_kort": 3, "traders": []},  # alleen deze signalen met echt geld; de rest als schaduwtrade
     "markets": ["BTC-EUR", "ETH-EUR", "SOL-EUR", "XRP-EUR"],
     "cycle_minutes": 120,
@@ -27,7 +27,8 @@ DEFAULTS = {
     "fast_cooldown_min": 30,
     "reopen_pause_min": 60,  # na zelf sluiten zo lang niet opnieuw dezelfde kant op  # per munt hooguit eens per zoveel minuten Skeptic+Chief tussendoor
     "followers": {
-        "enabled": True, "auto": True, "invo": True, "count": 20, "manual": [],
+        "enabled": True, "auto": True, "invo": True, "quality": True, "conviction": True,
+                  "follow_exit": True, "follow_stop_mult": 2.0, "count": 20, "manual": [],
         "min_traders": 4, "min_consensus": 0.6, "use_as_setup": True,
         "exit_on_flip": True,  # positie sluiten als de volgers duidelijk de andere kant op draaien
     },  # Chief mag shorts kiezen; die worden alleen gesimuleerd
@@ -45,6 +46,7 @@ DEFAULTS = {
         "max_spread_pct": 0.4,
         "fee_pct": 0.25,
         "cooldown_hours_after_stop": 12,
+        "daily_trend": False,  # alleen kopen boven / shorten onder het 20-daags gemiddelde (grafiekregels)
         "stop_pct": {"default": 6, "BTC-EUR": 5, "ETH-EUR": 5, "SOL-EUR": 7, "XRP-EUR": 7},
         "blocked_markets": [],
         "short_borrow_pct_day": 0.05,  # aanname leenkosten per dag voor gesimuleerde shorts

@@ -24,6 +24,7 @@ import requests
 import kraken
 
 INFO_URL = "https://api.hyperliquid.xyz/info"
+WS_URL = "wss://api.hyperliquid.xyz/ws"
 _http = requests.Session()
 
 
@@ -119,7 +120,10 @@ class CopyEngine:
         self.known = {}            # trader -> {coin: side} van de vorige ronde
         self.first_round = set()   # traders waarvan we de beginstand al kennen
         self._stop = threading.Event()
+        self._wake = threading.Event()   # gezet door de live-verbinding zodra een gevolgde trader handelt
         self._thread = None
+        self._ws = None
+        self.ws_ok = False
         with self.e.db() as con:
             init_db(con)
 
@@ -143,9 +147,70 @@ class CopyEngine:
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
+        if self.cfg.get("realtime", True):
+            threading.Thread(target=self._ws_loop, daemon=True).start()
 
     def stop(self):
         self._stop.set()
+        self._wake.set()
+        try:
+            if self._ws:
+                self._ws.close()
+        except Exception:
+            pass
+
+    # --- live-verbinding: Hyperliquid meldt zelf elke trade van (max 10) gevolgde traders
+    def _ws_loop(self):
+        try:
+            import websocket
+        except Exception:
+            self.e.log("Kopieer-modus: live-verbinding niet beschikbaar, alleen elke paar seconden kijken.", "muted")
+            return
+        users = [t["address"] for t in self.traders][:10]
+        if not users:
+            return
+        backoff = 2
+        while not self._stop.is_set():
+            try:
+                ws = websocket.create_connection(WS_URL, timeout=30)
+                self._ws = ws
+                for u in users:
+                    ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "userFills", "user": u}}))
+                if not self.ws_ok:
+                    self.e.log(f"Kopieer-modus: live-verbinding open voor {len(users)} trader(s); trades komen "
+                               "binnen ~1 seconde binnen.", "info")
+                self.ws_ok, backoff = True, 2
+                last_ping = time.time()
+                while not self._stop.is_set():
+                    if time.time() - last_ping > 45:
+                        ws.send(json.dumps({"method": "ping"}))
+                        last_ping = time.time()
+                    try:
+                        msg = ws.recv()
+                    except websocket.WebSocketTimeoutException:
+                        continue
+                    if not msg:
+                        break
+                    try:
+                        js = json.loads(msg)
+                    except ValueError:
+                        continue
+                    data = js.get("data") or {}
+                    if js.get("channel") == "userFills" and isinstance(data, dict) and not data.get("isSnapshot") \
+                            and data.get("fills"):
+                        self._wake.set()
+            except Exception:
+                pass
+            finally:
+                self.ws_ok = False
+                try:
+                    if self._ws:
+                        self._ws.close()
+                except Exception:
+                    pass
+            if not self._stop.is_set():
+                self._stop.wait(backoff)
+                backoff = min(60, backoff * 2)
 
     def _loop(self):
         every = max(2, int(self.cfg.get("interval_s", 5)))
@@ -158,7 +223,11 @@ class CopyEngine:
                 self.tick()
             except Exception as ex:
                 self.e.log(f"Kopieer-modus: fout ({ex})", "bad")
-            self._stop.wait(every)
+            # Wachten tot de volgende ronde, of eerder als de live-verbinding een trade meldt.
+            self._wake.wait(every)
+            if self._wake.is_set():
+                self._wake.clear()
+                self._stop.wait(0.7)   # trade even laten verwerken bij Hyperliquid
 
     # --- één ronde
     def tick(self):

@@ -13,7 +13,7 @@ import os
 import sqlite3
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import anthropic
@@ -243,6 +243,8 @@ def reset_history(db_path):
         for t in RESET_TABLES:
             con.execute(f"DELETE FROM {t}")
         con.execute(f"DELETE FROM meta WHERE key IN ({','.join('?' * len(RESET_META))})", RESET_META)
+        con.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('reset_at', ?)",
+                    (datetime.now(timezone.utc).isoformat(timespec="seconds"),))
     return backup
 
 
@@ -350,6 +352,7 @@ class Engine:
             if self.kx:
                 try:
                     total, free = self.kx.collateral_usd()
+                    self.kraken_account = {"usd": round(total, 2), "free_usd": round(free, 2), "ts": now()}
                     self.log(f"Kraken-account: ${total:.2f} totaal, ${free:.2f} vrij voor nieuwe posities.", "info")
                 except Exception as e:
                     self.log(f"Kraken-account niet te lezen: {e}", "bad")
@@ -391,7 +394,14 @@ class Engine:
             try:
                 self.check_exits()
                 if self.mode == "kopie":
-                    pass   # alleen kopiëren: geen nieuwe trades en geen AI-rondes voor de gewone bot
+                    # Alleen kopiëren: geen nieuwe trades en geen AI voor de gewone bot. Staan er nog volgers-
+                    # posities open, dan wel de volgers bijhouden zodat die netjes mee kunnen sluiten.
+                    if self.followers and (self.get_positions() or self.get_short_positions()):
+                        saved, self.fast = self.fast, False
+                        try:
+                            self.fast_check()
+                        finally:
+                            self.fast = saved
                 elif self.followers or self.fast:
                     self.fast_check()
                 if self.mode != "kopie" and time.time() - last_cycle >= self.cycle_minutes * 60:
@@ -408,6 +418,10 @@ class Engine:
             if time.time() - last_status >= STATUS_EVERY_SECONDS:
                 self.push_status(True)
                 last_status = time.time()
+                try:
+                    self.weekly_report()
+                except Exception as e:
+                    self.log(f"Weekoverzicht mislukt: {e}", "bad")
             self._stop.wait(tick)
         if self.copier:
             self.copier.stop()
@@ -468,6 +482,22 @@ class Engine:
             return (ask - bid) / ((ask + bid) / 2) * 100
         except Exception:
             return None
+
+    def daily_sma(self, market, days=20):
+        """20-daags gemiddelde van de slotkoers (Bitvavo dagkaarsen, openbaar), een uur in cache."""
+        cache = getattr(self, "_dsma", {})
+        self._dsma = cache
+        hit = cache.get(market)
+        if hit and time.time() - hit[0] < 3600:
+            return hit[1]
+        try:
+            raw = bv_check(self.pub.candles(market, "1d", {"limit": days}), f"dagkaarsen {market}")
+            closes = [float(c[4]) for c in raw]
+            sma = sum(closes) / len(closes) if closes else None
+        except Exception:
+            sma = None
+        cache[market] = (time.time(), sma)
+        return sma
 
     def indicators(self, market):
         raw = bv_check(self.pub.candles(market, "1h", {"limit": 200}), f"candles {market}")
@@ -539,21 +569,37 @@ class Engine:
             return {"fout": str(e)[:300], "score": 0}
 
     # ---------- risicopoort ----------
-    def risk_check_buy(self, market, amount_eur, confidence, book="long"):
+    def risk_check_buy(self, market, amount_eur, confidence, book="long", bron="regels"):
+        rules = self.rules_for(bron)
         with self.db() as con:
             res = risk_gate.check_buy(con, market, amount_eur, confidence, self.spread_pct(market),
-                                      stop_file=settings.stop_path(), rules=self.rules, book=book)
+                                      stop_file=settings.stop_path(), rules=rules, book=book)
             risk_gate.log_verdict(con, market, res, book)
         self.last_verdict = res
         if res["verdict"] == "BLOCK":
             return 0, "; ".join(res["reasons"])
-        plan = risk_gate.exit_plan(self.rules, market, self.price(market), book)
+        plan = risk_gate.exit_plan(rules, market, self.price(market), book)
         tag = "PASS (short, simulatie)" if book == "short" else "PASS"
+        doel = ("tot de volgers sluiten" if self.follower_held(bron) else fmt_px(plan["target_price"]))
         self.log(f"  {tag} €{res['amount_eur']:.2f} (grens: {res['decider']}, risico €{res['risk_eur']:.2f}), "
-                 f"stop {fmt_px(plan['stop_price'])}, doel {fmt_px(plan['target_price'])}", "good")
+                 f"stop {fmt_px(plan['stop_price'])}, doel {doel}", "good")
         return res["amount_eur"], "ok"
 
     # ---------- orders ----------
+    def follower_held(self, bron):
+        return bool(self.fcfg.get("follow_exit", True)) and (bron or "regels") in ("volgers", "beide")
+
+    def rules_for(self, bron):
+        """Regels voor een positie. Volgers-trades: geen koersdoel (we blijven tot de volgers zelf sluiten) en een
+        ruimere noodstop (standaard 2x). De positie wordt daardoor kleiner, zodat het max verlies gelijk blijft."""
+        if not self.follower_held(bron):
+            return self.rules
+        r = dict(self.rules)
+        mult = float(self.fcfg.get("follow_stop_mult", 2.0) or 2.0)
+        r["stop_pct"] = {k: float(v) * mult for k, v in self.rules["stop_pct"].items()}
+        r["reward_risk"] = 1000.0
+        return r
+
     def main_holds_real(self, symbol):
         """Heeft de hoofdbot een echte Kraken-positie op dit symbool? (voor de kopieer-modus)"""
         if not self.kx:
@@ -573,13 +619,13 @@ class Engine:
         pos = other.get(market)
         return bool(pos and pos.get("echt"))
 
-    def kraken_open(self, market, side, eur, book):
+    def kraken_open(self, market, side, eur, book, bron="regels"):
         """Echte positie openen bij Kraken plus stop-loss bij Kraken. Geeft (aantal, prijs, stop_id)."""
         size, _ = self.kx.size_for(market, eur)
         if size <= 0:
             raise RuntimeError(f"€{eur:.2f} is te weinig voor de kleinste ordergrootte van {market}")
         amount, fill_px, _ = self.kx.market_order(market, side, size)
-        plan = risk_gate.exit_plan(self.rules, market, fill_px, book)
+        plan = risk_gate.exit_plan(self.rules_for(bron), market, fill_px, book)
         try:
             stop_id = self.kx.stop_order(market, "sell" if side == "buy" else "buy", amount, plan["stop_price"])
         except Exception as e:
@@ -610,7 +656,7 @@ class Engine:
                 self.log(f"  {market}: er staat al een echte short, Kraken kan niet tegelijk long. Overgeslagen.", "muted")
                 return
             try:
-                amount, fill_px, ext_stop = self.kraken_open(market, "buy", eur, "long")
+                amount, fill_px, ext_stop = self.kraken_open(market, "buy", eur, "long", bron)
             except Exception as e:
                 self.log(f"  KOOP bij Kraken mislukt: {e}", "bad")
                 return
@@ -658,7 +704,7 @@ class Engine:
                 self.log(f"  VERKOOP bij Kraken mislukt: {e}. De stop-loss bij Kraken is mogelijk weg!", "bad")
                 return
             if done is None:
-                fill_px = risk_gate.exit_plan(self.rules, market, pos["entry_price"])["stop_price"]
+                fill_px = risk_gate.exit_plan(self.rules_for(pos.get("bron")), market, pos["entry_price"])["stop_price"]
                 reason = "stop-loss (al uitgevoerd bij Kraken)"
             else:
                 amount, fill_px = done
@@ -709,7 +755,7 @@ class Engine:
             px = self.price(market)
             value = pos["amount"] * px * (1 - fee)  # wat je na verkoop (incl. fee) zou krijgen
             marks.append(("long", market, px, value, value - pos["cost_eur"]))
-            why = risk_gate.exit_signal(self.rules, market, pos["entry_price"], px)
+            why = risk_gate.exit_signal(self.rules_for(pos.get("bron")), market, pos["entry_price"], px)
             if why:
                 self.log(f"[exit] {market}: {why}", "info")
                 self.execute_sell(market, why)
@@ -717,7 +763,7 @@ class Engine:
             px = self.price(market)
             pnl = self.short_pnl(pos, px)[0]
             marks.append(("short", market, px, pos["cost_eur"] + pnl, pnl))
-            why = risk_gate.exit_signal(self.rules, market, pos["entry_price"], px, "short")
+            why = risk_gate.exit_signal(self.rules_for(pos.get("bron")), market, pos["entry_price"], px, "short")
             if why:
                 self.log(f"[exit short] {market}: {why}", "info")
                 self.close_short(market, why)
@@ -747,7 +793,7 @@ class Engine:
                 self.log(f"  {market}: er staat al een echte long, Kraken kan niet tegelijk short. Overgeslagen.", "muted")
                 return
             try:
-                amount, px, ext_stop = self.kraken_open(market, "sell", eur, "short")
+                amount, px, ext_stop = self.kraken_open(market, "sell", eur, "short", bron)
             except Exception as e:
                 self.log(f"  SHORT bij Kraken mislukt: {e}", "bad")
                 return
@@ -787,7 +833,8 @@ class Engine:
                 self.log(f"  SHORT SLUITEN bij Kraken mislukt: {e}. De stop-loss bij Kraken is mogelijk weg!", "bad")
                 return
             if done is None:
-                px = risk_gate.exit_plan(self.rules, market, pos["entry_price"], "short")["stop_price"]
+                px = risk_gate.exit_plan(self.rules_for(pos.get("bron")), market, pos["entry_price"],
+                                         "short")["stop_price"]
                 reason = "stop-loss (al uitgevoerd bij Kraken)"
             else:
                 px = done[1]
@@ -912,6 +959,18 @@ class Engine:
     def combined_setup(self, market, ind, charts, news_r):
         """Setup volgens de regels én volgens de volgers. Geeft ook aan welke bron het signaal gaf."""
         setup = setup_for(ind, charts, news_r)
+        if self.rules.get("daily_trend"):
+            # Trend op dagbasis (zoals in de backtest-variant): alleen kopen boven het 20-daags gemiddelde,
+            # alleen shorten eronder. Geldt voor de grafiekregels, niet voor de volgers.
+            sma = self.daily_sma(market)
+            px = ind.get("price")
+            if sma and px:
+                if px < sma and setup["long"]:
+                    setup["long"] = False
+                    setup.setdefault("notes", []).append("onder 20-daags gemiddelde: geen koop")
+                if px > sma and setup["short"]:
+                    setup["short"] = False
+                    setup.setdefault("notes", []).append("boven 20-daags gemiddelde: geen short")
         setup["bron_long"] = "regels" if setup["long"] else ""
         setup["bron_short"] = "regels" if setup["short"] else ""
         setup["volgers"] = None
@@ -929,7 +988,7 @@ class Engine:
             setup["short"] = False
         return setup
 
-    def close_reasons(self, market, side, charts):
+    def close_reasons(self, market, side, charts, bron=None):
         """Mag een positie op eigen initiatief (Chief of volgers) gesloten worden? Geeft lijst met redenen.
         side='long' (koop-positie) of 'short'. Leeg = niet sluiten; stop-loss en koersdoel blijven gewoon werken."""
         why = []
@@ -937,9 +996,10 @@ class Engine:
             cs = float(charts.get("score")) if charts and "fout" not in charts else 0.0
         except (TypeError, ValueError):
             cs = 0.0
-        if side == "long" and cs <= -0.3:
+        held = self.follower_held(bron)    # volgers-trade: de grafiek alleen is geen reden om eruit te gaan
+        if side == "long" and cs <= -0.3 and not held:
             why.append(f"charts omgeslagen ({cs:+.2f})")
-        if side == "short" and cs >= 0.3:
+        if side == "short" and cs >= 0.3 and not held:
             why.append(f"charts omgeslagen ({cs:+.2f})")
         if self.followers:
             c = self.followers.consensus(coin_of(market))
@@ -962,6 +1022,14 @@ class Engine:
             return c["long"] >= min_tr and c["score"] >= min_sc
         return c["short"] >= min_tr and c["score"] <= -min_sc
 
+    def followers_left(self, market, side):
+        """Zijn de volgers grotendeels uit deze kant gestapt? (minder dan de helft van het instap-minimum over)"""
+        if not self.followers:
+            return False
+        c = self.followers.consensus(coin_of(market))
+        need = max(2, int(self.fcfg.get("min_traders", 4)) // 2)
+        return (c["long"] if side == "long" else c["short"]) < need
+
     def reopen_blocked(self, market, side):
         """Na zelf sluiten een uur niet opnieuw dezelfde kant op (voorkomt heen-en-weer en fees)."""
         t = self.closed_at.get((market, side))
@@ -974,12 +1042,16 @@ class Engine:
             return
         for market, pos in self.get_positions().items():
             why = [w for w in self.close_reasons(market, "long", {}) if w.startswith("volgers")]
+            if not why and self.follower_held(pos.get("bron")) and self.followers_left(market, "long"):
+                why = ["volgers zijn uit hun long gestapt"]
             if why:
                 self.log(f"[exit] {market}: {why[0]}", "info")
                 self.execute_sell(market, why[0])
                 self.closed_at[(market, "long")] = time.time()
         for market, pos in self.get_short_positions().items():
             why = [w for w in self.close_reasons(market, "short", {}) if w.startswith("volgers")]
+            if not why and self.follower_held(pos.get("bron")) and self.followers_left(market, "short"):
+                why = ["volgers zijn uit hun short gestapt"]
             if why:
                 self.log(f"[exit short] {market}: {why[0]}", "info")
                 self.close_short(market, why[0])
@@ -1045,14 +1117,14 @@ class Engine:
                 action = "hold"
         if action == "buy" and not pos:
             amount, why = self.risk_check_buy(market, float(decision.get("amount_eur", 0) or 0) * self.lev,
-                                              float(decision.get("confidence", 0) or 0))
+                                              float(decision.get("confidence", 0) or 0), bron=setup["bron_long"])
             if amount:
                 self.execute_buy(market, amount, decision.get("reason", ""), bron=setup["bron_long"])
                 executed = True
             else:
                 self.log(f"  risicopoort blokkeert: {why}", "muted")
         elif action == "sell" and pos:
-            why = self.close_reasons(market, "long", charts)
+            why = self.close_reasons(market, "long", charts, pos.get("bron"))
             if why:
                 self.execute_sell(market, f"{decision.get('reason', '')} [{'; '.join(why)}]")
                 self.closed_at[(market, "long")] = time.time()
@@ -1063,14 +1135,15 @@ class Engine:
                          "stop-loss en koersdoel bewaken hem", "muted")
         elif action == "short" and self.shorts and not spos:
             amount, why = self.risk_check_buy(market, float(decision.get("amount_eur", 0) or 0) * self.lev,
-                                              float(decision.get("confidence", 0) or 0), book="short")
+                                              float(decision.get("confidence", 0) or 0), book="short",
+                                              bron=setup["bron_short"])
             if amount:
                 self.open_short(market, amount, decision.get("reason", ""), bron=setup["bron_short"])
                 executed = True
             else:
                 self.log(f"  risicopoort blokkeert short: {why}", "muted")
         elif action == "cover" and spos:
-            why = self.close_reasons(market, "short", charts)
+            why = self.close_reasons(market, "short", charts, spos.get("bron"))
             if why:
                 self.close_short(market, f"{decision.get('reason', '')} [{'; '.join(why)}]")
                 self.closed_at[(market, "short")] = time.time()
@@ -1116,7 +1189,8 @@ class Engine:
             positions = []
             for r in con.execute("SELECT market, cost_eur, entry_price, opened, bron, COALESCE(schaduw,0) AS schaduw "
                                  "FROM positions"):
-                plan = risk_gate.exit_plan(self.rules, r["market"], r["entry_price"])
+                plan = risk_gate.exit_plan(self.rules_for(r["bron"] if "bron" in r.keys() else None), r["market"],
+                                           r["entry_price"])
                 mk = marks.get(("long", r["market"])) or {}
                 positions.append({"market": r["market"], "cost_eur": round(r["cost_eur"], 2),
                                   "entry": r["entry_price"], "stop": plan["stop_price"],
@@ -1128,7 +1202,8 @@ class Engine:
                                   "schaduw": bool(r["schaduw"])})
             short_positions = []
             for r in con.execute("SELECT * FROM short_positions"):
-                plan = risk_gate.exit_plan(self.rules, r["market"], r["entry_price"], "short")
+                plan = risk_gate.exit_plan(self.rules_for(r["bron"] if "bron" in r.keys() else None), r["market"],
+                                           r["entry_price"], "short")
                 mk = marks.get(("short", r["market"])) or {}
                 short_positions.append({"market": r["market"], "cost_eur": round(r["cost_eur"], 2),
                                         "entry": r["entry_price"], "stop": plan["stop_price"],
@@ -1166,7 +1241,114 @@ class Engine:
                 "buys_today": buys, "sells_today": sells, "daily_limit": self.rules["daily_loss_limit_eur"],
                 "api_usd_30d": round(usd, 4), "api_calls_30d": calls, "markets": self.markets,
                 "positions": positions, "short_positions": short_positions, "stats": stats,
-                "stats_bron": stats_bron, "followers": self.follower_snapshot()}
+                "stats_bron": stats_bron, "followers": self.follower_snapshot(),
+                # Extra voor de website (modus, beurs, kopiëren, limieten, reset)
+                "mode": self.mode, "exchange": self.exchange, "leverage": self.lev,
+                "kraken_account": getattr(self, "kraken_account", None),
+                "copy": self.copy_snapshot(), "reset_at": self.meta_get("reset_at"),
+                "limits": {"bot_today_pnl": round(pnl, 2), "bot_daily_limit": self.rules["daily_loss_limit_eur"],
+                           "copy_today_pnl": round(self.copier.realized_today(), 2) if self.copier else None,
+                           "copy_daily_limit": (self.cfg.get("copy") or {}).get("daily_loss_eur")}}
+
+    def weekly_report(self, force=False):
+        """Elke maandag vanaf 8:00 (eigen tijd) een overzicht van de afgelopen 7 dagen: in het logboek (ook op je
+        telefoon) en als bestand in de map 'rapporten'. Met force=True direct."""
+        local = datetime.now().astimezone()
+        week = local.strftime("%G-W%V")
+        if not force and (local.weekday() != 0 or local.hour < 8 or self.meta_get("week_report") == week):
+            return None
+        since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat(timespec="seconds")
+        L = [f"Weekoverzicht t/m {local.strftime('%d-%m-%Y')}"]
+        with self.db() as con:
+            for label, sql in (("Gewone bot (echt geld of droog)",
+                                "SELECT pnl, bron FROM trades WHERE side='sell' AND ts>=? AND COALESCE(schaduw,0)=0"),
+                               ("Shorts", "SELECT pnl, bron FROM short_trades WHERE side='cover' AND ts>=? "
+                                          "AND COALESCE(schaduw,0)=0"),
+                               ("Schaduwtrades (niet echt)",
+                                "SELECT pnl, bron FROM trades WHERE side='sell' AND ts>=? AND COALESCE(schaduw,0)=1")):
+                rows = con.execute(sql, (since,)).fetchall()
+                if rows:
+                    tot = sum(r[0] or 0 for r in rows)
+                    wins = sum(1 for r in rows if (r[0] or 0) > 0)
+                    per = {}
+                    for p_, b in rows:
+                        per[b or "regels"] = per.get(b or "regels", 0) + (p_ or 0)
+                    L.append(f"{label}: {len(rows)} trades, {wins} winst, totaal €{tot:+.2f} "
+                             f"({', '.join(f'{k} €{v:+.2f}' for k, v in per.items())})")
+                else:
+                    L.append(f"{label}: geen gesloten trades")
+            rows = con.execute("SELECT trader_name, pnl_eur FROM copy_trades WHERE closed>=?", (since,)).fetchall()
+            if rows:
+                per = {}
+                for n_, p_ in rows:
+                    per[n_] = per.get(n_, 0) + (p_ or 0)
+                L.append(f"Kopiëren: {len(rows)} trades, totaal €{sum(per.values()):+.2f} — " +
+                         ", ".join(f"@{k} €{v:+.2f}" for k, v in sorted(per.items(), key=lambda kv: -kv[1])))
+            else:
+                L.append("Kopiëren: geen gesloten kopieën")
+            usd = con.execute("SELECT COALESCE(SUM(usd),0) FROM api_usage WHERE ts>=?", (since,)).fetchone()[0]
+            L.append(f"API-kosten: ${usd:.2f}")
+            b = con.execute("SELECT bot_eur, btc_hold_eur FROM benchmark ORDER BY id DESC LIMIT 1").fetchone()
+            if b and b[0] is not None:
+                L.append(f"Stand: bot €{b[0]:.2f}, BTC vasthouden €{(b[1] or 0):.2f}")
+        for line in L:
+            self.log(line, "info")
+        try:
+            folder = os.path.join(settings.data_dir(), "rapporten")
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, f"week-{week}.md")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("# " + L[0] + "\n\n" + "\n".join("- " + x for x in L[1:]) + "\n")
+        except Exception:
+            path = None
+        self.meta_set("week_report", week)
+        return path
+
+    def copy_snapshot(self):
+        """Kopieer-modus voor de website: open kopieën, laatste gesloten, statistiek per trader."""
+        try:
+            with self.db() as con:
+                opens = [dict(r) for r in con.execute(
+                    "SELECT coin, side, leverage, cost_eur, entry_price, stop_price, trader_name, opened, echt "
+                    "FROM copy_positions ORDER BY opened DESC")]
+                closed = [dict(r) for r in con.execute(
+                    "SELECT closed, coin, side, trader_name, pnl_eur, pnl_pct, trader_pct, fee_eur, reason, echt "
+                    "FROM copy_trades ORDER BY id DESC LIMIT 30")]
+                rows = con.execute("SELECT trader_name, pnl_eur, pnl_pct, trader_pct FROM copy_trades").fetchall()
+        except Exception:
+            return None
+        kr = self.copier.kr if self.copier else self.kr
+        for o in opens:
+            try:
+                import kraken
+                px = kr.price(kraken.symbol_for_coin(o["coin"])) if kr else None
+            except Exception:
+                px = None
+            if px:
+                d = 1 if o["side"] == "long" else -1
+                amount = o["cost_eur"] / o["entry_price"] if o["entry_price"] else 0
+                o["price_now"] = px
+                o["pnl_now"] = round(d * (px - o["entry_price"]) * amount, 2)
+        per = {}
+        for name, p, bp, tp in rows:
+            x = per.setdefault(name or "?", {"trades": 0, "wins": 0, "pnl": 0.0, "bot_pct": [], "trader_pct": []})
+            x["trades"] += 1
+            x["wins"] += 1 if (p or 0) > 0 else 0
+            x["pnl"] += p or 0
+            if bp is not None and tp is not None:
+                x["bot_pct"].append(bp)
+                x["trader_pct"].append(tp)
+        per_list = [{"trader": k, "trades": v["trades"], "winrate": round(v["wins"] / v["trades"], 3),
+                     "pnl": round(v["pnl"], 2),
+                     "bot_pct": round(sum(v["bot_pct"]) / len(v["bot_pct"]), 2) if v["bot_pct"] else None,
+                     "trader_pct": round(sum(v["trader_pct"]) / len(v["trader_pct"]), 2) if v["trader_pct"] else None}
+                    for k, v in per.items()]
+        tot = sum(r[1] or 0 for r in rows)
+        return {"enabled": bool(self.copier), "live": bool(self.copier and self.copier.live()),
+                "realtime": bool(self.copier and self.copier.ws_ok),
+                "traders": [t["name"] for t in (self.copier.traders if self.copier else [])],
+                "open": opens, "closed": closed, "per_trader": per_list,
+                "totals": {"trades": len(rows), "wins": sum(1 for r in rows if (r[1] or 0) > 0), "pnl": round(tot, 2)}}
 
     def follower_snapshot(self):
         if not self.followers:

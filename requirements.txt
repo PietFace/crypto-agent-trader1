@@ -4,3 +4,4 @@ feedparser
 requests
 PySide6
 lz4
+websocket-client

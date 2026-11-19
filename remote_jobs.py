@@ -93,18 +93,23 @@ class JobRunner:
                 markets = ["BTC-EUR"] + markets
             bv = Bitvavo({})
             data = {m: backtest.fetch_candles(bv, m, months) for m in markets}
-            res = backtest.run(data, settings.effective_rules(cfg), shorts=shorts,
-                               cycle_minutes=int(cfg.get("cycle_minutes", 120)))
-            self._send(rc, {"id": req["id"], "status": "done", "result": _slim(res, months)})
+            rules = settings.effective_rules(cfg)
+            res = backtest.run(data, rules, shorts=shorts, cycle_minutes=int(cfg.get("cycle_minutes", 120)))
+            ex = "Kraken" if cfg.get("exchange") == "kraken" else "Bitvavo"
+            slim = _slim(res, months)
+            slim.update({"exchange": ex, "fee_pct": rules.get("fee_pct"), "leverage": rules.get("leverage", 1)})
+            self._send(rc, {"id": req["id"], "status": "done", "result": slim})
             # Varianten naast elkaar; de uitkomst komt in het logboek, ook op je telefoon.
             try:
                 rows = backtest.run_variants(data, settings.effective_rules(cfg), shorts=shorts,
                                              cycle_minutes=int(cfg.get("cycle_minutes", 120)))
-                ex = "Kraken" if cfg.get("exchange") == "kraken" else "Bitvavo"
                 lines = backtest.variants_text(rows, months, ex)
                 for line in lines:
                     self.log(line, "info")
                 self._send_logs(rc, lines)
+                # Zelfde resultaat nog eens, nu mét de varianten, zodat de website ze als tabel kan tonen.
+                slim["variants"] = rows
+                self._send(rc, {"id": req["id"], "status": "done", "result": slim})
             except Exception as e:
                 self.log(f"Varianten-test mislukt: {e}", "bad")
             self.log(f"Backtest klaar: eindstand €{res['final']:.2f} (BTC vasthouden "

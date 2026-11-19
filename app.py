@@ -754,6 +754,8 @@ class CopyPage(QWidget):
         f.addRow("", self.live)
         self.every = QSpinBox(); self.every.setRange(2, 60); self.every.setSuffix(" s")
         f.addRow("Kijken elke", self.every)
+        self.rt = QCheckBox("Live-verbinding: Hyperliquid meldt trades direct (binnen ~1 s, max 10 traders)")
+        f.addRow("", self.rt)
         self.stake = QDoubleSpinBox(); self.stake.setRange(2, 500); self.stake.setPrefix("€ ")
         f.addRow("Inzet per trade", self.stake)
         self.maxlev = QSpinBox(); self.maxlev.setRange(1, 10); self.maxlev.setSuffix("x")
@@ -846,6 +848,7 @@ class CopyPage(QWidget):
         self.on.setChecked(bool(c.get("enabled")))
         self.live.setChecked(bool(c.get("live")))
         self.every.setValue(int(c.get("interval_s", d["interval_s"])))
+        self.rt.setChecked(bool(c.get("realtime", True)))
         self.stake.setValue(float(c.get("eur_per_trade", d["eur_per_trade"])))
         self.maxlev.setValue(int(c.get("max_leverage", d["max_leverage"])))
         self.maxpos.setValue(int(c.get("max_positions", d["max_positions"])))
@@ -866,7 +869,8 @@ class CopyPage(QWidget):
                 traders.append({"address": parts[0].lower(), "name": parts[1] if len(parts) > 1 else parts[0][:8],
                                 "style": style})
         self.win.cfg["copy"] = {
-            "enabled": self.on.isChecked(), "live": self.live.isChecked(), "interval_s": self.every.value(),
+            "enabled": self.on.isChecked(), "live": self.live.isChecked(), "realtime": self.rt.isChecked(),
+            "interval_s": self.every.value(),
             "eur_per_trade": round(self.stake.value(), 2), "max_leverage": self.maxlev.value(),
             "max_positions": self.maxpos.value(), "daily_loss_eur": round(self.dayloss.value(), 2),
             "stop_pct_lang": round(self.stop_l.value(), 2), "stop_pct_kort": round(self.stop_k.value(), 2),
@@ -1411,6 +1415,8 @@ class SettingsPage(QWidget):
         num("cooldown_hours_after_stop", "Pauze na stop-loss", 0, 72, 1, 0, " uur")
         num("fee_pct", "Bitvavo-fee per order", 0, 1, 0.05, 2, " %")
         num("short_borrow_pct_day", "Leenkosten short (aanname)", 0, 1, 0.01, 3, " % per dag")
+        self.dtrend = QCheckBox("Trend op dagbasis: alleen kopen boven / shorten onder het 20-daags gemiddelde")
+        f.addRow("", self.dtrend)
         self.size_hint = lab("", "hint", wrap=True)
         f.addRow("", self.size_hint)
         for s in self.r.values():
@@ -1444,6 +1450,15 @@ class SettingsPage(QWidget):
         f.addRow("", self.fw_auto)
         self.fw_invo = QCheckBox("Ook traders die via Invo handelen (tot de helft van de plekken)")
         f.addRow("", self.fw_invo)
+        self.fw_quality = QCheckBox("Kiezen op kwaliteitsscore (gelijkmatige groei, kleine dalingen) i.p.v. één goede maand")
+        f.addRow("", self.fw_quality)
+        self.fw_conv = QCheckBox("Gewicht naar overtuiging (groter deel van hun account ingezet = telt zwaarder)")
+        f.addRow("", self.fw_conv)
+        self.fw_hold = QCheckBox("Volgers-trades pas sluiten als de volgers zelf uitstappen (geen koersdoel)")
+        f.addRow("", self.fw_hold)
+        self.fw_mult = QDoubleSpinBox(); self.fw_mult.setRange(1.0, 5.0); self.fw_mult.setSingleStep(0.5)
+        self.fw_mult.setSuffix("x de normale stop")
+        f.addRow("Noodstop volgers-trades", self.fw_mult)
         self.fw_count = QSpinBox()
         self.fw_count.setRange(3, 50)
         f.addRow("Aantal traders", self.fw_count)
@@ -1599,6 +1614,10 @@ class SettingsPage(QWidget):
         self.fw_setup.setChecked(bool(fc.get("use_as_setup", True)))
         self.fw_auto.setChecked(bool(fc.get("auto", True)))
         self.fw_invo.setChecked(bool(fc.get("invo", True)))
+        self.fw_quality.setChecked(bool(fc.get("quality", True)))
+        self.fw_conv.setChecked(bool(fc.get("conviction", True)))
+        self.fw_hold.setChecked(bool(fc.get("follow_exit", True)))
+        self.fw_mult.setValue(float(fc.get("follow_stop_mult", 2.0)))
         self.fw_exit.setChecked(bool(fc.get("exit_on_flip", True)))
         self.fw_count.setValue(int(fc.get("count", 10)))
         self.fw_min.setValue(int(fc.get("min_traders", 3)))
@@ -1612,6 +1631,7 @@ class SettingsPage(QWidget):
         self.model.setCurrentText(cfg.get("model") or settings.MODELS[0])
         self.model_chief.setCurrentText(cfg.get("model_chief") or "(zelfde als agents)")
         self.shorts_on.setChecked(bool(cfg.get("shorts_sim", True)))
+        self.dtrend.setChecked(bool(cfg["rules"].get("daily_trend", False)))
         self.exch.setCurrentIndex(1 if cfg.get("exchange") == "kraken" else 0)
         self.lev.setValue(int((cfg.get("kraken") or {}).get("leverage", 3)))
         lbs = cfg.get("live_bronnen") or ["volgers", "beide"]
@@ -1632,6 +1652,7 @@ class SettingsPage(QWidget):
             val = s.value()
             rules[key] = int(val) if isinstance(s, QSpinBox) else round(float(val), 2)
         rules["stop_pct"] = {m: round(s.value(), 1) for m, s in self.stops.items()}
+        rules["daily_trend"] = self.dtrend.isChecked()
         return rules
 
     def save(self):
@@ -1653,6 +1674,8 @@ class SettingsPage(QWidget):
         cfg["rules"] = self.collect_rules()
         cfg["followers"] = {"enabled": self.fw_on.isChecked(), "use_as_setup": self.fw_setup.isChecked(),
                             "auto": self.fw_auto.isChecked(), "invo": self.fw_invo.isChecked(),
+                            "quality": self.fw_quality.isChecked(), "conviction": self.fw_conv.isChecked(),
+                            "follow_exit": self.fw_hold.isChecked(), "follow_stop_mult": self.fw_mult.value(),
                             "count": self.fw_count.value(),
                             "exit_on_flip": self.fw_exit.isChecked(),
                             "min_traders": self.fw_min.value(), "min_consensus": round(self.fw_cons.value(), 1),
