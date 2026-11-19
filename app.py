@@ -326,6 +326,14 @@ class BotPage(QWidget):
             mk = marks.get(("short", market))
             rows.append(["short" if real else "short (sim)", market, eur(cost_eur), fmt_px(entry), *live_cols(mk, cost_eur),
                          fmt_px(plan['stop_price']), fmt_px(plan['target_price']), local_time(opened)])
+        for coin, side, lev, cost, entry, stop, pxn, pnl, tn, opened, real in query(
+                "SELECT coin, side, leverage, cost_eur, entry_price, stop_price, price_now, pnl_now, trader_name, "
+                "opened, echt FROM copy_positions ORDER BY opened"):
+            margin = (cost or 0) / max(1.0, lev or 1)
+            mk = (pxn, margin + (pnl or 0), pnl or 0) if pxn is not None else None
+            rows.append([f"kopie {side} {lev:.0f}x @{tn}" + ("" if real else " (droog)"), coin, eur(margin),
+                         fmt_px(entry or 0), *live_cols(mk, margin), fmt_px(stop or 0), "tot trader sluit",
+                         local_time(opened)])
         fill(self.pos, rows)
         from PySide6.QtGui import QColor
         for r, row in enumerate(rows):
@@ -841,7 +849,8 @@ class CopyPage(QWidget):
         self.per_trader.setMinimumHeight(150)
         v.addWidget(self.per_trader)
         v.addWidget(lab("OPEN KOPIEËN", "cap"))
-        self.open_t = table(["Geopend", "Munt", "Kant", "Hefboom", "Positie", "Instap", "Noodstop", "Trader", "Echt"])
+        self.open_t = table(["Geopend", "Munt", "Kant", "Hefboom", "Positie", "Inzet", "Instap", "Koers nu",
+                             "Resultaat", "Noodstop", "Trader", "Echt"])
         self.open_t.setMinimumHeight(140)
         v.addWidget(self.open_t)
         v.addWidget(lab("GESLOTEN KOPIEËN (bot naast de trader)", "cap"))
@@ -1091,12 +1100,22 @@ class CopyPage(QWidget):
     def refresh(self):
         self._update_hint()
         rows = []
-        for r in query("SELECT opened, coin, side, leverage, cost_eur, entry_price, stop_price, trader_name, echt "
-                       "FROM copy_positions ORDER BY opened DESC"):
-            opened, coin, side, lev, cost, entry, stop, tn, real = r
-            rows.append([local_time(opened), coin, side, f"{lev:.0f}x", eur(cost or 0), fmt_px(entry or 0),
-                         fmt_px(stop or 0), tn, "ja" if real else "droog"])
+        for r in query("SELECT opened, coin, side, leverage, cost_eur, entry_price, stop_price, trader_name, echt, "
+                       "price_now, pnl_now FROM copy_positions ORDER BY opened DESC"):
+            opened, coin, side, lev, cost, entry, stop, tn, real, pxn, pnl = r
+            margin = (cost or 0) / max(1.0, lev or 1)
+            res = (f"{eur(pnl, True)} ({pnl / margin * 100:+.1f}%)" if pnl is not None and margin else "…")
+            rows.append([local_time(opened), coin, side, f"{lev:.0f}x", eur(cost or 0), eur(margin),
+                         fmt_px(entry or 0), fmt_px(pxn) if pxn else "…", res, fmt_px(stop or 0), tn,
+                         "ja" if real else "droog"])
         fill(self.open_t, rows)
+        from PySide6.QtGui import QColor
+        for r_ in range(len(rows)):
+            it = self.open_t.item(r_, 8)
+            if it and it.text().startswith("€ +") and not it.text().startswith("€ +0,00"):
+                it.setForeground(QColor(C["good"]))
+            elif it and it.text().startswith("€ -"):
+                it.setForeground(QColor(C["bad"]))
         rows, tot, n, wins = [], 0.0, 0, 0
         for r in query("SELECT closed, coin, side, trader_name, pnl_eur, pnl_pct, trader_pct, fee_eur, reason "
                        "FROM copy_trades ORDER BY id DESC LIMIT 300"):
@@ -1854,7 +1873,11 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             changed = True
+        # Ook zonder nieuwe logregels elke 5 s verversen, zodat live waarden (ook van kopieën) meelopen.
+        if self.engine is not None and self.engine.running and time.time() - getattr(self, "_last_refresh", 0) > 5:
+            changed = True
         if changed:
+            self._last_refresh = time.time()
             self.refresh()
 
     def refresh(self):
@@ -1871,6 +1894,8 @@ class MainWindow(QMainWindow):
             self.over.refresh()
         if self.stack.currentIndex() == 2:
             self.fol.refresh()
+        if self.stack.currentIndex() == 3:
+            self.cp.refresh()
 
     def reset_all(self):
         """Alle trades en posities wissen en opnieuw beginnen op het budget."""
