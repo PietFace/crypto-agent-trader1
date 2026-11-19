@@ -195,8 +195,19 @@ class BotPage(QWidget):
         pv.addWidget(lab("OPEN POSITIES", "cap"))
         self.pos = table(["Soort", "Munt", "Ingelegd", "Instapkoers", "Koers nu", "Waarde nu", "Resultaat",
                           "Stop-loss", "Koersdoel", "Sinds"])
-        self.pos.setMaximumHeight(150)
+        self.pos.setMaximumHeight(170)
+        self.pos.setSelectionMode(QTableWidget.SingleSelection)
+        self.pos.setSelectionBehavior(QTableWidget.SelectRows)
+        self._pos_keys = []
         pv.addWidget(self.pos)
+        prow = QHBoxLayout()
+        self.close_btn = QPushButton("Geselecteerde positie sluiten")
+        self.close_btn.clicked.connect(self.close_selected)
+        prow.addWidget(self.close_btn)
+        prow.addWidget(lab("Klik een positie aan en druk op de knop. Werkt voor de gewone bot, shorts en kopieën.",
+                           "hint"))
+        prow.addStretch(1)
+        pv.addLayout(prow)
         v.addWidget(pos_card)
 
         v.addWidget(lab("LOGBOEK", "cap"))
@@ -204,6 +215,46 @@ class BotPage(QWidget):
         self.log.setReadOnly(True)
         v.addWidget(self.log, 1)
 
+
+    def close_selected(self):
+        sel = sorted({i.row() for i in self.pos.selectedIndexes()})
+        if not sel or sel[0] >= len(self._pos_keys):
+            QMessageBox.information(self, "Positie sluiten", "Klik eerst een positie aan in de tabel.")
+            return
+        kind, key = self._pos_keys[sel[0]]
+        label = self.pos.item(sel[0], 0).text() + " " + self.pos.item(sel[0], 1).text()
+        real = ("droog" not in label and "sim" not in label and "schaduw" not in label
+                and (bool(self.win.cfg.get("live")) or kind == "kopie" and (self.win.cfg.get("copy") or {}).get("live")))
+        msg = (f"{label} nu sluiten tegen de huidige koers?" +
+               ("\n\nDit is een ECHTE positie: er gaat een echte order naar de beurs." if real else ""))
+        if QMessageBox.question(self, "Positie sluiten", msg, QMessageBox.Yes | QMessageBox.No,
+                                QMessageBox.No) != QMessageBox.Yes:
+            return
+        self.close_btn.setEnabled(False)
+        win = self.win
+
+        def work():
+            try:
+                eng = win.engine if (win.engine and win.engine.running) else None
+                if eng is None:
+                    from bot import Engine
+                    eng = Engine(win.cfg, lambda t, k="": win.msgq.put((t, k)))
+                if kind == "long":
+                    eng.execute_sell(key, "handmatig gesloten")
+                elif kind == "short":
+                    eng.close_short(key, "handmatig gesloten")
+                else:
+                    cp = eng.copier
+                    if cp is None:
+                        import copier
+                        cp = copier.CopyEngine(eng, win.cfg.get("copy") or {})
+                    cp.close(key, "handmatig gesloten")
+            except Exception as e:
+                win.msgq.put((f"Handmatig sluiten mislukt: {e}", "bad"))
+            finally:
+                win.msgq.put(("", ""))
+        threading.Thread(target=work, daemon=True).start()
+        QTimer.singleShot(3000, lambda: self.close_btn.setEnabled(True))
 
     def _mode_changed(self, i):
         key = self.MODES[i][0]
@@ -314,18 +365,21 @@ class BotPage(QWidget):
             return [fmt_px(px), eur(v), f"{eur(p, True)} ({pct:+.1f}%)"]
 
         rows = []
+        keys = []
         for market, amount, entry, cost_eur, opened, shadow in query(
                 "SELECT market, amount, entry_price, cost_eur, opened, COALESCE(schaduw,0) FROM positions"):
             plan = risk_gate.exit_plan(rules, market, entry)
             mk = marks.get(("long", market))
             rows.append(["kopen (schaduw)" if shadow else "kopen", market, eur(cost_eur), fmt_px(entry), *live_cols(mk, cost_eur),
                          fmt_px(plan['stop_price']), fmt_px(plan['target_price']), local_time(opened)])
+            keys.append(("long", market))
         for market, amount, entry, cost_eur, opened, real in query(
                 "SELECT market, amount, entry_price, cost_eur, opened, COALESCE(echt,0) FROM short_positions"):
             plan = risk_gate.exit_plan(rules, market, entry, "short")
             mk = marks.get(("short", market))
             rows.append(["short" if real else "short (sim)", market, eur(cost_eur), fmt_px(entry), *live_cols(mk, cost_eur),
                          fmt_px(plan['stop_price']), fmt_px(plan['target_price']), local_time(opened)])
+            keys.append(("short", market))
         for coin, side, lev, cost, entry, stop, pxn, pnl, tn, opened, real in query(
                 "SELECT coin, side, leverage, cost_eur, entry_price, stop_price, price_now, pnl_now, trader_name, "
                 "opened, echt FROM copy_positions ORDER BY opened"):
@@ -334,7 +388,13 @@ class BotPage(QWidget):
             rows.append([f"kopie {side} {lev:.0f}x @{tn}" + ("" if real else " (droog)"), coin, eur(margin),
                          fmt_px(entry or 0), *live_cols(mk, margin), fmt_px(stop or 0), "tot trader sluit",
                          local_time(opened)])
+            keys.append(("kopie", coin))
+        sel = sorted({i.row() for i in self.pos.selectedIndexes()})
+        prev = self._pos_keys[sel[0]] if sel and sel[0] < len(self._pos_keys) else None
         fill(self.pos, rows)
+        self._pos_keys = keys
+        if prev in keys:
+            self.pos.selectRow(keys.index(prev))      # selectie bewaren bij het verversen
         from PySide6.QtGui import QColor
         for r, row in enumerate(rows):
             it = self.pos.item(r, 6)
@@ -1920,12 +1980,13 @@ class MainWindow(QMainWindow):
                 text, kind = self.msgq.get_nowait()
             except queue.Empty:
                 break
-            self.bot.add_log(text, kind)
-            try:
-                self.logf.write(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S}  {text}\n")
-                self.logf.flush()
-            except Exception:
-                pass
+            if text:
+                self.bot.add_log(text, kind)
+                try:
+                    self.logf.write(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S}  {text}\n")
+                    self.logf.flush()
+                except Exception:
+                    pass
             changed = True
         # Ook zonder nieuwe logregels elke 5 s verversen, zodat live waarden (ook van kopieën) meelopen.
         if self.engine is not None and self.engine.running and time.time() - getattr(self, "_last_refresh", 0) > 5:
