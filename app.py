@@ -1129,6 +1129,33 @@ class CopyPage(QWidget):
                 self.find_status.setText("Klaar. Bovenaan per naam staat de beste match: de meeste treffers en een "
                                          "accountwaarde die het dichtst bij Invo ligt. Dubbelklik om toe te voegen.")
 
+    def show_proposals(self):
+        """Voorstellen die Claude via de claude-map heeft klaargezet: onderaan de gevonden-tabel, niet aangevinkt."""
+        try:
+            import claude_link
+            props = claude_link.load_proposals()
+        except Exception:
+            return
+        have = {self.found.item(r, 1).text().lower() for r in range(self.found.rowCount()) if self.found.item(r, 1)}
+        text = self.traders.toPlainText().lower()
+        new = [p for p in props if p["address"] not in have and p["address"] not in text]
+        if not new:
+            return
+        for p in new:
+            r = self.found.rowCount()
+            self.found.insertRow(r)
+            acc = p.get("account_invo")
+            vals = [p["name"], p["address"], "Claude", "", f"{acc:,.0f}" if isinstance(acc, (int, float)) else "",
+                    p["style"], "voorstel Claude: " + (p.get("reden") or "")]
+            for c, v in enumerate(vals):
+                self.found.setItem(r, c, QTableWidgetItem(str(v)))
+            it = self.found.item(r, 0)
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+            it.setCheckState(Qt.Unchecked)
+        self.find_status.setText(f"Claude heeft {len(new)} voorstel(len) klaargezet: "
+                                 + ", ".join("@" + p["name"] for p in new)
+                                 + ". Vink aan en klik op 'Aangevinkte toevoegen' als je akkoord bent.")
+
     def _add_found(self, r, _c):
         self._add_rows([r])
 
@@ -1168,6 +1195,11 @@ class CopyPage(QWidget):
             text = (text + "\n" if text else "") + f"{addr} {name} {style}"
             added.append(name)
         self.traders.setPlainText(text)
+        try:
+            import claude_link
+            claude_link.remove_proposals([self.found.item(r, 1).text() for r in rows if self.found.item(r, 1)])
+        except Exception:
+            pass
         if (added or already) and not self.on.isChecked():
             self.on.setChecked(True)          # droog, dus veilig: anders gebeurt er niets
         self.save()
@@ -1980,6 +2012,15 @@ class MainWindow(QMainWindow):
         except Exception:
             self.jobs = None
 
+        # Claude-map: Claude kan zoeken en opvragen, en voorstellen klaarzetten. Niets aan handelen of keys.
+        self.propq = queue.Queue()
+        try:
+            from claude_link import ClaudeLink
+            self.link = ClaudeLink(on_proposal=self.propq.put, log=self.log)
+        except Exception:
+            self.link = None
+        self.cp.show_proposals()
+
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
         self.timer.start(500)
@@ -2017,6 +2058,10 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
             changed = True
+        if not self.propq.empty():
+            while not self.propq.empty():
+                self.propq.get_nowait()
+            self.cp.show_proposals()
         # Ook zonder nieuwe logregels elke 5 s verversen, zodat live waarden (ook van kopieën) meelopen.
         if self.engine is not None and self.engine.running and time.time() - getattr(self, "_last_refresh", 0) > 5:
             changed = True
