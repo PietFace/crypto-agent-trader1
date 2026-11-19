@@ -1084,7 +1084,9 @@ class CopyPage(QWidget):
                             rows.append([n, c["address"], f"{c['matches']} van {c['of']}",
                                          f"{c['account']:,.0f}" if c["account"] else "?",
                                          f"{fp['account']:,}" if fp.get("account") else "verborgen", fp["style"],
-                                         ("bot?" if c["bot"] else (conf if j == 0 else "alternatief"))])
+                                         ("bot?" if c["bot"] else
+                                          "kopieerder (volgt later/klein account)" if c.get("copier") else
+                                          (conf if j == 0 else "alternatief"))])
                     self._q.put(("rows", list(rows)))
                 best_of = {}
                 for n, (res, conf) in found.items():

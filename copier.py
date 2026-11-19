@@ -242,6 +242,11 @@ class CopyEngine:
         if self.live():
             self.sync_kraken()
         mine = self.positions()
+        followed = {t["address"] for t in self.traders}
+        for coin, pos in list(mine.items()):
+            if pos["trader"] not in followed:   # trader uit de lijst gehaald: zijn kopie ook sluiten
+                self.close(coin, f"{pos['trader_name']} wordt niet meer gevolgd")
+                mine.pop(coin, None)
         for t in self.traders:
             try:
                 st = trader_state(t["address"])
@@ -565,15 +570,17 @@ def find_trader(trades, cache_dir, days=60, tol_pct=0.05, account=None, progress
     want = [(str(c).upper(), float(p)) for c, p in trades]
     coins = {c for c, _ in want}
     best = {}      # (user, k) -> kleinste verschil in %
+    when = {}      # (user, k) -> tijd (s) van die fill: het origineel is altijd de eerste, kopieerders volgen
     nfills = {}    # user -> aantal fills in de periode (hoge aantallen = bot)
     today = datetime.now(timezone.utc).date()
 
-    def check(user, coin, px):
+    def check(user, coin, px, t=None):
         for k, (c, p) in enumerate(want):
             if coin == c and p:
                 diff = abs(px - p) / p * 100
                 if diff <= tol_pct and diff < best.get((user, k), 99):
                     best[(user, k)] = diff
+                    when[(user, k)] = t
 
     for i in range(days):
         d = (today - timedelta(days=i)).strftime("%Y%m%d")
@@ -587,8 +594,9 @@ def find_trader(trades, cache_dir, days=60, tol_pct=0.05, account=None, progress
             nfills[user] = nfills.get(user, 0) + 1
             if coin not in coins:
                 continue
-            check(user, coin, px)
-            groups.setdefault((user, coin), []).append((_ts(ts), px, sz))
+            t = _ts(ts)
+            check(user, coin, px, t)
+            groups.setdefault((user, coin), []).append((t, px, sz))
         # gemiddelde prijs van fills die bij elkaar horen (binnen 2 minuten)
         for (user, coin), fl in groups.items():
             if len(fl) < 2:
@@ -602,21 +610,30 @@ def find_trader(trades, cache_dir, days=60, tol_pct=0.05, account=None, progress
                 if len(run) > 1:
                     q = sum(x[2] for x in run)
                     if q > 0:
-                        check(user, coin, sum(x[1] * x[2] for x in run) / q)
+                        check(user, coin, sum(x[1] * x[2] for x in run) / q, run[0][0])
                 if f is not None:
                     run = [f]
     per_user = {}
     for (u, k), diff in best.items():
         per_user.setdefault(u, {})[k] = diff
     need = min(len(want), 2)
+    # Per vingerafdruk-trade: wie deed hem het EERST? Kopieerders (Mimic Trade) zitten seconden tot minuten later.
+    first = {}
+    for (u, k), t in when.items():
+        if t is not None and u in per_user and len(per_user[u]) >= need:
+            first[k] = min(first.get(k, t), t)
     cands = []
     for u, ks in per_user.items():
         if len(ks) < need:
             continue
+        lags = [when[(u, k)] - first[k] for k in ks if when.get((u, k)) is not None and k in first]
+        lag = sorted(lags)[len(lags) // 2] if lags else None
         bot = nfills.get(u, 0) > 300 * days      # meer dan ~300 trades per dag
         cands.append({"address": u, "matches": len(ks), "of": len(want), "diff": sum(ks.values()) / len(ks),
-                      "fills": nfills.get(u, 0), "bot": bot, "account": None})
-    cands.sort(key=lambda c: (c["bot"], -c["matches"], c["diff"]))
+                      "fills": nfills.get(u, 0), "bot": bot, "account": None, "lag_s": lag,
+                      "copier": lag is not None and lag > 2})
+    cands.sort(key=lambda c: (c["bot"], -c["matches"], c["copier"], c["lag_s"] if c["lag_s"] is not None else 1e9,
+                              c["diff"]))
     out = cands[:8]
     for c in out:
         try:
@@ -624,17 +641,19 @@ def find_trader(trades, cache_dir, days=60, tol_pct=0.05, account=None, progress
         except Exception:
             pass
     if account:
-        # Bij gelijke treffers: de accountwaarde die het dichtst bij Invo ligt wint.
-        out.sort(key=lambda c: (c["bot"], -c["matches"], abs((c["account"] or 0) - account) / account + c["diff"]))
-        if confidence(out) != "zeker":
-            try:
-                extra = find_by_account(trades, account, cache_dir, tol_pct=tol_pct, progress=progress)
-            except Exception:
-                extra = []
-            seen = {c["address"] for c in out}
-            out = [c for c in extra if c["address"] not in seen] + out
-            out.sort(key=lambda c: (c["bot"], -c["matches"],
-                                    abs((c["account"] or 0) - account) / account + c["diff"]))
+        # Live Portfolio's handelen vaak buiten Invo om: altijd ook op accountwaarde zoeken. Een kandidaat met een
+        # account dat veel kleiner is dan op Invo is vrijwel zeker een kopieerder, niet het origineel.
+        try:
+            extra = find_by_account(trades, account, cache_dir, tol_pct=tol_pct, progress=progress)
+        except Exception:
+            extra = []
+        seen = {c["address"] for c in out}
+        out = [dict(c, lag_s=0, copier=False) for c in extra if c["address"] not in seen] + out
+        for c in out:
+            if c["account"] is not None and c["account"] < 0.3 * account:
+                c["copier"] = True
+        out.sort(key=lambda c: (c["bot"], c["copier"], -c["matches"],
+                                abs((c["account"] or 0) - account) / account + c["diff"]))
     return out
 
 
@@ -680,8 +699,9 @@ def confidence(res):
         return None
     b = res[0]
     second = res[1] if len(res) > 1 else None
-    clear_lead = not second or second["matches"] < b["matches"] or second["diff"] > b["diff"] * 3
-    if b["bot"]:
+    clear_lead = (not second or second.get("copier") or second["matches"] < b["matches"]
+                  or second["diff"] > b["diff"] * 3)
+    if b["bot"] or b.get("copier"):
         return "twijfel"
     if b["matches"] >= 3 and clear_lead:
         return "zeker"
