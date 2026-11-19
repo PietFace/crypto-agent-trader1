@@ -469,8 +469,15 @@ FILLS_URL = "https://stats-data.hyperliquid.xyz/Mainnet/builder_fills/{b}/{d}.cs
 # Trades zoals ze op Invo-profielen stonden (18 nov 2026): munt + uitstapprijs in USD.
 # Accountwaarde ($) als die op het profiel zichtbaar was; helpt kopieerders uit te sluiten.
 FINGERPRINTS = {
-    "blackstallion": {"style": "lang", "account": 685079, "trades": [
-        ("OP", 0.1176198), ("UNI", 6.8216759), ("XRP", 1.3573416), ("ENS", 5.5822016)]},
+    "blackstallion": {"style": "lang", "account": 684499, "trades": [
+        ("BTC", 63375.00), ("ETH", 1797.60), ("OP", 0.1176198), ("UNI", 6.8216759), ("XRP", 1.3573416),
+        ("ENS", 5.5822016)]},
+    # Toegevoegd 19 nov (gelezen van de Invo-profielen; Closed-tab, uitstap- en instapprijzen)
+    "missed": {"style": "lang", "account": 20748076, "trades": [
+        ("VVV", 20.25), ("MEGA", 0.0492592), ("AVAX", 7.1935013), ("XMR", 490.66), ("AAVE", 127.70)]},
+    "ka5h": {"style": "kort", "account": None, "trades": [
+        ("JUP", 0.272275), ("INIT", 0.10983), ("APE", 0.08106), ("ME", 0.03853), ("ANIME", 0.002148),
+        ("SOPH", 0.001043)]},
     "amber_one": {"style": "lang", "account": 115186, "trades": [
         ("NEAR", 3.1442057), ("VVV", 19.75), ("HYPE", 86.57), ("SUI", 1.0499074), ("VVV", 22.72)]},
     "bravo": {"style": "lang", "account": 48889, "trades": [
@@ -481,8 +488,9 @@ FINGERPRINTS = {
         ("NEAR", 3.285), ("XMR", 498.63), ("JUP", 0.25617), ("JUP", 0.25929), ("ZRO", 1.4564)]},
     "retrace": {"style": "kort", "account": None, "trades": [
         ("BTC", 63691.50), ("BTC", 64190.00), ("BTC", 64282.00), ("BTC", 63866.00), ("BTC", 63920.00)]},
-    "johndrockefeller": {"style": "kort", "account": 5627041, "trades": [
-        ("BTC", 63219.99), ("BTC", 63200.00), ("BTC", 63460.03), ("BTC", 63903.00), ("BTC", 64439.00)]},
+    "johndrockefeller": {"style": "kort", "account": 5353645, "trades": [
+        ("BTC", 63565.00), ("BTC", 63550.00), ("BTC", 62906.00), ("BTC", 62100.00), ("BTC", 63539.47),
+        ("BTC", 63079.81)]},
     "apx": {"style": "kort", "account": None, "trades": [
         ("BTC", 63071.00), ("BTC", 64421.50), ("ETH", 1823.30), ("BTC", 64886.00), ("SOL", 74.98)]},
     "suv": {"style": "kort", "account": None, "trades": [
