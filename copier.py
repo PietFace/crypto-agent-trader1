@@ -220,7 +220,7 @@ class CopyEngine:
         every = max(2, int(self.cfg.get("interval_s", 5)))
         names = ", ".join(t["name"] for t in self.traders) or "(nog geen traders)"
         self.e.log(f"Kopieer-modus {'LIVE' if self.live() else 'droog'}: elke {every} s kijken naar {names}. "
-                   f"Budget €{self.budget():.0f}, max verlies €{self.e.rules['max_loss_per_trade_eur']} per trade, "
+                   f"Budget €{self.budget():.0f}, max verlies €{self.max_loss():.2f} per kopie, "
                    f"hefboom max {self.cfg.get('max_leverage', 10)}x. Alleen nieuwe posities worden gekopieerd.",
                    "info")
         while not self._stop.is_set():
@@ -276,6 +276,11 @@ class CopyEngine:
             return con.execute("SELECT COALESCE(SUM(pnl_eur),0) FROM copy_trades WHERE closed LIKE ?",
                                (day,)).fetchone()[0]
 
+    def max_loss(self):
+        """Eigen max verlies per kopie; anders dat van de gewone bot."""
+        v = self.cfg.get("max_loss_eur")
+        return float(v) if v else float(self.e.rules["max_loss_per_trade_eur"])
+
     def budget(self):
         import settings
         return settings.budgets(self.e.cfg)[1]
@@ -317,7 +322,7 @@ class CopyEngine:
         # Grootte zoals bij de gewone bot: terugrekenen vanuit het max verlies per trade (incl. kosten),
         # begrensd door 'max per aankoop' x hefboom en door wat er nog vrij is in het kopieer-budget.
         fee2 = 2 * kraken.TAKER_FEE_PCT / 100
-        by_risk = float(rules["max_loss_per_trade_eur"]) / (stop_pct / 100 + fee2)
+        by_risk = self.max_loss() / (stop_pct / 100 + fee2)
         room = self.budget_room()
         notional = min(by_risk, float(rules["max_trade_eur"]) * lev, max(0.0, room) * lev)
         why = ("max verlies per trade" if notional == by_risk else

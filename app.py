@@ -769,6 +769,11 @@ class CopyPage(QWidget):
         self.stake = QDoubleSpinBox(); self.stake.setRange(2, 500); self.stake.setPrefix("€ ")   # oud, niet meer gebruikt
         self.budget_info = lab("", "sub", wrap=True)
         f.addRow("Budget en risico", self.budget_info)
+        self.maxloss = QDoubleSpinBox(); self.maxloss.setRange(0.5, 100); self.maxloss.setSingleStep(0.5)
+        self.maxloss.setPrefix("€ ")
+        self.maxloss.setToolTip("Hoeveel een kopie maximaal mag kosten als de noodstop geraakt wordt. "
+                                "Hieruit rekent de bot de positiegrootte terug. Los van de gewone bot.")
+        f.addRow("Max verlies per kopie", self.maxloss)
         self.maxlev = QSpinBox(); self.maxlev.setRange(1, 10); self.maxlev.setSuffix("x")
         f.addRow("Hefboom max", self.maxlev)
         self.maxpos = QSpinBox(); self.maxpos.setRange(1, 20)
@@ -780,7 +785,7 @@ class CopyPage(QWidget):
         f.addRow("Noodstop korte traders", self.stop_k)
         self.hint = lab("", "hint", wrap=True)
         f.addRow("", self.hint)
-        for w in (self.stake, self.maxlev, self.stop_l, self.stop_k):
+        for w in (self.stake, self.maxlev, self.stop_l, self.stop_k, self.maxloss):
             w.valueChanged.connect(self._update_hint)
         v.addWidget(g)
 
@@ -859,6 +864,7 @@ class CopyPage(QWidget):
         self.live.setChecked(bool(c.get("live")))
         self.every.setValue(int(c.get("interval_s", d["interval_s"])))
         self.rt.setChecked(bool(c.get("realtime", True)))
+        self.maxloss.setValue(float(c.get("max_loss_eur") or d["max_loss_eur"]))
         self.stake.setValue(float(c.get("eur_per_trade", d["eur_per_trade"])))
         self.maxlev.setValue(int(c.get("max_leverage", d["max_leverage"])))
         self.maxpos.setValue(int(c.get("max_positions", d["max_positions"])))
@@ -880,6 +886,7 @@ class CopyPage(QWidget):
                                 "style": style})
         self.win.cfg["copy"] = {
             "enabled": self.on.isChecked(), "live": self.live.isChecked(), "realtime": self.rt.isChecked(),
+            "max_loss_eur": round(self.maxloss.value(), 2),
             "interval_s": self.every.value(),
             "eur_per_trade": round(self.stake.value(), 2), "max_leverage": self.maxlev.value(),
             "max_positions": self.maxpos.value(), "daily_loss_eur": round(self.dayloss.value(), 2),
@@ -896,11 +903,10 @@ class CopyPage(QWidget):
         r = cfg["rules"]
         bot_b, copy_b = settings.budgets(cfg)
         lev = self.maxlev.value()
-        ml = float(r["max_loss_per_trade_eur"])
+        ml = self.maxloss.value()
         self.budget_info.setText(
             f"Kopieer-budget €{copy_b:.0f} van totaal €{float(r['budget_eur']):.0f} (in te stellen bij Instellingen). "
-            f"Zelfde regels als de gewone bot: max €{ml:.2f} verlies per trade en één daglimiet van "
-            f"€{float(r['daily_loss_limit_eur']):.2f} voor alles samen.")
+            f"Eén daglimiet van €{float(r['daily_loss_limit_eur']):.2f} voor gewone bot en kopiëren samen.")
         def size(stop):
             st = min(stop, 80 / lev)
             return min(ml / (st / 100 + 0.001), float(r["max_trade_eur"]) * lev), st
