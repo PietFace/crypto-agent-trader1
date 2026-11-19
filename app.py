@@ -818,6 +818,23 @@ class CopyPage(QWidget):
         row.addWidget(self.find_btn)
         row.addStretch(1)
         v.addLayout(row)
+        own = QHBoxLayout()
+        self.own_name = QLineEdit(); self.own_name.setPlaceholderText("naam, bijv. apx")
+        self.own_name.setMaximumWidth(150)
+        own.addWidget(self.own_name)
+        self.own_trades = QLineEdit()
+        self.own_trades.setPlaceholderText("eigen trades van het Invo-profiel (Closed): munt prijs; munt prijs; … "
+                                           "bijv. BTC 63071; ETH 1823.30; SOL 74.98")
+        own.addWidget(self.own_trades, 1)
+        self.own_acct = QLineEdit(); self.own_acct.setPlaceholderText("account $ (als zichtbaar)")
+        self.own_acct.setMaximumWidth(170)
+        own.addWidget(self.own_acct)
+        self.own_style = QComboBox(); self.own_style.addItems(["lang", "kort"])
+        own.addWidget(self.own_style)
+        v.addLayout(own)
+        v.addWidget(lab("Vul je eigen trades in om iemand te (her)zoeken; dan wordt de lijst hierboven genegeerd. "
+                        "Gebruik afgesloten trades van gisteren of eerder: Hyperliquid publiceert de Invo-bestanden "
+                        "pas na afloop van een dag. Hoe exacter de prijzen (alle decimalen), hoe beter.", "hint", wrap=True))
         self.find_status = lab("", "sub", wrap=True)
         v.addWidget(self.find_status)
         self.found = table(["Invo-naam", "Adres", "Treffers", "Account $ nu", "Account $ op Invo", "Stijl", "Zekerheid"])
@@ -937,10 +954,47 @@ class CopyPage(QWidget):
             self.live.setChecked(False)
 
     # --- vingerafdruk
+    def _own_fingerprint(self):
+        """Eigen vingerafdruk uit de invulvelden, of None."""
+        text = self.own_trades.text().strip()
+        if not text:
+            return None
+        trades = []
+        for part in text.replace("\n", ";").split(";"):
+            bits = part.split()
+            if len(bits) >= 2:
+                num = bits[1].replace("$", "").replace("_", "")
+                if "," in num and "." in num:      # 63,871.50 (Invo-notatie)
+                    num = num.replace(",", "")
+                elif "," in num:                   # 1823,30 (Nederlandse notatie)
+                    num = num.replace(",", ".")
+                try:
+                    trades.append((bits[0].upper(), float(num)))
+                except ValueError:
+                    pass
+        if len(trades) < 2:
+            self.find_status.setText("Vul minstens 2 trades in, bijv. 'BTC 63071; ETH 1823.30'.")
+            return False
+        acct = None
+        try:
+            acct = float(self.own_acct.text().replace("$", "").replace(".", "").replace(",", "").strip() or 0) or None
+        except ValueError:
+            acct = None
+        name = (self.own_name.text().strip().lstrip("@") or "eigen").replace(" ", "_")
+        return name, {"style": self.own_style.currentText(), "account": acct, "trades": trades}
+
     def find(self):
         import copier
-        name = self.fp.currentText()
-        names = list(copier.FINGERPRINTS) if name.startswith("Alle") else [name]
+        own = self._own_fingerprint()
+        if own is False:
+            return
+        fps = dict(copier.FINGERPRINTS)
+        if own:
+            fps = {own[0]: own[1]}
+            names = [own[0]]
+        else:
+            name = self.fp.currentText()
+            names = list(copier.FINGERPRINTS) if name.startswith("Alle") else [name]
         self.find_btn.setEnabled(False)
         self.found.setRowCount(0)
 
@@ -949,7 +1003,7 @@ class CopyPage(QWidget):
             found = {}
             try:
                 for n in names:
-                    fp = copier.FINGERPRINTS[n]
+                    fp = fps[n]
                     res = copier.find_trader(fp["trades"], settings.data_dir(), account=fp.get("account"),
                                              progress=lambda t, n=n: self._q.put(("msg", f"@{n}: {t}")))
                     conf = copier.confidence(res)
