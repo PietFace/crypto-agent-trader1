@@ -6,6 +6,7 @@ geen extra aanroepen, geen extra kosten.
 Overzicht bekijken:  python kosten.py
 """
 import sqlite3
+import dbutil
 import sys
 from datetime import datetime, timezone
 
@@ -34,7 +35,7 @@ def log_usage(agent, model, usage, db_path=DB_PATH):
     try:
         tin = int(getattr(usage, "input_tokens", 0) or 0)
         tout = int(getattr(usage, "output_tokens", 0) or 0)
-        with sqlite3.connect(db_path) as con:
+        with dbutil.connect(db_path) as con:
             con.execute(
                 "CREATE TABLE IF NOT EXISTS api_usage(id INTEGER PRIMARY KEY, ts TEXT, agent TEXT, "
                 "model TEXT, input_tokens INTEGER, output_tokens INTEGER, usd REAL)"
@@ -49,7 +50,7 @@ def log_usage(agent, model, usage, db_path=DB_PATH):
 
 
 def report(db_path=DB_PATH):
-    con = sqlite3.connect(db_path)
+    con = dbutil.connect(db_path)
     try:
         first, last, n, usd = con.execute(
             "SELECT MIN(ts), MAX(ts), COUNT(*), COALESCE(SUM(usd),0) FROM api_usage"

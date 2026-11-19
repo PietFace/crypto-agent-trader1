@@ -11,6 +11,7 @@ import json
 import math
 import os
 import sqlite3
+import dbutil
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -174,7 +175,7 @@ def rsi(closes, n=14):
 
 
 def init_db(path):
-    with sqlite3.connect(path) as con:
+    with dbutil.connect(path) as con:
         con.executescript("""
         CREATE TABLE IF NOT EXISTS positions(
             market TEXT PRIMARY KEY, amount REAL, entry_price REAL, cost_eur REAL, opened TEXT);
@@ -229,7 +230,7 @@ def reset_history(db_path):
     Weigert als er nog echte posities open staan. Geeft het pad van de reservekopie."""
     import shutil
     init_db(db_path)
-    with sqlite3.connect(db_path) as con:
+    with dbutil.connect(db_path) as con:
         real = 0
         for t in ("positions", "short_positions", "copy_positions"):
             real += con.execute(f"SELECT COUNT(*) FROM {t} WHERE COALESCE(echt,0)=1").fetchone()[0]
@@ -239,7 +240,7 @@ def reset_history(db_path):
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     backup = os.path.join(os.path.dirname(db_path), f"trader-reserve-{stamp}.db")
     shutil.copyfile(db_path, backup)
-    with sqlite3.connect(db_path) as con:
+    with dbutil.connect(db_path) as con:
         for t in RESET_TABLES:
             con.execute(f"DELETE FROM {t}")
         con.execute(f"DELETE FROM meta WHERE key IN ({','.join('?' * len(RESET_META))})", RESET_META)
@@ -434,7 +435,7 @@ class Engine:
 
     # ---------- database ----------
     def db(self):
-        con = sqlite3.connect(self.db_path)
+        con = dbutil.connect(self.db_path)
         con.row_factory = sqlite3.Row
         return con
 

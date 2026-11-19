@@ -3,6 +3,7 @@ import datetime
 import os
 import queue
 import sqlite3
+import dbutil
 import sys
 import threading
 import time
@@ -90,7 +91,7 @@ def card():
 
 def query(sql, args=()):
     try:
-        con = sqlite3.connect(settings.db_path())
+        con = dbutil.connect(settings.db_path())
         try:
             return con.execute(sql, args).fetchall()
         finally:
@@ -494,7 +495,7 @@ class OverviewPage(QWidget):
         fill(self.shorts, rows)
 
         try:
-            con = sqlite3.connect(settings.db_path())
+            con = dbutil.connect(settings.db_path())
             stats = {b: risk_gate.book_stats(con, b) for b in ("long", "short")}
             for b in ("long", "short"):
                 stats[b]["per_bron"] = {br: risk_gate.book_stats(con, b, br) for br in ("regels", "volgers", "beide")}

@@ -19,6 +19,7 @@ import glob
 import json
 import os
 import sqlite3
+import dbutil
 import sys
 import threading
 import time
@@ -62,7 +63,7 @@ def remove_proposals(addresses):
 
 def _rows(db, sql):
     try:
-        con = sqlite3.connect(db)
+        con = dbutil.connect(db)
         con.row_factory = sqlite3.Row
         out = [dict(r) for r in con.execute(sql).fetchall()]
         con.close()

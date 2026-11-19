@@ -12,6 +12,7 @@ Geen AI, geen kosten: alleen openbare gegevens. Alleen kijken, nooit kopiëren.
 import json
 import os
 import sqlite3
+import dbutil
 import time
 from datetime import datetime, timezone
 
@@ -242,12 +243,12 @@ class Followers:
         self.log = log
         self.last_refresh = 0.0
         self.seen = set()
-        with sqlite3.connect(db_path) as con:
+        with dbutil.connect(db_path) as con:
             init_db(con)
 
     # ---- welke traders
     def traders(self):
-        with sqlite3.connect(self.db_path) as con:
+        with dbutil.connect(self.db_path) as con:
             con.row_factory = sqlite3.Row
             return [dict(r) for r in con.execute("SELECT * FROM follower_traders ORDER BY month_roi DESC")]
 
@@ -302,7 +303,7 @@ class Followers:
                     chosen.append((r, "leaderboard"))
         if not chosen:
             return self.traders()
-        with sqlite3.connect(self.db_path) as con:
+        with dbutil.connect(self.db_path) as con:
             keep = [r["address"].lower() for r, _ in chosen]
             con.execute("DELETE FROM follower_traders WHERE lower(address) NOT IN (%s)" % ",".join("?" * len(keep)), keep)
             con.execute("DELETE FROM follower_positions WHERE lower(address) NOT IN (%s)" % ",".join("?" * len(keep)), keep)
@@ -324,7 +325,7 @@ class Followers:
         coins = {c.upper() for c in coins}
         traders = self.choose()
         events, errors = [], 0
-        with sqlite3.connect(self.db_path) as con:
+        with dbutil.connect(self.db_path) as con:
             con.row_factory = sqlite3.Row
             for t in traders:
                 addr = t["address"]
@@ -369,7 +370,7 @@ class Followers:
     def consensus(self, coin, min_notional=1000):
         """Per munt: hoeveel gevolgde traders long/short staan en een score van -1 (allemaal short) tot 1."""
         coin = coin.upper()
-        with sqlite3.connect(self.db_path) as con:
+        with dbutil.connect(self.db_path) as con:
             rows = con.execute("SELECT p.address, p.side, p.notional, p.leverage, p.since, p.entry, p.upnl, "
                                "t.name, t.account_value FROM follower_positions p "
                                "JOIN follower_traders t ON t.address=p.address "
