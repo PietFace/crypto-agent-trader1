@@ -76,6 +76,29 @@ def trader_state(address, timeout=10):
     return {"account": acct, "positions": pos}
 
 
+def spot_usdc(address, timeout=10):
+    """USDC in het spot-deel. Wie geen open posities heeft, zet zijn geld vaak daar; dan is de perps-account $0."""
+    r = _http.post(INFO_URL, json={"type": "spotClearinghouseState", "user": address}, timeout=timeout)
+    r.raise_for_status()
+    for b in (r.json() or {}).get("balances") or []:
+        if b.get("coin") in ("USDC", "USDH", "USDT0"):
+            try:
+                return float(b.get("total") or 0)
+            except (TypeError, ValueError):
+                pass
+    return 0.0
+
+
+def total_value(address):
+    """Perps-account + spot-USDC: de waarde die Invo ongeveer laat zien."""
+    v = trader_state(address)["account"]
+    try:
+        v += spot_usdc(address)
+    except Exception:
+        pass
+    return v
+
+
 def trader_style(address, short_hours=4.0, timeout=15):
     """Lang of kort, bepaald uit zijn eigen recente trades op Hyperliquid (tot 2000 fills).
     Geeft (stijl, mediane houdtijd in uren, aantal afgesloten posities). Te weinig gegevens: 'lang'."""
@@ -637,15 +660,17 @@ def find_trader(trades, cache_dir, days=60, tol_pct=0.05, account=None, progress
     out = cands[:8]
     for c in out:
         try:
-            c["account"] = trader_state(c["address"])["account"]
+            c["account"] = total_value(c["address"])
         except Exception:
             pass
+        time.sleep(0.5)
     if account:
         # Live Portfolio's handelen vaak buiten Invo om: altijd ook op accountwaarde zoeken. Een kandidaat met een
         # account dat veel kleiner is dan op Invo is vrijwel zeker een kopieerder, niet het origineel.
         try:
             extra = find_by_account(trades, account, cache_dir, tol_pct=tol_pct, progress=progress)
-        except Exception:
+        except Exception as e:
+            LAST_DIAG["fout"] = str(e)
             extra = []
         seen = {c["address"] for c in out}
         out = [dict(c, lag_s=0, copier=False) for c in extra if c["address"] not in seen] + out
@@ -657,7 +682,36 @@ def find_trader(trades, cache_dir, days=60, tol_pct=0.05, account=None, progress
     return out
 
 
-def find_by_account(trades, account, cache_dir, tol_acct=0.05, tol_pct=0.05, max_check=40,
+LAST_DIAG = {}
+
+
+def _post_retry(payload, timeout=15, tries=4):
+    """Hyperliquid geeft 429 als we te snel vragen: dan even wachten en opnieuw."""
+    for i in range(tries):
+        r = _http.post(INFO_URL, json=payload, timeout=timeout)
+        if r.status_code == 429:
+            time.sleep(15 * (i + 1))
+            continue
+        r.raise_for_status()
+        return r.json()
+    raise RuntimeError("Hyperliquid blijft 'te veel verzoeken' geven")
+
+
+def fills_since(address, days=60, max_pages=5):
+    """Alle fills van de laatste dagen (userFills geeft er maar 2000; grote traders zitten daar snel overheen)."""
+    start = int((time.time() - days * 86400) * 1000)
+    out = []
+    for _ in range(max_pages):
+        fl = _post_retry({"type": "userFillsByTime", "user": address, "startTime": start}) or []
+        out += fl
+        if len(fl) < 2000:
+            break
+        start = max(f.get("time", 0) for f in fl) + 1
+        time.sleep(1)
+    return out
+
+
+def find_by_account(trades, account, cache_dir, tol_acct=0.10, tol_pct=0.05, max_check=40,
                     progress=lambda t: None):
     """Voor 'Live Portfolio's op Invo: die handelen vaak rechtstreeks op Hyperliquid (niet via Invo), dus ze staan
     niet in Invo's builder-bestanden. Wel zien we hun accountwaarde. Zoek in het leaderboard naar accounts met
@@ -669,11 +723,14 @@ def find_by_account(trades, account, cache_dir, tol_acct=0.05, tol_pct=0.05, max
     near.sort(key=lambda r: abs(r["account_value"] - account))
     want = [(str(c).upper(), float(p)) for c, p in trades]
     out = []
+    LAST_DIAG.update({"leaderboard": len(rows), "accounts_in_buurt": len(near), "gecontroleerd": 0, "fouten": 0})
     for i, r in enumerate(near[:max_check]):
         progress(f"Account {i + 1}/{min(len(near), max_check)} met ongeveer ${account:,.0f} controleren…")
         try:
-            fl = _http.post(INFO_URL, json={"type": "userFills", "user": r["address"]}, timeout=15).json() or []
+            fl = fills_since(r["address"])
+            LAST_DIAG["gecontroleerd"] += 1
         except Exception:
+            LAST_DIAG["fouten"] += 1
             continue
         ks = {}
         for f in fl:
@@ -688,7 +745,7 @@ def find_by_account(trades, account, cache_dir, tol_acct=0.05, tol_pct=0.05, max
             out.append({"address": r["address"].lower(), "matches": len(ks), "of": len(want),
                         "diff": sum(ks.values()) / len(ks), "fills": len(fl), "bot": False,
                         "account": r["account_value"]})
-        time.sleep(0.2)
+        time.sleep(1.2)
     out.sort(key=lambda c: (-c["matches"], c["diff"]))
     return out
 

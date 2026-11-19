@@ -8,6 +8,7 @@ Opdrachten:
   {"type": "zoek", "name": "missed", "trades": [["BTC", 63071.0], ...], "account": 20748076, "style": "lang"}
   {"type": "posities", "addresses": ["0x...", ...]}
   {"type": "status"}
+  {"type": "info", "requests": [{"type": "portfolio", "user": "0x..."}]}   (alleen openbare leesverzoeken)
   {"type": "voorstel", "name": "missed", "address": "0x...", "style": "lang", "reden": "..."}
 """
 import glob
@@ -80,6 +81,7 @@ def _log_tail(n=300):
 class ClaudeLink:
     def __init__(self, on_proposal=lambda p: None, log=lambda t: None, interval=3):
         self.on_proposal, self.log, self.interval = on_proposal, log, interval
+        self.pause = 20 if interval >= 1 else 0
         self.dir = link_dir()
         self.busy = False
         threading.Thread(target=self._loop, daemon=True).start()
@@ -120,6 +122,8 @@ class ClaudeLink:
             os.remove(busy)
         except Exception:
             pass
+        if job.get("type") in ("zoek", "posities", "info"):
+            time.sleep(self.pause)  # Hyperliquid-limiet laten bijkomen voor de volgende opdracht
 
     def _write(self, stem, data):
         tmp = stem + ".resultaat.tmp"
@@ -138,6 +142,7 @@ class ClaudeLink:
         import copier
         kind = job.get("type")
         if kind == "zoek":
+            copier.LAST_DIAG.clear()
             trades = [(c, float(p)) for c, p in job["trades"]]
             res = copier.find_trader(trades, settings.data_dir(), days=int(job.get("days", 60)),
                                      account=job.get("account"),
@@ -147,23 +152,44 @@ class ClaudeLink:
             for c in res[:6]:
                 try:
                     st = copier.trader_state(c["address"])
-                    c["account"], c["posities"] = st["account"], st["positions"]
+                    c["perps"], c["posities"] = st["account"], st["positions"]
+                    c["spot_usdc"] = copier.spot_usdc(c["address"])
+                    c["account"] = c["perps"] + c["spot_usdc"]
                 except Exception as e:
                     c["posities"] = f"fout: {e}"
                 out.append(c)
+                time.sleep(1)
             try:
                 os.remove(stem + ".voortgang.txt")
             except Exception:
                 pass
-            return {"name": job.get("name"), "zekerheid": conf, "kandidaten": out}
+            return {"name": job.get("name"), "zekerheid": conf, "kandidaten": out,
+                    "account_zoektocht": dict(copier.LAST_DIAG)}
         if kind == "posities":
             out = {}
             for a in job.get("addresses", [])[:30]:
                 try:
                     out[a] = copier.trader_state(a)
+                    out[a]["spot_usdc"] = copier.spot_usdc(a)
                 except Exception as e:
                     out[a] = {"fout": str(e)}
                 time.sleep(0.2)
+            return out
+        if kind == "info":
+            # Alleen openbare Hyperliquid-gegevens opvragen; niets wat iets kan veranderen.
+            allowed = {"clearinghouseState", "spotClearinghouseState", "userFills", "userFillsByTime", "portfolio",
+                       "openOrders", "frontendOpenOrders", "historicalOrders", "userFunding"}
+            out = []
+            for req in job.get("requests", [])[:20]:
+                if req.get("type") not in allowed:
+                    out.append({"fout": f"niet toegestaan: {req.get('type')}"})
+                    continue
+                try:
+                    r = copier._http.post(copier.INFO_URL, json=req, timeout=20)
+                    out.append(r.json())
+                except Exception as e:
+                    out.append({"fout": str(e)})
+                time.sleep(0.5)
             return out
         if kind == "status":
             cfg = settings.load()
