@@ -43,6 +43,9 @@ def init_db(con):
         cost_eur REAL, leverage REAL, entry REAL, exit REAL, trader_entry REAL, trader_exit REAL,
         pnl_eur REAL, pnl_pct REAL, trader_pct REAL, fee_eur REAL, reason TEXT, echt INTEGER DEFAULT 0);
     """)
+    con.execute("""CREATE TABLE IF NOT EXISTS copy_trader_positions(
+        address TEXT, name TEXT, coin TEXT, side TEXT, size REAL, entry REAL, leverage REAL, account REAL,
+        ts TEXT, PRIMARY KEY(address, coin))""")
     cols = [r[1] for r in con.execute("PRAGMA table_info(copy_positions)")]
     for c in ("price_now", "pnl_now"):
         if c not in cols:
@@ -245,6 +248,7 @@ class CopyEngine:
             except Exception as ex:
                 self.e.log(f"Kopieer-modus: {t['name']} niet op te halen ({ex})", "muted")
                 continue
+            self.save_trader_state(t, st)
             now_sides = {c: p["side"] for c, p in st["positions"].items()}
             before = self.known.get(t["address"])
             self.known[t["address"]] = now_sides
@@ -264,6 +268,17 @@ class CopyEngine:
                     if self.open(coin, side, p, t):
                         mine = self.positions()
         self.check_stops()
+
+    def save_trader_state(self, t, st):
+        """Wat de trader nu echt open heeft op Hyperliquid bewaren, zodat je het naast Invo kunt leggen."""
+        ts = now()
+        with self.e.db() as con:
+            con.execute("DELETE FROM copy_trader_positions WHERE address=?", (t["address"],))
+            rows = [(t["address"], t["name"], c, p["side"], p["size"], p["entry"], p["leverage"], st["account"], ts)
+                    for c, p in st["positions"].items()]
+            if not rows:   # ook zonder posities: account en tijd tonen
+                rows = [(t["address"], t["name"], "", "", 0, 0, 0, st["account"], ts)]
+            con.executemany("INSERT OR REPLACE INTO copy_trader_positions VALUES(?,?,?,?,?,?,?,?,?)", rows)
 
     # --- helpers
     def positions(self):

@@ -925,6 +925,14 @@ class CopyPage(QWidget):
                                  "Achterstand", "Beste", "Slechtste"])
         self.per_trader.setMinimumHeight(150)
         v.addWidget(self.per_trader)
+        v.addWidget(lab("CONTROLE: WAT DE GEVOLGDE TRADERS NU OPEN HEBBEN (HYPERLIQUID)", "cap"))
+        v.addWidget(lab("Leg dit naast het tabblad 'Open' op hun Invo-profiel. Zelfde munten, kant, hefboom en (bijna) "
+                        "dezelfde instapprijs = de bot volgt de juiste persoon. Klopt het niet, haal die trader dan weg "
+                        "en zoek hem opnieuw.", "hint", wrap=True))
+        self.tpos = table(["Trader", "Munt", "Kant", "Hefboom", "Instapprijs $", "Positie $", "Account $",
+                           "Bijgewerkt", "Gekopieerd?"])
+        self.tpos.setMinimumHeight(160)
+        v.addWidget(self.tpos)
         v.addWidget(lab("OPEN KOPIEËN", "cap"))
         self.open_t = table(["Geopend", "Munt", "Kant", "Hefboom", "Positie", "Inzet", "Instap", "Koers nu",
                              "Resultaat", "Noodstop", "Trader", "Echt"])
@@ -1210,9 +1218,27 @@ class CopyPage(QWidget):
                          f"{sum(lg) / len(lg):+.1f}%-pt" if lg else "–", eur(max(ps), True), eur(min(ps), True)])
         fill(self.per_trader, rows)
 
+    def _trader_positions(self):
+        mine = {r[0]: (r[1], r[2]) for r in query("SELECT coin, side, trader_name FROM copy_positions")}
+        rows = []
+        for name, coin, side, size, entry, lev, acct, ts in query(
+                "SELECT name, coin, side, size, entry, leverage, account, ts FROM copy_trader_positions "
+                "ORDER BY name, coin"):
+            if not coin:
+                rows.append([name, "geen open posities", "", "", "", "", f"{acct:,.0f}" if acct else "?",
+                             local_time(ts), ""])
+                continue
+            got = mine.get(coin)
+            copied = ("ja" if got and got[0] == side and got[1] == name else
+                      "andere trader" if got else "nee (stond al open bij start, of overgeslagen)")
+            rows.append([name, coin, side, f"{lev:.0f}x", fmt_px(entry or 0), f"{(size or 0) * (entry or 0):,.0f}",
+                         f"{acct:,.0f}" if acct else "?", local_time(ts), copied])
+        fill(self.tpos, rows)
+
     # --- tabellen
     def refresh(self):
         self._update_hint()
+        self._trader_positions()
         rows = []
         for r in query("SELECT opened, coin, side, leverage, cost_eur, entry_price, stop_price, trader_name, echt, "
                        "price_now, pnl_now FROM copy_positions ORDER BY opened DESC"):

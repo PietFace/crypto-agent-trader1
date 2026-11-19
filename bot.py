@@ -1333,6 +1333,9 @@ class Engine:
                     "SELECT closed, coin, side, trader_name, pnl_eur, pnl_pct, trader_pct, fee_eur, reason, echt "
                     "FROM copy_trades ORDER BY id DESC LIMIT 30")]
                 rows = con.execute("SELECT trader_name, pnl_eur, pnl_pct, trader_pct FROM copy_trades").fetchall()
+                tpos = [dict(r) for r in con.execute(
+                    "SELECT name, coin, side, size, entry, leverage, account, ts FROM copy_trader_positions "
+                    "ORDER BY name, coin")]
         except Exception:
             return None
         kr = self.copier.kr if self.copier else self.kr
@@ -1365,7 +1368,7 @@ class Engine:
         return {"enabled": bool(self.copier), "live": bool(self.copier and self.copier.live()),
                 "realtime": bool(self.copier and self.copier.ws_ok),
                 "traders": [t["name"] for t in (self.copier.traders if self.copier else [])],
-                "open": opens, "closed": closed, "per_trader": per_list,
+                "open": opens, "closed": closed, "per_trader": per_list, "trader_positions": tpos,
                 "totals": {"trades": len(rows), "wins": sum(1 for r in rows if (r[1] or 0) > 0), "pnl": round(tot, 2)}}
 
     def follower_snapshot(self):
