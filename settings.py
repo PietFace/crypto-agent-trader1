@@ -18,6 +18,7 @@ DEFAULTS = {
     # Kopieer-modus: gekozen traders 1-op-1 volgen op Kraken. Live alleen als bot live op Kraken staat én "live" aan.
     "copy": {"enabled": False, "live": False, "realtime": True, "max_loss_eur": 5.0, "interval_s": 5, "eur_per_trade": 10, "max_leverage": 10,
              "max_positions": 5, "daily_loss_eur": 10, "stop_pct_lang": 10, "stop_pct_kort": 3, "traders": []},  # alleen deze signalen met echt geld; de rest als schaduwtrade
+    "tape": {"enabled": True, "min_notional": 250, "retention_h": 48},   # trades meeschrijven om traders te vinden
     "markets": ["BTC-EUR", "ETH-EUR", "SOL-EUR", "XRP-EUR"],
     "cycle_minutes": 120,
     "model": "claude-haiku-5-5",

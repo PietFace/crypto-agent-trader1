@@ -8,6 +8,10 @@ Opdrachten:
   {"type": "zoek", "name": "missed", "trades": [["BTC", 63071.0], ...], "account": 20748076, "style": "lang"}
   {"type": "posities", "addresses": ["0x...", ...]}
   {"type": "status"}
+  {"type": "tape", "coin": "BTC", "van": "2026-11-19T18:30:00+01:00", "tot": "2026-11-19T18:35:00+01:00",
+   "richting": "verkoop", "px_min": 63000, "px_max": 63200, "min_bedrag": 1000, "controleer": 10}
+  {"type": "tape_status"}
+  {"type": "leiders", "days": 2}   (wie volgen de Invo-kopieerders? zie tape.leaders)
   {"type": "info", "requests": [{"type": "portfolio", "user": "0x..."}]}   (alleen openbare leesverzoeken)
   {"type": "voorstel", "name": "missed", "address": "0x...", "style": "lang", "reden": "..."}
 """
@@ -79,8 +83,8 @@ def _log_tail(n=300):
 
 
 class ClaudeLink:
-    def __init__(self, on_proposal=lambda p: None, log=lambda t: None, interval=3):
-        self.on_proposal, self.log, self.interval = on_proposal, log, interval
+    def __init__(self, on_proposal=lambda p: None, log=lambda t: None, interval=3, tape=None):
+        self.on_proposal, self.log, self.interval, self.tape = on_proposal, log, interval, tape
         self.pause = 20 if interval >= 1 else 0
         self.dir = link_dir()
         self.busy = False
@@ -93,6 +97,8 @@ class ClaudeLink:
                     base = os.path.basename(path)
                     if base.endswith(".resultaat.json") or base.endswith(".bezig.json"):
                         continue
+                    if time.time() - os.path.getmtime(path) < 1.0:
+                        continue        # wordt misschien nog geschreven
                     self._run(path)
             except Exception:
                 pass
@@ -198,6 +204,32 @@ class ClaudeLink:
                     out.append({"fout": str(e)})
                 time.sleep(0.5)
             return out
+        if kind == "leiders":
+            import tape as tp
+            return tp.leaders(settings.data_dir(), days=int(job.get("days", 2)),
+                              window_s=float(job.get("venster_s", 20)), min_users=int(job.get("min_gebruikers", 3)),
+                              top=int(job.get("top", 40)), progress=lambda t: self._progress(stem, t))
+        if kind == "tape_status":
+            return self.tape.status() if self.tape else {"fout": "meeschrijven staat uit"}
+        if kind == "tape":
+            import tape as tp
+            def ms(v):
+                if isinstance(v, (int, float)):
+                    return int(v)
+                from datetime import datetime
+                return int(datetime.fromisoformat(str(v)).timestamp() * 1000)
+            rows = tp.search(settings.data_dir(), job["coin"], ms(job["van"]), ms(job["tot"]),
+                             direction=job.get("richting"), px_min=job.get("px_min"), px_max=job.get("px_max"),
+                             min_notional=float(job.get("min_bedrag", 0)), limit=int(job.get("max", 40)))
+            for r in rows[:int(job.get("controleer", 0))]:
+                try:
+                    st = copier.trader_state(r["address"])
+                    r["posities"] = st["positions"]
+                    r["account"] = st["account"] + copier.spot_usdc(r["address"])
+                except Exception as e:
+                    r["posities"] = f"fout: {e}"
+                time.sleep(0.5)
+            return {"aantal": len(rows), "trades": rows}
         if kind == "status":
             cfg = settings.load()
             db = settings.db_path()

@@ -26,14 +26,14 @@ jobs:
           pip install -r requirements.txt pyinstaller
 
       - name: Controle (syntax)
-        run: python -m py_compile app.py bot.py settings.py risk_gate.py kosten.py remote.py followers.py backtest.py remote_jobs.py kraken.py copier.py claude_link.py
+        run: python -m py_compile app.py bot.py settings.py risk_gate.py kosten.py remote.py followers.py backtest.py remote_jobs.py kraken.py copier.py claude_link.py tape.py
 
       - name: CryptoTrader.exe bouwen
         run: >
           pyinstaller --noconfirm --onefile --windowed --name CryptoTrader
           --exclude-module tkinter --exclude-module PySide6.QtWebEngineCore --exclude-module PySide6.Qt3DCore
           --exclude-module PySide6.QtQuick --exclude-module PySide6.QtQml --exclude-module PySide6.QtMultimedia
-          --exclude-module PySide6.QtPdf --hidden-import kraken --hidden-import copier --hidden-import claude_link app.py
+          --exclude-module PySide6.QtPdf --hidden-import kraken --hidden-import copier --hidden-import claude_link --hidden-import tape app.py
 
       - name: Downloadpakket maken
         shell: pwsh

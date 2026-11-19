@@ -2016,7 +2016,17 @@ class MainWindow(QMainWindow):
         self.propq = queue.Queue()
         try:
             from claude_link import ClaudeLink
-            self.link = ClaudeLink(on_proposal=self.propq.put, log=self.log)
+            self.tape = None
+            tcfg = self.cfg.get("tape") or {}
+            if tcfg.get("enabled", True):
+                try:
+                    from tape import Tape
+                    self.tape = Tape(settings.data_dir(), tcfg.get("min_notional", 250), tcfg.get("retention_h", 48),
+                                     log=self.log)
+                    self.tape.start()
+                except Exception:
+                    self.tape = None
+            self.link = ClaudeLink(on_proposal=self.propq.put, log=self.log, tape=self.tape)
         except Exception:
             self.link = None
         self.cp.show_proposals()
