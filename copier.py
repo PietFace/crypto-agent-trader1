@@ -361,7 +361,9 @@ class CopyEngine:
             amount = notional / px
         stop = px * (1 - stop_pct / 100) if side == "long" else px * (1 + stop_pct / 100)
         with self.e.db() as con:
-            con.execute("INSERT OR REPLACE INTO copy_positions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            con.execute("INSERT OR REPLACE INTO copy_positions(coin, symbol, side, amount, entry_price, cost_eur, "
+                        "leverage, opened, trader, trader_name, trader_entry, stop_price, ext_stop, echt) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (coin, sym, side, amount, px, notional, lev, now(), t["address"], t["name"],
                          float(their.get("entry") or 0), stop, ext, int(self.live())))
         risk = notional * (stop_pct / 100 + fee2)
