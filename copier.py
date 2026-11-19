@@ -43,6 +43,10 @@ def init_db(con):
         cost_eur REAL, leverage REAL, entry REAL, exit REAL, trader_entry REAL, trader_exit REAL,
         pnl_eur REAL, pnl_pct REAL, trader_pct REAL, fee_eur REAL, reason TEXT, echt INTEGER DEFAULT 0);
     """)
+    cols = [r[1] for r in con.execute("PRAGMA table_info(copy_positions)")]
+    for c in ("price_now", "pnl_now"):
+        if c not in cols:
+            con.execute(f"ALTER TABLE copy_positions ADD COLUMN {c} REAL")
 
 
 # ---------------------------------------------------------------- Hyperliquid
@@ -422,13 +426,17 @@ class CopyEngine:
                           trader=pos["trader_name"])
 
     def check_stops(self):
-        """Noodstop bewaken bij droog draaien (live zit hij bij Kraken zelf)."""
+        """Live waarde bijwerken, en de noodstop bewaken bij droog draaien (live zit hij bij Kraken zelf)."""
         for coin, pos in self.positions().items():
-            if pos["echt"]:
-                continue
             try:
                 px = self.kr.price(pos["symbol"])
             except Exception:
+                continue
+            d = 1 if pos["side"] == "long" else -1
+            pnl = d * (px - pos["entry_price"]) * pos["amount"] - pos["cost_eur"] * kraken.TAKER_FEE_PCT / 100 * 2
+            with self.e.db() as con:
+                con.execute("UPDATE copy_positions SET price_now=?, pnl_now=? WHERE coin=?", (px, pnl, coin))
+            if pos["echt"]:
                 continue
             hit = px <= pos["stop_price"] if pos["side"] == "long" else px >= pos["stop_price"]
             if hit:

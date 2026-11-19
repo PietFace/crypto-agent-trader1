@@ -181,7 +181,7 @@ class BotPage(QWidget):
 
         g = QGridLayout()
         g.setSpacing(12)
-        self.t_bot = StatTile("Bot nu")
+        self.t_bot = StatTile("Totaal nu")
         self.t_btc = StatTile("BTC vasthouden")
         self.t_today = StatTile("Resultaat vandaag")
         self.t_cost = StatTile("API-kosten 30 dagen")
@@ -230,7 +230,8 @@ class BotPage(QWidget):
     def refresh(self):
         cfg = self.win.cfg
         rules = cfg["rules"]
-        budget = float(rules["budget_eur"])
+        budget = float(rules["budget_eur"])          # totaal: gewone bot + kopiëren
+        bot_budget, copy_budget = settings.budgets(cfg)
         kr = cfg.get("exchange") == "kraken"
         live = bool(cfg.get("live")) and (not kr or bool(cfg["keys"].get("kraken_key")))
         where = "KRAKEN" if kr else "BITVAVO"
@@ -256,28 +257,31 @@ class BotPage(QWidget):
 
         b = query("SELECT bot_eur, btc_hold_eur, ts FROM benchmark ORDER BY id DESC LIMIT 1")
         meta = dict(query("SELECT key, value FROM meta WHERE key IN ('btc_price_now','btc_start_price','marks_ts')"))
-        if meta.get("marks_ts"):
-            realized = (query("SELECT COALESCE(SUM(pnl),0) FROM trades WHERE side='sell' AND COALESCE(schaduw,0)=0") or [[0]])[0][0]
-            open_pnl = (query("SELECT COALESCE(SUM(m.pnl_eur),0) FROM position_marks m JOIN positions p "
-                              "ON p.market=m.market WHERE m.book='long' AND COALESCE(p.schaduw,0)=0") or [[0]])[0][0]
-            live_bot = budget + realized + open_pnl
-            live_hold = b[0][1] if b else None
-            try:
-                live_hold = budget * float(meta["btc_price_now"]) / float(meta["btc_start_price"])
-            except Exception:
-                pass
-            b = [(live_bot, live_hold, meta["marks_ts"])]
-        if b:
-            bot_eur, hold, ts = b[0]
-            self.t_bot.set(eur(bot_eur), f"{eur(bot_eur - budget, True)} sinds de start · live {local_time(ts)}",
-                           C["good"] if bot_eur >= budget else C["bad"])
-            if hold is not None:
-                diff = bot_eur - hold
-                self.t_btc.set(eur(hold), f"bot {eur(diff, True)} t.o.v. BTC", None)
-            else:
-                self.t_btc.set("–", "start na de eerste analyse")
+        one = lambda sql: ((query(sql) or [[0]])[0][0] or 0)
+        # Gewone bot: gesloten + open resultaat (long en short, zonder schaduwtrades).
+        bot_res = (one("SELECT COALESCE(SUM(pnl),0) FROM trades WHERE side='sell' AND COALESCE(schaduw,0)=0")
+                   + one("SELECT COALESCE(SUM(m.pnl_eur),0) FROM position_marks m JOIN positions p ON p.market=m.market "
+                         "WHERE m.book='long' AND COALESCE(p.schaduw,0)=0")
+                   + one("SELECT COALESCE(SUM(pnl),0) FROM short_trades WHERE side='cover' AND COALESCE(schaduw,0)=0")
+                   + one("SELECT COALESCE(SUM(pnl_eur),0) FROM position_marks WHERE book='short'"))
+        # Kopiëren: gesloten + live resultaat van open kopieën.
+        copy_res = one("SELECT COALESCE(SUM(pnl_eur),0) FROM copy_trades") + \
+            one("SELECT COALESCE(SUM(pnl_now),0) FROM copy_positions")
+        total = budget + bot_res + copy_res
+        ts = meta.get("marks_ts") or (b[0][2] if b else None)
+        self.t_bot.set(eur(total), f"{eur(total - budget, True)} sinds de start · gewone bot "
+                       f"{eur(bot_budget + bot_res)} ({eur(bot_res, True)}) · kopiëren "
+                       f"{eur(copy_budget + copy_res)} ({eur(copy_res, True)})"
+                       + (f" · live {local_time(ts)}" if ts else ""),
+                       C["good"] if total >= budget else C["bad"])
+        hold = None
+        try:
+            hold = budget * float(meta["btc_price_now"]) / float(meta["btc_start_price"])
+        except Exception:
+            pass
+        if hold is not None:
+            self.t_btc.set(eur(hold), f"totaal {eur(total - hold, True)} t.o.v. BTC", None)
         else:
-            self.t_bot.set(eur(budget), "nog geen analyse gedraaid")
             self.t_btc.set("–", "start na de eerste analyse")
 
         day = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d") + "%"
@@ -285,8 +289,14 @@ class BotPage(QWidget):
         buys = query("SELECT COUNT(*) FROM trades WHERE side='buy' AND ts LIKE ? AND COALESCE(schaduw,0)=0", (day,))
         p, n = pnl[0] if pnl else (0, 0)
         nb = buys[0][0] if buys else 0
-        self.t_today.set(eur(p, True), f"{nb} gekocht, {n} verkocht · daglimiet {eur(rules['daily_loss_limit_eur'])}",
-                         C["good"] if p > 0 else (C["bad"] if p < 0 else None))
+        sp = (query("SELECT COALESCE(SUM(pnl),0) FROM short_trades WHERE side='cover' AND ts LIKE ? "
+                    "AND COALESCE(schaduw,0)=0", (day,)) or [[0]])[0][0] or 0
+        cp, cn = (query("SELECT COALESCE(SUM(pnl_eur),0), COUNT(*) FROM copy_trades WHERE closed LIKE ?", (day,))
+                  or [(0, 0)])[0]
+        tot = (p or 0) + sp + (cp or 0)
+        self.t_today.set(eur(tot, True), f"gewone bot {eur((p or 0) + sp, True)} ({nb} in, {n} uit) · kopiëren "
+                         f"{eur(cp or 0, True)} ({cn} dicht) · daglimiet {eur(rules['daily_loss_limit_eur'])} samen",
+                         C["good"] if tot > 0 else (C["bad"] if tot < 0 else None))
 
         since = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=30)).isoformat()
         cost = query("SELECT COALESCE(SUM(usd),0), COUNT(*) FROM api_usage WHERE ts >= ?", (since,))
