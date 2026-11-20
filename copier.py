@@ -47,7 +47,7 @@ def init_db(con):
         address TEXT, name TEXT, coin TEXT, side TEXT, size REAL, entry REAL, leverage REAL, account REAL,
         ts TEXT, PRIMARY KEY(address, coin))""")
     cols = [r[1] for r in con.execute("PRAGMA table_info(copy_positions)")]
-    for c in ("price_now", "pnl_now"):
+    for c in ("price_now", "pnl_now", "trader_size", "ratio", "base_notional"):
         if c not in cols:
             con.execute(f"ALTER TABLE copy_positions ADD COLUMN {c} REAL")
 
@@ -281,7 +281,18 @@ class CopyEngine:
             before = self.known.get(t["address"])
             self.known[t["address"]] = now_sides
             if before is None:
-                continue  # eerste keer: alleen de beginstand onthouden, niet instappen in oude posities
+                # Eerste ronde na (her)start: oude posities van de trader niet kopiëren, maar wel nakijken of onze
+                # kopieën van hem nog kloppen. Sloot hij terwijl de bot uit stond, dan sluiten wij nu ook.
+                for coin, pos in list(mine.items()):
+                    if pos["trader"] != t["address"]:
+                        continue
+                    if now_sides.get(coin) != pos["side"]:
+                        self.close(coin, f"{t['name']} sloot zijn {pos['side']} terwijl de bot uit stond")
+                        mine.pop(coin, None)
+                    else:
+                        self.e.log(f"Kopie {coin} {pos['side']} van {t['name']}: staat bij hem nog open ✓", "muted")
+                        self.resize(coin, pos, st["positions"][coin], t)
+                continue
             # gesloten of omgedraaid -> wij sluiten
             for coin, side in before.items():
                 if now_sides.get(coin) != side:
@@ -295,7 +306,142 @@ class CopyEngine:
                     p = st["positions"][coin]
                     if self.open(coin, side, p, t):
                         mine = self.positions()
+            # bijgekocht of deels verkocht -> wij doen naar verhouding mee
+            for coin, p in st["positions"].items():
+                pos = mine.get(coin)
+                if pos and pos["trader"] == t["address"] and pos["side"] == p["side"]:
+                    self.resize(coin, pos, p, t)
+                    mine = self.positions()
         self.check_stops()
+
+    # --- bijkopen en deels verkopen volgen
+    def resize(self, coin, pos, their, t):
+        """Onze kopie meebewegen met de grootte van de trader: zelfde verhouding als bij het openen.
+        Bijkopen hooguit tot max_scale x de beginpositie en binnen budget en daglimiet; afbouwen altijd."""
+        if not self.cfg.get("follow_size", True):
+            return
+        size_now = float(their.get("size") or 0)
+        if size_now <= 0:
+            return
+        ratio = pos.get("ratio")
+        if not ratio:
+            # Kopie van vóór deze functie: de huidige verhouding als uitgangspunt nemen.
+            with self.e.db() as con:
+                con.execute("UPDATE copy_positions SET ratio=?, trader_size=?, base_notional=? WHERE coin=?",
+                            (pos["amount"] / size_now, size_now, pos["cost_eur"], coin))
+            return
+        target = ratio * size_now
+        amount = pos["amount"]
+        diff = target - amount
+        min_pct = float(self.cfg.get("resize_min_pct", 10)) / 100
+        if abs(diff) < amount * min_pct:
+            return
+        sym = pos["symbol"]
+        try:
+            px = self.kr.price(sym)
+        except Exception:
+            return
+        if abs(diff) * px < 5:     # kleiner dan €5: niet de moeite (en vaak onder de kleinste order)
+            return
+        lev = max(1.0, float(pos["leverage"] or 1))
+        side = pos["side"]
+        d_sign = 1 if side == "long" else -1
+        fee_pct = kraken.TAKER_FEE_PCT / 100
+        stop_pct = abs(pos["stop_price"] - pos["entry_price"]) / pos["entry_price"] if pos["entry_price"] else 0.05
+        live = bool(pos["echt"]) and bool(self.kx)
+        if diff > 0:
+            base = float(pos.get("base_notional") or pos["cost_eur"])
+            cap = base * float(self.cfg.get("max_scale", 3)) - amount * px
+            room = max(0.0, self.budget_room()) * lev
+            add_eur = min(diff * px, cap, room)
+            if add_eur < 5:
+                return
+            with self.e.db() as con:
+                import risk_gate
+                loss, open_risk = risk_gate.day_risk_all(con, self.e.rules)
+            limit = float(self.e.rules["daily_loss_limit_eur"])
+            if loss + open_risk + add_eur * (stop_pct + 2 * fee_pct) > limit:
+                self.e.log(f"Kopie {coin}: {t['name']} kocht bij, wij niet (daglimiet).", "muted")
+                return
+            if live:
+                try:
+                    size, _ = self.kx.size_for(sym, add_eur)
+                    if size <= 0:
+                        return
+                    got, fill_px, _ = self.kx.market_order(sym, "buy" if side == "long" else "sell", size)
+                except Exception as ex:
+                    self.e.log(f"Kopie {coin}: bijkopen bij Kraken mislukt ({ex})", "bad")
+                    return
+            else:
+                spread = (self.kr.spread_pct(sym) or 0) / 100
+                fill_px = px * (1 + spread / 2) if side == "long" else px * (1 - spread / 2)
+                got = add_eur / fill_px
+            new_amount = amount + got
+            entry = (amount * pos["entry_price"] + got * fill_px) / new_amount
+            stop = entry * (1 - stop_pct) if side == "long" else entry * (1 + stop_pct)
+            ext = self._replace_stop(pos, new_amount, stop) if live else pos.get("ext_stop")
+            with self.e.db() as con:
+                # Verhouding opnieuw vastleggen: werd het bijkopen begrensd, dan schalen we bij afbouwen vanaf hier mee.
+                con.execute("UPDATE copy_positions SET amount=?, entry_price=?, cost_eur=?, stop_price=?, ext_stop=?, "
+                            "trader_size=?, ratio=? WHERE coin=?",
+                            (new_amount, entry, pos["cost_eur"] + got * fill_px, stop, ext, size_now,
+                             new_amount / size_now, coin))
+            self.e.log(f"{'LIVE' if live else 'DROOG'} KOPIE BIJGEKOCHT {coin} {side}: +€{got * fill_px:.2f} positie "
+                       f"@ {fill_px:.6g} ({t['name']} kocht bij); nieuwe instap {entry:.6g}, noodstop {stop:.6g}",
+                       "good")
+            self.e.push_trade(f"{coin}-PERP", "buy" if side == "long" else "short", got * fill_px / lev, fill_px, 0,
+                              f"[kopie {t['name']}] bijgekocht", sim=not live, kind="kopie", trader=t["name"])
+            return
+        # afbouwen
+        cut = -diff
+        if target < amount * 0.1:          # trader bouwde bijna alles af: dan sluiten we helemaal
+            self.close(coin, f"{t['name']} bouwde zijn {side} bijna helemaal af")
+            return
+        if live:
+            try:
+                size, _ = self.kx.size_for(sym, cut * px)
+                if size <= 0:
+                    return
+                cut, fill_px, _ = self.kx.market_order(sym, "sell" if side == "long" else "buy", size,
+                                                        reduce_only=True)
+            except Exception as ex:
+                self.e.log(f"Kopie {coin}: deels verkopen bij Kraken mislukt ({ex})", "bad")
+                return
+        else:
+            spread = (self.kr.spread_pct(sym) or 0) / 100
+            fill_px = px * (1 - spread / 2) if side == "long" else px * (1 + spread / 2)
+        cut = min(cut, amount)
+        part = cut / amount
+        cost_part = pos["cost_eur"] * part
+        pnl = d_sign * (fill_px - pos["entry_price"]) * cut - (cost_part + cut * fill_px) * fee_pct
+        margin = cost_part / lev
+        new_amount = amount - cut
+        ext = self._replace_stop(pos, new_amount, pos["stop_price"]) if live else pos.get("ext_stop")
+        with self.e.db() as con:
+            con.execute("UPDATE copy_positions SET amount=?, cost_eur=?, ext_stop=?, trader_size=? WHERE coin=?",
+                        (new_amount, pos["cost_eur"] - cost_part, ext, size_now, coin))
+            con.execute("INSERT INTO copy_trades(opened,closed,coin,side,trader,trader_name,cost_eur,leverage,entry,"
+                        "exit,trader_entry,trader_exit,pnl_eur,pnl_pct,trader_pct,fee_eur,reason,echt) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (pos["opened"], now(), coin, side, pos["trader"], pos["trader_name"], cost_part, lev,
+                         pos["entry_price"], fill_px, pos.get("trader_entry") or 0, None, pnl,
+                         pnl / margin * 100 if margin else 0, None, (cost_part + cut * fill_px) * fee_pct,
+                         f"deels verkocht ({part * 100:.0f}%): {t['name']} bouwde af", pos["echt"]))
+        self.e.log(f"{'LIVE' if live else 'DROOG'} KOPIE DEELS VERKOCHT {coin} {side}: {part * 100:.0f}% @ "
+                   f"{fill_px:.6g}, €{pnl:+.2f} ({t['name']} bouwde af)", "good" if pnl >= 0 else "bad")
+        self.e.push_trade(f"{coin}-PERP", "sell" if side == "long" else "cover", cut * fill_px / lev, fill_px, pnl,
+                          f"[kopie {t['name']}] deels verkocht", sim=not live, kind="kopie", trader=t["name"])
+
+    def _replace_stop(self, pos, amount, stop):
+        """Noodstop bij Kraken vervangen door een met de nieuwe grootte."""
+        sym, side = pos["symbol"], pos["side"]
+        try:
+            new = self.kx.stop_order(sym, "sell" if side == "long" else "buy", amount, stop)
+        except Exception as ex:
+            self.e.log(f"Kopie {pos['coin']}: nieuwe noodstop bij Kraken mislukt ({ex}); de oude blijft staan.", "bad")
+            return pos.get("ext_stop")
+        self.kx.cancel(pos.get("ext_stop"))
+        return new
 
     def save_trader_state(self, t, st):
         """Wat de trader nu echt open heeft op Hyperliquid bewaren, zodat je het naast Invo kunt leggen."""
@@ -409,11 +555,13 @@ class CopyEngine:
             amount = notional / px
         stop = px * (1 - stop_pct / 100) if side == "long" else px * (1 + stop_pct / 100)
         with self.e.db() as con:
+            t_size = float(their.get("size") or 0)
             con.execute("INSERT OR REPLACE INTO copy_positions(coin, symbol, side, amount, entry_price, cost_eur, "
-                        "leverage, opened, trader, trader_name, trader_entry, stop_price, ext_stop, echt) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "leverage, opened, trader, trader_name, trader_entry, stop_price, ext_stop, echt, "
+                        "trader_size, ratio, base_notional) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (coin, sym, side, amount, px, notional, lev, now(), t["address"], t["name"],
-                         float(their.get("entry") or 0), stop, ext, int(self.live())))
+                         float(their.get("entry") or 0), stop, ext, int(self.live()),
+                         t_size, amount / t_size if t_size else None, notional))
         risk = notional * (stop_pct / 100 + fee2)
         self.e.log(f"{'LIVE' if self.live() else 'DROOG'} KOPIE OPEN {coin} {side} {lev:.0f}x van {t['name']}: "
                    f"positie €{notional:.2f} (inzet €{notional / lev:.2f}, grens: {why}) @ {px:.6g}, noodstop "

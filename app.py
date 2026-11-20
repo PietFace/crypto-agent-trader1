@@ -852,6 +852,13 @@ class CopyPage(QWidget):
         f.addRow("Noodstop lange traders", self.stop_l)
         self.stop_k = QDoubleSpinBox(); self.stop_k.setRange(0.5, 50); self.stop_k.setSuffix(" %")
         f.addRow("Noodstop korte traders", self.stop_k)
+        self.follow_size = QCheckBox("Bijkopen en deels verkopen van de trader meedoen (naar verhouding)")
+        f.addRow("", self.follow_size)
+        self.max_scale = QDoubleSpinBox(); self.max_scale.setRange(1, 10); self.max_scale.setSingleStep(0.5)
+        self.max_scale.setPrefix("tot "); self.max_scale.setSuffix(" x de beginpositie")
+        f.addRow("Bijkopen hooguit", self.max_scale)
+        self.resize_min = QDoubleSpinBox(); self.resize_min.setRange(2, 50); self.resize_min.setSuffix(" %")
+        f.addRow("Pas aanpassen vanaf", self.resize_min)
         self.hint = lab("", "hint", wrap=True)
         f.addRow("", self.hint)
         for w in (self.stake, self.maxlev, self.stop_l, self.stop_k, self.maxloss):
@@ -966,6 +973,9 @@ class CopyPage(QWidget):
         self.dayloss.setValue(float(c.get("daily_loss_eur", d["daily_loss_eur"])))
         self.stop_l.setValue(float(c.get("stop_pct_lang", d["stop_pct_lang"])))
         self.stop_k.setValue(float(c.get("stop_pct_kort", d["stop_pct_kort"])))
+        self.follow_size.setChecked(bool(c.get("follow_size", True)))
+        self.max_scale.setValue(float(c.get("max_scale", d["max_scale"])))
+        self.resize_min.setValue(float(c.get("resize_min_pct", d["resize_min_pct"])))
         self.traders.setPlainText("\n".join(f"{t['address']} {t.get('name', '')} {t.get('style', 'lang')}"
                                             for t in c.get("traders", [])))
         self._loading = False
@@ -986,6 +996,8 @@ class CopyPage(QWidget):
             "eur_per_trade": round(self.stake.value(), 2), "max_leverage": self.maxlev.value(),
             "max_positions": self.maxpos.value(), "daily_loss_eur": round(self.dayloss.value(), 2),
             "stop_pct_lang": round(self.stop_l.value(), 2), "stop_pct_kort": round(self.stop_k.value(), 2),
+            "follow_size": self.follow_size.isChecked(), "max_scale": round(self.max_scale.value(), 1),
+            "resize_min_pct": round(self.resize_min.value(), 1),
             "traders": traders}
         settings.save(self.win.cfg)
         self.win.log(f"Kopieer-instellingen opgeslagen ({len(traders)} traders). Start de bot opnieuw om ze te "
