@@ -215,6 +215,13 @@ def init_db(path):
                 con.execute(f"ALTER TABLE {t} ADD COLUMN ext_stop TEXT")
             if "echt" not in [r[1] for r in con.execute(f"PRAGMA table_info({t})")]:
                 con.execute(f"ALTER TABLE {t} ADD COLUMN echt INTEGER DEFAULT 0")
+            have = [r[1] for r in con.execute(f"PRAGMA table_info({t})")]
+            for col, typ in (("peak", "REAL"), ("trail_stop", "REAL"), ("reentries", "INTEGER DEFAULT 0"),
+                             ("orig_entry", "REAL")):
+                if col not in have:
+                    con.execute(f"ALTER TABLE {t} ADD COLUMN {col} {typ}")
+        con.execute("""CREATE TABLE IF NOT EXISTS reentry_watch(
+            market TEXT, book TEXT, bron TEXT, entry REAL, count INTEGER, until REAL, PRIMARY KEY(market, book))""")
         import copier
         copier.init_db(con)
 
@@ -706,8 +713,10 @@ class Engine:
                 self.log(f"  VERKOOP bij Kraken mislukt: {e}. De stop-loss bij Kraken is mogelijk weg!", "bad")
                 return
             if done is None:
-                fill_px = risk_gate.exit_plan(self.rules_for(pos.get("bron")), market, pos["entry_price"])["stop_price"]
-                reason = "stop-loss (al uitgevoerd bij Kraken)"
+                fill_px = pos.get("trail_stop") or risk_gate.exit_plan(self.rules_for(pos.get("bron")), market,
+                                                                      pos["entry_price"])["stop_price"]
+                reason = ("winst vastgezet (stop al uitgevoerd bij Kraken)" if pos.get("trail_stop") else
+                          "stop-loss (al uitgevoerd bij Kraken)")
             else:
                 amount, fill_px = done
             gross = amount * fill_px
@@ -758,6 +767,8 @@ class Engine:
             px = self.price(market)
             value = pos["amount"] * px * (1 - fee)  # wat je na verkoop (incl. fee) zou krijgen
             marks.append(("long", market, px, value, value - pos["cost_eur"]))
+            if self.trail_check(market, pos, "long", px):
+                continue
             why = risk_gate.exit_signal(self.rules_for(pos.get("bron")), market, pos["entry_price"], px)
             if why:
                 self.log(f"[exit] {market}: {why}", "info")
@@ -766,10 +777,16 @@ class Engine:
             px = self.price(market)
             pnl = self.short_pnl(pos, px)[0]
             marks.append(("short", market, px, pos["cost_eur"] + pnl, pnl))
+            if self.trail_check(market, pos, "short", px):
+                continue
             why = risk_gate.exit_signal(self.rules_for(pos.get("bron")), market, pos["entry_price"], px, "short")
             if why:
                 self.log(f"[exit short] {market}: {why}", "info")
                 self.close_short(market, why)
+        try:
+            self.reentry_check()
+        except Exception as e:
+            self.log(f"Opnieuw instappen: fout ({e})", "bad")
         try:
             self.meta_set("btc_price_now", self.price("BTC-EUR"))
             self.meta_set("marks_ts", now())
@@ -779,6 +796,116 @@ class Engine:
             con.execute("DELETE FROM position_marks")
             con.executemany("INSERT INTO position_marks(book,market,price,value_eur,pnl_eur,ts) VALUES(?,?,?,?,?,?)",
                             [(b, m, px, v, p, now()) for b, m, px, v, p in marks])
+
+    # ---------- meeschuivende stop en opnieuw instappen ----------
+    def trail_cfg(self):
+        import trail as tm
+        return tm.conf(self.cfg.get("trail"))
+
+    def trail_check(self, market, pos, book, px):
+        """Meeschuivende stop bijwerken; True als hij geraakt is en de positie nu gesloten is."""
+        import trail as tm
+        tc = self.trail_cfg()
+        if not tc["enabled"]:
+            return False
+        table = "positions" if book == "long" else "short_positions"
+        if tm.hit(book, pos.get("trail_stop"), px):
+            why = tm.reason(book, pos["trail_stop"], pos["entry_price"])
+            self.log(f"[exit{' short' if book == 'short' else ''}] {market}: {why}", "info")
+            if book == "long":
+                self.execute_sell(market, why)
+                still = self.get_positions().get(market)
+            else:
+                self.close_short(market, why)
+                still = self.get_short_positions().get(market)
+            if not still:
+                self.closed_at[(market, book)] = time.time()
+                n = int(pos.get("reentries") or 0)
+                if tc["reentry"] and n < int(tc["max_reentries"]):
+                    with self.db() as con:
+                        con.execute("INSERT OR REPLACE INTO reentry_watch VALUES(?,?,?,?,?,?)",
+                                    (market, book, pos.get("bron") or "regels",
+                                     pos.get("orig_entry") or pos["entry_price"], n + 1,
+                                     time.time() + float(tc["reentry_hours"]) * 3600))
+                    self.log(f"  {market}: ik houd hem {tc['reentry_hours']:.0f} uur in de gaten om opnieuw in te "
+                             f"stappen als de koers terugkomt bij de instap en het signaal nog geldt.", "muted")
+            return True
+        stop_pct = risk_gate.stop_pct(self.rules_for(pos.get("bron")), market)
+        peak, new = tm.update(book, pos["entry_price"], stop_pct, pos.get("peak"), pos.get("trail_stop"), px, px,
+                              self.rules["fee_pct"], tc)
+        old = pos.get("trail_stop")
+        if peak != pos.get("peak") or new != old:
+            ext = pos.get("ext_stop")
+            if new and new != old:
+                if not old:
+                    self.log(f"  {market}: meeschuivende stop aan op {fmt_px(new)} (winst na kosten vast)", "good")
+                if pos.get("echt") and self.kx and (not old or abs(new / old - 1) >= 0.003):
+                    ext = self.move_ext_stop(market, book, pos, new)
+            with self.db() as con:
+                con.execute(f"UPDATE {table} SET peak=?, trail_stop=?, ext_stop=? WHERE market=?",
+                            (peak, new, ext, market))
+        return False
+
+    def move_ext_stop(self, market, book, pos, stop):
+        """De stop bij Kraken opschuiven, zodat de vastgezette winst ook geldt als je pc uit staat."""
+        try:
+            new_id = self.kx.stop_order(market, "sell" if book == "long" else "buy", pos["amount"], stop)
+        except Exception as e:
+            self.log(f"  {market}: stop bij Kraken opschuiven mislukt ({e}); de bot bewaakt hem zelf.", "bad")
+            return pos.get("ext_stop")
+        self.kx.cancel(pos.get("ext_stop"))
+        return new_id
+
+    def reentry_check(self):
+        """Na vastgezette winst: opnieuw instappen als de koers terug is bij de oorspronkelijke instap en het
+        signaal nog geldt (volgers zitten er nog in, of de setup uit de grafiek staat er nog)."""
+        import trail as tm
+        tc = self.trail_cfg()
+        with self.db() as con:
+            rows = [dict(r) for r in con.execute("SELECT * FROM reentry_watch")]
+        for w in rows:
+            market, book = w["market"], w["book"]
+            if not tc["enabled"] or not tc["reentry"] or time.time() > w["until"]:
+                with self.db() as con:
+                    con.execute("DELETE FROM reentry_watch WHERE market=? AND book=?", (market, book))
+                continue
+            held = self.get_positions() if book == "long" else self.get_short_positions()
+            if market in held:
+                continue
+            if self.mode == "kopie":
+                continue
+            try:
+                px = self.price(market)
+            except Exception:
+                continue
+            if not tm.near_entry(w["entry"], px, tc):
+                continue
+            bron = w["bron"] or "regels"
+            if self.follower_held(bron):
+                ok = self.followers_still_with(market, book)
+                why = "de volgers zitten er nog in"
+            else:
+                ok = book in self.last_state.get(market, "")
+                why = "de setup uit de grafiek staat er nog"
+            if not ok:
+                continue
+            amount, msg = self.risk_check_buy(market, float(self.rules["max_trade_eur"]), 1.0, book, bron)
+            if not amount:
+                self.log(f"  {market}: opnieuw instappen geblokkeerd ({msg})", "muted")
+                continue
+            reason = f"opnieuw ingestapt ({w['count']}e keer): koers terug bij de instap en {why}"
+            self.log(f"[opnieuw] {market} {book}: {reason}", "head")
+            if book == "long":
+                self.execute_buy(market, amount, reason, bron)
+                new = self.get_positions().get(market)
+            else:
+                self.open_short(market, amount, reason, bron)
+                new = self.get_short_positions().get(market)
+            with self.db() as con:
+                con.execute("DELETE FROM reentry_watch WHERE market=? AND book=?", (market, book))
+                if new:
+                    con.execute(f"UPDATE {'positions' if book == 'long' else 'short_positions'} SET reentries=?, "
+                                "orig_entry=? WHERE market=?", (w["count"], w["entry"], market))
 
     # ---------- shorts (gesimuleerd, behalve op Kraken live) ----------
     def get_short_positions(self):
@@ -836,9 +963,10 @@ class Engine:
                 self.log(f"  SHORT SLUITEN bij Kraken mislukt: {e}. De stop-loss bij Kraken is mogelijk weg!", "bad")
                 return
             if done is None:
-                px = risk_gate.exit_plan(self.rules_for(pos.get("bron")), market, pos["entry_price"],
-                                         "short")["stop_price"]
-                reason = "stop-loss (al uitgevoerd bij Kraken)"
+                px = pos.get("trail_stop") or risk_gate.exit_plan(self.rules_for(pos.get("bron")), market,
+                                                                  pos["entry_price"], "short")["stop_price"]
+                reason = ("winst vastgezet (stop al uitgevoerd bij Kraken)" if pos.get("trail_stop") else
+                          "stop-loss (al uitgevoerd bij Kraken)")
             else:
                 px = done[1]
         pnl, fees, borrow = self.short_pnl(pos, px)

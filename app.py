@@ -998,6 +998,7 @@ class CopyPage(QWidget):
             "stop_pct_lang": round(self.stop_l.value(), 2), "stop_pct_kort": round(self.stop_k.value(), 2),
             "follow_size": self.follow_size.isChecked(), "max_scale": round(self.max_scale.value(), 1),
             "resize_min_pct": round(self.resize_min.value(), 1),
+            "trail": bool((self.win.cfg.get("copy") or {}).get("trail", False)),   # staat bij Instellingen
             "traders": traders}
         settings.save(self.win.cfg)
         self.win.log(f"Kopieer-instellingen opgeslagen ({len(traders)} traders). Start de bot opnieuw om ze te "
@@ -1655,6 +1656,18 @@ class SettingsPage(QWidget):
         num("short_borrow_pct_day", "Leenkosten short (aanname)", 0, 1, 0.01, 3, " % per dag")
         self.dtrend = QCheckBox("Trend op dagbasis: alleen kopen boven / shorten onder het 20-daags gemiddelde")
         f.addRow("", self.dtrend)
+        self.tr_on = QCheckBox("Meeschuivende stop: winst vastzetten (nooit onder instap + kosten)")
+        f.addRow("", self.tr_on)
+        self.tr_act = QSpinBox(); self.tr_act.setRange(10, 200); self.tr_act.setSuffix(" % van de stopafstand")
+        f.addRow("Aan zodra de winst", self.tr_act)
+        self.tr_dist = QSpinBox(); self.tr_dist.setRange(10, 200); self.tr_dist.setSuffix(" % van de stopafstand")
+        f.addRow("Meeschuiven op afstand", self.tr_dist)
+        self.tr_re = QCheckBox("Opnieuw instappen als de koers terugkomt bij de instap en het signaal nog geldt")
+        f.addRow("", self.tr_re)
+        self.tr_max = QSpinBox(); self.tr_max.setRange(1, 5); self.tr_max.setSuffix(" keer per trade")
+        f.addRow("Opnieuw instappen max", self.tr_max)
+        self.tr_copy = QCheckBox("Ook voor kopieën (anders volgen kopieën puur de trader)")
+        f.addRow("", self.tr_copy)
         self.size_hint = lab("", "hint", wrap=True)
         f.addRow("", self.size_hint)
         for s in self.r.values():
@@ -1870,6 +1883,14 @@ class SettingsPage(QWidget):
         self.model_chief.setCurrentText(cfg.get("model_chief") or "(zelfde als agents)")
         self.shorts_on.setChecked(bool(cfg.get("shorts_sim", True)))
         self.dtrend.setChecked(bool(cfg["rules"].get("daily_trend", False)))
+        import trail as _tm
+        tc = _tm.conf(cfg.get("trail"))
+        self.tr_on.setChecked(bool(tc["enabled"]))
+        self.tr_act.setValue(int(round(float(tc["activate_frac"]) * 100)))
+        self.tr_dist.setValue(int(round(float(tc["distance_frac"]) * 100)))
+        self.tr_re.setChecked(bool(tc["reentry"]))
+        self.tr_max.setValue(int(tc["max_reentries"]))
+        self.tr_copy.setChecked(bool((cfg.get("copy") or {}).get("trail", False)))
         self.share.setValue(int(round(float(cfg.get("copy_share", 0.5)) * 100)))
         self.exch.setCurrentIndex(1 if cfg.get("exchange") == "kraken" else 0)
         self.lev.setValue(int((cfg.get("kraken") or {}).get("leverage", 3)))
@@ -1912,6 +1933,12 @@ class SettingsPage(QWidget):
         cfg["copy_share"] = self.share.value() / 100
         cfg["max_api_usd_month"] = round(self.api_cap.value(), 2)
         cfg["rules"] = self.collect_rules()
+        tc = dict(cfg.get("trail") or {})
+        tc.update({"enabled": self.tr_on.isChecked(), "activate_frac": self.tr_act.value() / 100,
+                   "distance_frac": self.tr_dist.value() / 100, "reentry": self.tr_re.isChecked(),
+                   "max_reentries": self.tr_max.value()})
+        cfg["trail"] = tc
+        cfg.setdefault("copy", {})["trail"] = self.tr_copy.isChecked()
         cfg["followers"] = {"enabled": self.fw_on.isChecked(), "use_as_setup": self.fw_setup.isChecked(),
                             "auto": self.fw_auto.isChecked(), "invo": self.fw_invo.isChecked(),
                             "quality": self.fw_quality.isChecked(), "conviction": self.fw_conv.isChecked(),

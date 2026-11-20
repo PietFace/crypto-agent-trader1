@@ -249,6 +249,28 @@ class ClaudeLink:
             except Exception:
                 pass
             return {"in_buurt": len(near), "gecontroleerd": checked, "treffers": hits}
+        if kind == "backtest":
+            # Varianten naast elkaar op historische uurkoersen (Bitvavo), met de regels van nu.
+            import backtest
+            from python_bitvavo_api.bitvavo import Bitvavo
+            cfg = settings.load()
+            months = max(1, min(int(job.get("months", 12)), 36))
+            markets = list(job.get("markets") or cfg.get("markets") or [])
+            if "BTC-EUR" not in markets:
+                markets = ["BTC-EUR"] + markets
+            bv = Bitvavo({})
+            data = {}
+            for m in markets:
+                self._progress(stem, f"koersen ophalen: {m}")
+                data[m] = backtest.fetch_candles(bv, m, months)
+            rules = settings.effective_rules(cfg)
+            rows = backtest.run_variants(data, rules, shorts=bool(job.get("shorts", cfg.get("shorts_sim", True))),
+                                         cycle_minutes=int(cfg.get("cycle_minutes", 120)),
+                                         progress=lambda t: self._progress(stem, t))
+            ex = "Kraken" if cfg.get("exchange") == "kraken" else "Bitvavo"
+            return {"months": months, "exchange": ex, "fee_pct": rules.get("fee_pct"),
+                    "leverage": rules.get("leverage", 1), "varianten": rows,
+                    "tekst": backtest.variants_text(rows, months, ex)}
         if kind == "leiders":
             import tape as tp
             return tp.leaders(settings.data_dir(), days=int(job.get("days", 2)),

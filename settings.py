@@ -19,6 +19,8 @@ DEFAULTS = {
     "copy": {"enabled": False, "live": False, "realtime": True, "max_loss_eur": 5.0, "interval_s": 5, "eur_per_trade": 10, "max_leverage": 10,
              "max_positions": 5, "daily_loss_eur": 10, "stop_pct_lang": 10, "stop_pct_kort": 3, "traders": [],
              "follow_size": True, "resize_min_pct": 10, "max_scale": 3},  # alleen deze signalen met echt geld; de rest als schaduwtrade
+    "trail": {"enabled": False, "activate_frac": 0.5, "distance_frac": 0.5, "buffer_pct": 0.2, "spread_pct": 0.1,
+              "reentry": True, "max_reentries": 1, "reentry_band_pct": 0.5, "reentry_hours": 24},
     "tape": {"enabled": True, "min_notional": 250, "retention_h": 48},   # trades meeschrijven om traders te vinden
     "markets": ["BTC-EUR", "ETH-EUR", "SOL-EUR", "XRP-EUR"],
     "cycle_minutes": 120,

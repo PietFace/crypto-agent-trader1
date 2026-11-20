@@ -18,6 +18,7 @@ import time
 from datetime import datetime, timezone
 
 import risk_gate
+import trail as trailmod
 
 
 # ------------------------------------------------------------------ data
@@ -107,6 +108,33 @@ def run(data, rules, shorts=True, start_budget=None, progress=None, cycle_minute
     def risk_per_eur(m):
         return risk_gate.risk_per_eur(rules, m)
 
+    tcfg = trailmod.conf(rules.get("trail"))
+    trail_on = bool(tcfg.get("enabled"))
+    watch = {}         # (market, side) -> {"entry", "count", "until"}: opnieuw instappen na vastgezette winst
+
+    def try_open(m, side, k, t, day, orig=None, count=0):
+        if (m, side) in open_pos or t < stop_until.get((m, side), 0):
+            return False
+        n_side = sum(1 for (_, s) in open_pos if s == side)
+        if n_side >= rules["max_positions"] or day_buys.get((day, side), 0) >= rules["max_buys_per_day"]:
+            return False
+        invested = sum(p["cost"] for (mm, s), p in open_pos.items() if s == side)
+        amount, _ = risk_gate.size_buy(rules, m, rules["max_trade_eur"] * max(1, int(rules.get("leverage", 1) or 1)),
+                                       invested, realized)
+        if amount < rules["min_order_eur"]:
+            return False
+        open_risk = sum(p["cost"] * risk_per_eur(mm) for (mm, s), p in open_pos.items() if s == side)
+        if -day_loss.get((day, side), 0.0) + open_risk + amount * risk_per_eur(m) > rules["daily_loss_limit_eur"]:
+            return False
+        px = closes[m][k]
+        plan = risk_gate.exit_plan(rules, m, px, side)
+        amt = (amount * (1 - fee)) / px if side == "long" else amount / px
+        open_pos[(m, side)] = {"t": t, "entry": px, "amount": amt, "cost": amount,
+                               "stop": plan["stop_price"], "target": plan["target_price"],
+                               "peak": px, "trail": None, "orig": orig or px, "re": count}
+        day_buys[(day, side)] = day_buys.get((day, side), 0) + 1
+        return True
+
     for n, t in enumerate(times):
         day = datetime.fromtimestamp(t / 1000, timezone.utc).strftime("%Y-%m-%d")
         if day != cur_day:
@@ -120,7 +148,10 @@ def run(data, rules, shorts=True, start_budget=None, progress=None, cycle_minute
             _, o, h, l, c, _ = data[m][k]
             p = open_pos[key]
             exit_px, why = None, None
-            if side == "long":
+            # De meeschuivende stop van de vorige kaars eerst (voorzichtig: hij ligt boven de gewone stop).
+            if trail_on and trailmod.hit(side, p.get("trail"), l, h):
+                exit_px, why = p["trail"], "winst vastgezet"
+            elif side == "long":
                 if l <= p["stop"]:
                     exit_px, why = p["stop"], "stop-loss"
                 elif h >= p["target"]:
@@ -130,6 +161,9 @@ def run(data, rules, shorts=True, start_budget=None, progress=None, cycle_minute
                     exit_px, why = p["stop"], "stop-loss"
                 elif l <= p["target"]:
                     exit_px, why = p["target"], "koersdoel"
+            if exit_px is None and trail_on:
+                p["peak"], p["trail"] = trailmod.update(side, p["entry"], risk_gate.stop_pct(rules, m), p.get("peak"),
+                                                        p.get("trail"), h, l, rules["fee_pct"], tcfg)
             if exit_px is None and k >= 60 and k % flip_every == 0:
                 st, cs = setup_at(closes[m], k)
                 if (side == "long" and cs <= -0.3) or (side == "short" and cs >= 0.3):
@@ -146,8 +180,26 @@ def run(data, rules, shorts=True, start_budget=None, progress=None, cycle_minute
                 if why == "stop-loss":
                     stop_until[key] = t + rules["cooldown_hours_after_stop"] * 3600000
                 trades.append({"market": m, "side": side, "open": p["t"], "close": t, "entry": p["entry"],
-                               "exit": exit_px, "eur": p["cost"], "pnl": pnl, "reason": why})
+                               "exit": exit_px, "eur": p["cost"], "pnl": pnl, "reason": why,
+                               "herinstap": p.get("re", 0)})
                 del open_pos[key]
+                if why == "winst vastgezet" and tcfg.get("reentry") and p.get("re", 0) < int(tcfg["max_reentries"]):
+                    watch[key] = {"entry": p.get("orig") or p["entry"], "count": p.get("re", 0) + 1,
+                                  "until": t + float(tcfg["reentry_hours"]) * 3600000}
+        # 2a. opnieuw instappen na vastgezette winst: koers terug bij de instap en het signaal geldt nog
+        for key in list(watch):
+            m, side = key
+            w = watch[key]
+            k = idx[m].get(t)
+            if t > w["until"]:
+                del watch[key]
+                continue
+            if k is None or k < 60 or key in open_pos:
+                continue
+            st, _ = setup_at(closes[m], k)
+            if st.get(side) and trailmod.near_entry(w["entry"], closes[m][k], tcfg):
+                if try_open(m, side, k, t, day, orig=w["entry"], count=w["count"]):
+                    del watch[key]
         # 2. nieuwe setups
         for m in markets:
             k = idx[m].get(t)
@@ -169,25 +221,8 @@ def run(data, rules, shorts=True, start_budget=None, progress=None, cycle_minute
             if not state or state == prev:
                 continue
             side = "long" if st["long"] else "short"
-            if (m, side) in open_pos or t < stop_until.get((m, side), 0):
-                continue
-            n_side = sum(1 for (_, s) in open_pos if s == side)
-            if n_side >= rules["max_positions"] or day_buys.get((day, side), 0) >= rules["max_buys_per_day"]:
-                continue
-            invested = sum(p["cost"] for (mm, s), p in open_pos.items() if s == side)
-            amount, _ = risk_gate.size_buy(rules, m, rules["max_trade_eur"] * max(1, int(rules.get("leverage", 1) or 1)),
-                                               invested, realized)
-            if amount < rules["min_order_eur"]:
-                continue
-            open_risk = sum(p["cost"] * risk_per_eur(mm) for (mm, s), p in open_pos.items() if s == side)
-            if -day_loss.get((day, side), 0.0) + open_risk + amount * risk_per_eur(m) > rules["daily_loss_limit_eur"]:
-                continue
-            px = closes[m][k]
-            plan = risk_gate.exit_plan(rules, m, px, side)
-            amt = (amount * (1 - fee)) / px if side == "long" else amount / px
-            open_pos[(m, side)] = {"t": t, "entry": px, "amount": amt, "cost": amount,
-                                   "stop": plan["stop_price"], "target": plan["target_price"]}
-            day_buys[(day, side)] = day_buys.get((day, side), 0) + 1
+            watch.pop((m, side), None)      # nieuwe setup: oude 'opnieuw instappen' vervalt
+            try_open(m, side, k, t, day)
         # 3. equity (gerealiseerd + open tegen slotkoers)
         if n % 24 == 0 or n == len(times) - 1:
             unreal = 0.0
@@ -250,8 +285,14 @@ def max_drawdown(equity):
 
 
 # ------------------------------------------------------------------ varianten naast elkaar
+TRAIL_ON = {"enabled": True, "reentry": False}
+TRAIL_RE = {"enabled": True, "reentry": True}
+
 VARIANTS = [
     ("Zoals nu", {}),
+    ("Meeschuivende stop", {"trail": TRAIL_ON}),
+    ("Meeschuivend + opnieuw instappen", {"trail": TRAIL_RE}),
+    ("Meeschuivend + opnieuw + doel 3x", {"trail": TRAIL_RE, "reward_risk": 3.0}),
     ("Doel 3x het risico", {"reward_risk": 3.0}),
     ("Trend op dagbasis", {"daily_trend": True}),
     ("Pauze 48 uur na stop", {"cooldown_hours_after_stop": 48}),

@@ -47,7 +47,8 @@ def init_db(con):
         address TEXT, name TEXT, coin TEXT, side TEXT, size REAL, entry REAL, leverage REAL, account REAL,
         ts TEXT, PRIMARY KEY(address, coin))""")
     cols = [r[1] for r in con.execute("PRAGMA table_info(copy_positions)")]
-    for c in ("price_now", "pnl_now", "trader_size", "ratio", "base_notional"):
+    for c in ("price_now", "pnl_now", "trader_size", "ratio", "base_notional", "peak", "trail_stop", "reentries",
+              "orig_entry"):
         if c not in cols:
             con.execute(f"ALTER TABLE copy_positions ADD COLUMN {c} REAL")
 
@@ -154,6 +155,7 @@ class CopyEngine:
         self._thread = None
         self._ws = None
         self.ws_ok = False
+        self.rewatch = {}          # coin -> opnieuw instappen na vastgezette winst (zolang de trader het nog heeft)
         with self.e.db() as con:
             init_db(con)
 
@@ -306,6 +308,9 @@ class CopyEngine:
                     p = st["positions"][coin]
                     if self.open(coin, side, p, t):
                         mine = self.positions()
+            # opnieuw instappen na vastgezette winst: de trader zit er nog in en de koers is terug bij de instap
+            self.reentry_check(t, st, mine)
+            mine = self.positions()
             # bijgekocht of deels verkocht -> wij doen naar verhouding mee
             for coin, p in st["positions"].items():
                 pos = mine.get(coin)
@@ -379,7 +384,9 @@ class CopyEngine:
             new_amount = amount + got
             entry = (amount * pos["entry_price"] + got * fill_px) / new_amount
             stop = entry * (1 - stop_pct) if side == "long" else entry * (1 + stop_pct)
-            ext = self._replace_stop(pos, new_amount, stop) if live else pos.get("ext_stop")
+            ts = pos.get("trail_stop")
+            eff = (max(stop, ts) if side == "long" else min(stop, ts)) if ts else stop
+            ext = self._replace_stop(pos, new_amount, eff) if live else pos.get("ext_stop")
             with self.e.db() as con:
                 # Verhouding opnieuw vastleggen: werd het bijkopen begrensd, dan schalen we bij afbouwen vanaf hier mee.
                 con.execute("UPDATE copy_positions SET amount=?, entry_price=?, cost_eur=?, stop_price=?, ext_stop=?, "
@@ -416,7 +423,8 @@ class CopyEngine:
         pnl = d_sign * (fill_px - pos["entry_price"]) * cut - (cost_part + cut * fill_px) * fee_pct
         margin = cost_part / lev
         new_amount = amount - cut
-        ext = self._replace_stop(pos, new_amount, pos["stop_price"]) if live else pos.get("ext_stop")
+        ext = self._replace_stop(pos, new_amount, pos.get("trail_stop") or pos["stop_price"]) if live else \
+            pos.get("ext_stop")
         with self.e.db() as con:
             con.execute("UPDATE copy_positions SET amount=?, cost_eur=?, ext_stop=?, trader_size=? WHERE coin=?",
                         (new_amount, pos["cost_eur"] - cost_part, ext, size_now, coin))
@@ -623,6 +631,75 @@ class CopyEngine:
                           px, pnl, f"[kopie {pos['trader_name']}] {reason}", sim=not pos["echt"], kind="kopie",
                           trader=pos["trader_name"])
 
+    # --- meeschuivende stop en opnieuw instappen (zelfde regels als de bot, zie trail.py)
+    def trail_cfg(self):
+        import trail as tm
+        c = tm.conf(self.e.cfg.get("trail"))
+        c["enabled"] = bool(self.cfg.get("trail", False))
+        return c
+
+    def trail_check(self, coin, pos, px):
+        """True als de meeschuivende stop geraakt is en de kopie gesloten."""
+        import trail as tm
+        tc = self.trail_cfg()
+        if not tc["enabled"]:
+            return False
+        side = pos["side"]
+        if tm.hit(side, pos.get("trail_stop"), px):
+            why = tm.reason(side, pos["trail_stop"], pos["entry_price"])
+            self.close(coin, why, exit_px=None if pos["echt"] else pos["trail_stop"])
+            n = int(pos.get("reentries") or 0)
+            if tc["reentry"] and n < int(tc["max_reentries"]):
+                self.rewatch[coin] = {"trader": pos["trader"], "side": side, "count": n + 1,
+                                      "entry": pos.get("orig_entry") or pos["entry_price"],
+                                      "until": time.time() + float(tc["reentry_hours"]) * 3600}
+            return True
+        peak, new = tm.update(side, pos["entry_price"], self.stop_pct_of(pos), pos.get("peak"), pos.get("trail_stop"),
+                              px, px, kraken.TAKER_FEE_PCT, tc)
+        old = pos.get("trail_stop")
+        if peak != pos.get("peak") or new != old:
+            ext = pos.get("ext_stop")
+            if new and new != old:
+                if not old:
+                    self.e.log(f"Kopie {coin}: meeschuivende stop aan op {new:.6g} (winst na kosten vast)", "good")
+                if pos["echt"] and self.kx and (not old or abs(new / old - 1) >= 0.003):
+                    ext = self._replace_stop(pos, pos["amount"], new)
+            with self.e.db() as con:
+                con.execute("UPDATE copy_positions SET peak=?, trail_stop=?, ext_stop=? WHERE coin=?",
+                            (peak, new, ext, coin))
+        return False
+
+    def stop_pct_of(self, pos):
+        """Afstand van de oorspronkelijke noodstop in % (de noodstop zelf blijft staan; de meeschuivende stop
+        is een aparte, krappere grens)."""
+        return abs(pos["stop_price"] - pos["entry_price"]) / pos["entry_price"] * 100 if pos["entry_price"] else 5.0
+
+    def reentry_check(self, t, st, mine):
+        import trail as tm
+        tc = self.trail_cfg()
+        for coin, w in list(self.rewatch.items()):
+            if w["trader"] != t["address"]:
+                continue
+            p = st["positions"].get(coin)
+            if not tc["enabled"] or not tc["reentry"] or time.time() > w["until"] or not p or p["side"] != w["side"]:
+                self.rewatch.pop(coin, None)       # trader is eruit, of te lang geleden
+                continue
+            if coin in mine:
+                continue
+            try:
+                px = self.kr.price(kraken.symbol_for_coin(coin))
+            except Exception:
+                continue
+            if not tm.near_entry(w["entry"], px, tc):
+                continue
+            self.e.log(f"Kopie {coin}: opnieuw ingestapt ({w['count']}e keer) — {t['name']} zit er nog in en de koers "
+                       "is terug bij de instap.", "head")
+            if self.open(coin, w["side"], p, t):
+                with self.e.db() as con:
+                    con.execute("UPDATE copy_positions SET reentries=?, orig_entry=? WHERE coin=?",
+                                (w["count"], w["entry"], coin))
+            self.rewatch.pop(coin, None)
+
     def check_stops(self):
         """Live waarde bijwerken, en de noodstop bewaken bij droog draaien (live zit hij bij Kraken zelf)."""
         for coin, pos in self.positions().items():
@@ -634,6 +711,8 @@ class CopyEngine:
             pnl = d * (px - pos["entry_price"]) * pos["amount"] - pos["cost_eur"] * kraken.TAKER_FEE_PCT / 100 * 2
             with self.e.db() as con:
                 con.execute("UPDATE copy_positions SET price_now=?, pnl_now=? WHERE coin=?", (px, pnl, coin))
+            if self.trail_check(coin, pos, px):
+                continue
             if pos["echt"]:
                 continue
             hit = px <= pos["stop_price"] if pos["side"] == "long" else px >= pos["stop_price"]
@@ -647,7 +726,10 @@ class CopyEngine:
             return
         for coin, pos in self.positions().items():
             if pos["echt"] and pos["symbol"] not in open_at:
-                self.close(coin, "noodstop (bij Kraken)", exit_px=pos["stop_price"])
+                if pos.get("trail_stop"):
+                    self.close(coin, "winst vastgezet (stop bij Kraken)", exit_px=pos["trail_stop"])
+                else:
+                    self.close(coin, "noodstop (bij Kraken)", exit_px=pos["stop_price"])
 
     def open_symbols(self, real_only=True):
         return {p["symbol"] for p in self.positions().values() if p["echt"] or not real_only}
