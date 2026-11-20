@@ -302,12 +302,14 @@ VARIANTS = [
 ]
 
 
-def run_variants(data, rules, shorts=True, cycle_minutes=120, progress=None):
-    """Dezelfde koersen met een paar instellingen naast elkaar. Geeft een lijst met korte uitkomsten."""
+def run_variants(data, rules, shorts=True, cycle_minutes=120, progress=None, variants=None):
+    """Dezelfde koersen met een paar instellingen naast elkaar. Geeft een lijst met korte uitkomsten.
+    variants: eigen lijst [(naam, wijzigingen)]; standaard VARIANTS."""
     out = []
-    for i, (name, change) in enumerate(VARIANTS):
+    variants = variants or VARIANTS
+    for i, (name, change) in enumerate(variants):
         if progress:
-            progress(f"Variant {i + 1}/{len(VARIANTS)}: {name}")
+            progress(f"Variant {i + 1}/{len(variants)}: {name}")
         r = dict(rules)
         r.update(change)
         res = run(data, r, shorts=shorts, cycle_minutes=cycle_minutes)

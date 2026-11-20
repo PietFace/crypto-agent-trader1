@@ -264,9 +264,10 @@ class ClaudeLink:
                 self._progress(stem, f"koersen ophalen: {m}")
                 data[m] = backtest.fetch_candles(bv, m, months)
             rules = settings.effective_rules(cfg)
+            custom = [(str(n), dict(c)) for n, c in (job.get("varianten") or [])] or None
             rows = backtest.run_variants(data, rules, shorts=bool(job.get("shorts", cfg.get("shorts_sim", True))),
                                          cycle_minutes=int(cfg.get("cycle_minutes", 120)),
-                                         progress=lambda t: self._progress(stem, t))
+                                         progress=lambda t: self._progress(stem, t), variants=custom)
             ex = "Kraken" if cfg.get("exchange") == "kraken" else "Bitvavo"
             return {"months": months, "exchange": ex, "fee_pct": rules.get("fee_pct"),
                     "leverage": rules.get("leverage", 1), "varianten": rows,
