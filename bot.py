@@ -1314,6 +1314,12 @@ class Engine:
             pnl, sells = con.execute("SELECT COALESCE(SUM(pnl),0), COUNT(*) FROM trades "
                                      "WHERE side='sell' AND ts LIKE ? AND COALESCE(schaduw,0)=0", (day,)).fetchone()
             buys = con.execute("SELECT COUNT(*) FROM trades WHERE side='buy' AND ts LIKE ? AND COALESCE(schaduw,0)=0", (day,)).fetchone()[0]
+            # Shorts tellen mee: openen = 'koop', sluiten = 'verkoop' in de dagtelling.
+            s_pnl, s_cov = con.execute("SELECT COALESCE(SUM(pnl),0), COUNT(*) FROM short_trades WHERE side='cover' "
+                                       "AND ts LIKE ? AND COALESCE(schaduw,0)=0", (day,)).fetchone()
+            s_open = con.execute("SELECT COUNT(*) FROM short_trades WHERE side='short' AND ts LIKE ? "
+                                 "AND COALESCE(schaduw,0)=0", (day,)).fetchone()[0]
+            pnl, sells, buys = pnl + s_pnl, sells + s_cov, buys + s_open
             since = datetime.now(timezone.utc).timestamp() - 30 * 86400
             since = datetime.fromtimestamp(since, timezone.utc).isoformat()
             usd, calls = con.execute("SELECT COALESCE(SUM(usd),0), COUNT(*) FROM api_usage WHERE ts >= ?",
@@ -1355,13 +1361,12 @@ class Engine:
         stats["long"]["open_pnl"], stats["short"]["open_pnl"] = self.open_pnl()
         # Live: gerealiseerd resultaat + actuele waarde van open posities, en BTC vasthouden tegen de koers van nu.
         real_pos = [p for p in positions if not p["schaduw"]]  # schaduwtrades zijn geen echt geld
-        open_value = sum(p["value_now"] or 0 for p in real_pos)
-        open_pnl = sum(p["pnl_now"] or 0 for p in real_pos)
+        real_short = [p for p in short_positions if not p["schaduw"]]
+        open_value = sum(p["value_now"] or 0 for p in real_pos) + sum(p["value_now"] or 0 for p in real_short)
+        open_pnl = sum(p["pnl_now"] or 0 for p in real_pos) + sum(p["pnl_now"] or 0 for p in real_short)
         live_bot = live_hold = None
         try:
-            with self.db() as con:
-                realized = con.execute("SELECT COALESCE(SUM(pnl),0) FROM trades WHERE side='sell' AND COALESCE(schaduw,0)=0").fetchone()[0]
-            live_bot = round(budget + realized + open_pnl, 2)
+            live_bot = round(budget + self.realized_all() + open_pnl, 2)
             start = self.meta_get("btc_start_price")
             if start:
                 live_hold = round(budget * self.price("BTC-EUR") / float(start), 2)
@@ -1536,14 +1541,25 @@ class Engine:
             except Exception:
                 pass
 
+    def realized_all(self):
+        """Gerealiseerd resultaat van de bot: longs én shorts (geen schaduwtrades)."""
+        with self.db() as con:
+            a = con.execute("SELECT COALESCE(SUM(pnl),0) FROM trades WHERE side='sell' "
+                            "AND COALESCE(schaduw,0)=0").fetchone()[0]
+            b = con.execute("SELECT COALESCE(SUM(pnl),0) FROM short_trades WHERE side='cover' "
+                            "AND COALESCE(schaduw,0)=0").fetchone()[0]
+        return a + b
+
     def summary(self):
         budget = float(self.rules["budget_eur"])
         unrealized = 0.0
         for m, p in self.get_positions().items():
             if not p.get("schaduw"):
                 unrealized += p["amount"] * self.price(m) - p["cost_eur"]
-        with self.db() as con:
-            pnl = con.execute("SELECT COALESCE(SUM(pnl),0) FROM trades WHERE side='sell' AND COALESCE(schaduw,0)=0").fetchone()[0]
+        for m, p in self.get_short_positions().items():
+            if not p.get("schaduw"):
+                unrealized += self.short_pnl(p, self.price(m))[0]
+        pnl = self.realized_all()
         try:
             btc = self.price("BTC-EUR")
             start = self.meta_get("btc_start_price")

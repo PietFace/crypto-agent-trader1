@@ -272,6 +272,24 @@ class ClaudeLink:
             return {"months": months, "exchange": ex, "fee_pct": rules.get("fee_pct"),
                     "leverage": rules.get("leverage", 1), "varianten": rows,
                     "tekst": backtest.variants_text(rows, months, ex)}
+        if kind == "invo_dag":
+            # Controle: is het Invo-bestand van een dag er, en hoe ziet het eruit?
+            import tape as tp
+            import lz4.frame
+            import requests
+            day = str(job.get("day"))
+            r = requests.get(tp.FILLS_URL.format(b=tp.INVO_BUILDER, d=day), timeout=60)
+            out = {"day": day, "http": r.status_code, "bytes": len(r.content)}
+            if r.status_code == 200:
+                text = lz4.frame.decompress(r.content).decode("utf-8", "replace")
+                lines = text.splitlines()
+                out.update({"regels": len(lines), "eerste": lines[:4], "laatste": lines[-2:]})
+                parsed = tp._invo_fills(settings.data_dir(), day)
+                out["gelezen"] = len(parsed)
+                out["voorbeeld_gelezen"] = parsed[:2]
+                t_min = tp._con(tp.tape_db(settings.data_dir())).execute("SELECT MIN(t) FROM tape").fetchone()[0]
+                out["na_tape_start"] = sum(1 for f in parsed if t_min and f[0] >= t_min)
+            return out
         if kind == "leiders":
             import tape as tp
             return tp.leaders(settings.data_dir(), days=int(job.get("days", 2)),

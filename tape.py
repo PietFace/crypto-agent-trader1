@@ -175,7 +175,9 @@ def _invo_fills(data_dir, day):
     path = os.path.join(data_dir, f"invo_side_{day}.json")
     today = datetime.now(timezone.utc).strftime("%Y%m%d")
     if os.path.exists(path) and day != today:
-        return json.load(open(path, encoding="utf-8"))
+        cached = json.load(open(path, encoding="utf-8"))
+        if cached:
+            return cached
     r = requests.get(FILLS_URL.format(b=INVO_BUILDER, d=day), timeout=60)
     if r.status_code != 200:
         return []
@@ -194,7 +196,7 @@ def _invo_fills(data_dir, day):
                         (row.get("side") or "").upper()[:1], float(row.get("px") or 0), float(row.get("sz") or 0)])
         except (ValueError, TypeError):
             continue
-    if day != today:
+    if day != today and out:          # nooit een leeg resultaat bewaren (dan blijft het voor altijd leeg)
         json.dump(out, open(path, "w", encoding="utf-8"))
     return out
 
