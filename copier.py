@@ -72,6 +72,7 @@ def trader_state(address, timeout=10):
         pos[str(p.get("coin", "")).upper()] = {
             "side": "long" if szi > 0 else "short", "size": abs(szi),
             "entry": float(p.get("entryPx") or 0),
+            "value": float(p.get("positionValue") or 0),
             "leverage": float(lev.get("value") or 1) if isinstance(lev, dict) else 1.0}
     acct = float((js.get("marginSummary") or {}).get("accountValue") or 0)
     return {"account": acct, "positions": pos}
@@ -305,7 +306,7 @@ class CopyEngine:
             # nieuw geopend -> wij openen
             for coin, side in now_sides.items():
                 if before.get(coin) != side and coin not in mine:
-                    p = st["positions"][coin]
+                    p = dict(st["positions"][coin], account=st["account"], address=t["address"])
                     if self.open(coin, side, p, t):
                         mine = self.positions()
             # opnieuw instappen na vastgezette winst: de trader zit er nog in en de koers is terug bij de instap
@@ -318,6 +319,10 @@ class CopyEngine:
                     self.resize(coin, pos, p, t)
                     mine = self.positions()
         self.check_stops()
+        try:
+            self.check_noodrem()
+        except Exception as ex:
+            self.say_once("noodrem-err", f"Noodrem-controle mislukt ({ex})", "bad")
 
     # --- bijkopen en deels verkopen volgen
     def resize(self, coin, pos, their, t):
@@ -355,18 +360,18 @@ class CopyEngine:
         stop_pct = abs(pos["stop_price"] - pos["entry_price"]) / pos["entry_price"] if pos["entry_price"] else 0.05
         live = bool(pos["echt"]) and bool(self.kx)
         if diff > 0:
-            base = float(pos.get("base_notional") or pos["cost_eur"])
-            cap = base * float(self.cfg.get("max_scale", 3)) - amount * px
-            room = max(0.0, self.budget_room()) * lev
-            add_eur = min(diff * px, cap, room)
-            if add_eur < 5:
+            if self.halted():
                 return
-            with self.e.db() as con:
-                import risk_gate
-                loss, open_risk = risk_gate.day_risk_all(con, self.e.rules)
-            limit = float(self.e.rules["daily_loss_limit_eur"])
-            if loss + open_risk + add_eur * (stop_pct + 2 * fee_pct) > limit:
-                self.e.log(f"Kopie {coin}: {t['name']} kocht bij, wij niet (daglimiet).", "muted")
+            room = max(0.0, self.budget_room()) * lev
+            pot_room = max(0.0, self.pot_risk_room()) / (stop_pct + 2 * fee_pct)
+            caps = [diff * px, room, pot_room]
+            if self.cfg.get("sizing", "verhouding") != "verhouding":
+                base = float(pos.get("base_notional") or pos["cost_eur"])
+                caps.append(base * float(self.cfg.get("max_scale", 3)) - amount * px)
+            add_eur = min(caps)
+            if add_eur < 5:
+                why = "pot-grens" if add_eur == pot_room else "kopieer-budget" if add_eur == room else "max bijkopen"
+                self.say_once(f"add-{coin}", f"Kopie {coin}: {t['name']} kocht bij, wij niet ({why} bereikt).")
                 return
             if live:
                 try:
@@ -493,6 +498,93 @@ class CopyEngine:
         return float(self.cfg.get("stop_pct_lang" if style == "lang" else "stop_pct_kort",
                                   10 if style == "lang" else 3))
 
+    # --- bescherming op de hele pot
+    def pot_value(self):
+        """Wat de kopieer-pot nu waard is: budget + gesloten resultaat + open resultaat."""
+        with self.e.db() as con:
+            realized = con.execute("SELECT COALESCE(SUM(pnl_eur),0) FROM copy_trades").fetchone()[0]
+            open_pnl = con.execute("SELECT COALESCE(SUM(pnl_now),0) FROM copy_positions").fetchone()[0]
+        return self.budget() + realized + open_pnl
+
+    def open_risk(self):
+        """Wat alle open kopieën samen kunnen verliezen tot hun noodstop (incl. kosten)."""
+        fee2 = 2 * kraken.TAKER_FEE_PCT / 100
+        risk = 0.0
+        for pos in self.positions().values():
+            px = pos.get("price_now") or pos["entry_price"]
+            d = 1 if pos["side"] == "long" else -1
+            to_stop = max(0.0, d * (px - pos["stop_price"])) * pos["amount"]
+            risk += to_stop + pos["amount"] * px * fee2
+        return risk
+
+    def pot_risk_room(self):
+        """Hoeveel extra risico er nog bij mag binnen de pot-grens (pot_risk_pct van de pot)."""
+        cap = self.pot_value() * float(self.cfg.get("pot_risk_pct", 25)) / 100
+        return cap - self.open_risk()
+
+    def halted(self):
+        return bool(self.e.meta_get("copy_halted"))
+
+    def check_noodrem(self):
+        """Zakt de pot meer dan noodrem_pct onder zijn hoogste stand, dan alles dicht en geen nieuwe kopieën meer
+        tot je de noodrem vrijgeeft."""
+        if not self.cfg.get("noodrem_on", True):
+            return
+        pv = self.pot_value()
+        peak = float(self.e.meta_get("copy_pot_peak") or 0) or max(pv, self.budget())
+        if pv > peak:
+            peak = pv
+        self.e.meta_set("copy_pot_peak", peak)
+        if self.halted():
+            return
+        pct = float(self.cfg.get("noodrem_pct", 15))
+        if pv < peak * (1 - pct / 100):
+            self.e.meta_set("copy_halted", now())
+            self.e.log(f"NOODREM KOPIËREN: de pot staat op €{pv:.2f}, {(1 - pv / peak) * 100:.1f}% onder de top "
+                       f"(€{peak:.2f}). Alle kopieën worden gesloten en er worden geen nieuwe meer geopend tot je "
+                       "de noodrem vrijgeeft bij Kopiëren.", "bad")
+            for coin in list(self.positions()):
+                self.close(coin, f"noodrem: pot {pct:.0f}% onder de top")
+
+    def release_noodrem(self):
+        self.e.meta_set("copy_halted", "")
+        self.e.meta_set("copy_pot_peak", self.pot_value())
+
+    def say_once(self, key, text, kind="muted", every=1800):
+        """Een melding hooguit eens per 'every' seconden (anders vult het logboek zich bij elke controle)."""
+        if not hasattr(self, "_said"):
+            self._said = {}
+        if time.time() - self._said.get(key, 0) >= every:
+            self._said[key] = time.time()
+            self.e.log(text, kind)
+
+    def size_for_open(self, their, stop_pct, lev):
+        """Grootte van een nieuwe kopie in € (positie). Geeft (notional, reden)."""
+        fee2 = 2 * kraken.TAKER_FEE_PCT / 100
+        risk_per_eur = stop_pct / 100 + fee2
+        caps = []
+        if self.cfg.get("sizing", "verhouding") == "verhouding":
+            # Zelfde gewicht als bij de trader: zijn positie / zijn account, toegepast op jouw pot.
+            acct = float(their.get("account") or 0)
+            if their.get("address"):
+                try:   # geld in het spot-deel hoort bij zijn account (Hyperliquid 'unified' accounts)
+                    acct += spot_usdc(their["address"])
+                except Exception:
+                    pass
+            their_notional = float(their.get("value") or 0) or \
+                abs(float(their.get("size") or 0)) * float(their.get("entry") or 0)
+            if acct <= 0 or their_notional <= 0:
+                return 0.0, "geen accountwaarde van de trader"
+            weight = their_notional / acct
+            want = weight * self.pot_value() * float(self.cfg.get("scale_pct", 100)) / 100
+            caps.append((want, f"zelfde verhouding als de trader ({weight * 100:.0f}% van zijn account)"))
+        else:
+            caps.append((self.max_loss() / risk_per_eur, "max verlies per kopie"))
+        caps.append((max(0.0, self.budget_room()) * lev, "kopieer-budget"))
+        caps.append((max(0.0, self.pot_risk_room()) / risk_per_eur, "pot-grens"))
+        notional, why = min(caps, key=lambda c: c[0])
+        return notional, why
+
     def open(self, coin, side, their, t):
         kr = self.kr
         sym = kraken.symbol_for_coin(coin)
@@ -519,21 +611,18 @@ class CopyEngine:
         # Grootte zoals bij de gewone bot: terugrekenen vanuit het max verlies per trade (incl. kosten),
         # begrensd door 'max per aankoop' x hefboom en door wat er nog vrij is in het kopieer-budget.
         fee2 = 2 * kraken.TAKER_FEE_PCT / 100
-        by_risk = self.max_loss() / (stop_pct / 100 + fee2)
-        room = self.budget_room()
-        notional = min(by_risk, float(rules["max_trade_eur"]) * lev, max(0.0, room) * lev)
-        why = ("max verlies per trade" if notional == by_risk else
-               "max per aankoop" if notional == float(rules["max_trade_eur"]) * lev else "kopieer-budget")
+        if self.halted():
+            self.say_once("halt", "Kopiëren staat stil door de noodrem; geef hem vrij bij Kopiëren om weer te openen.")
+            return False
+        notional, why = self.size_for_open(their, stop_pct, lev)
         if notional < 5:
-            self.e.log(f"Kopie {t['name']}: {coin} overgeslagen, kopieer-budget op (nog €{room:.2f} vrij).", "muted")
+            self.say_once(f"skip-{coin}", f"Kopie {t['name']}: {coin} overgeslagen ({why}: nog maar €{notional:.2f}).")
             return False
         with self.e.db() as con:
             import risk_gate
-            loss, open_risk = risk_gate.day_risk_all(con, rules)
-        new_risk = notional * (stop_pct / 100 + fee2)
-        if loss + open_risk + new_risk > limit:
-            self.e.log(f"Kopie {t['name']}: {coin} overgeslagen, daglimiet: verlies vandaag €{loss:.2f} + open "
-                       f"risico €{open_risk:.2f} + deze €{new_risk:.2f} > €{limit:.2f}", "muted")
+            loss, _ = risk_gate.day_risk_all(con, rules)
+        if loss >= limit:   # alleen het echt gemaakte verlies van vandaag; het open risico bewaakt de pot-grens
+            self.say_once("daylimit", f"Kopiëren: daglimiet bereikt (verlies vandaag €{loss:.2f}), geen nieuwe kopieën.")
             return False
         px = kr.price(sym)
         ext = None

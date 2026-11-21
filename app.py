@@ -800,82 +800,105 @@ class CopyPage(QWidget):
         self.win = win
         self._q = queue.Queue()
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        inner = QWidget()
-        inner.setObjectName("page")
-        v = QVBoxLayout(inner)
-        v.setContentsMargins(28, 24, 28, 24)
-        v.setSpacing(10)
-        scroll.setWidget(inner)
-        outer.addWidget(scroll)
+        outer.setContentsMargins(28, 24, 28, 16)
+        outer.setSpacing(10)
 
+        def tab_page():
+            """Een tabblad met eigen scrollbalk; geeft (widget, layout)."""
+            sc = QScrollArea()
+            sc.setWidgetResizable(True)
+            w = QWidget()
+            w.setObjectName("page")
+            lay = QVBoxLayout(w)
+            lay.setContentsMargins(0, 12, 8, 12)
+            lay.setSpacing(10)
+            sc.setWidget(w)
+            return sc, lay
+
+        # --- kop: titel, status, opslaan
         top = QHBoxLayout()
         top.addWidget(lab("Kopiëren", "h1"))
+        self.state_lbl = lab("", "sub")
+        top.addWidget(self.state_lbl)
         top.addStretch(1)
         self.save_btn = QPushButton("Opslaan")
         self.save_btn.setObjectName("primary")
         self.save_btn.clicked.connect(self.save)
         top.addWidget(self.save_btn)
-        v.addLayout(top)
-        v.addWidget(lab("Volgt gekozen traders 1-op-1 op Kraken: opent hij een nieuwe positie, dan opent de bot "
-                        "dezelfde kant; sluit hij, dan sluit de bot ook. Alleen nieuwe posities, nooit instappen in "
-                        "een positie die al openstond. Elke kopie krijgt een noodstop. Wijzigingen gelden na het "
-                        "opnieuw starten van de bot.", "hint", wrap=True))
+        outer.addLayout(top)
 
-        g = QGroupBox("Instellingen")
-        f = QFormLayout(g)
-        self.on = QCheckBox("Kopieer-modus aan")
-        f.addRow("", self.on)
-        self.live = QCheckBox("Live: echt geld (werkt alleen als de bot zelf live op Kraken staat)")
-        self.live.toggled.connect(self._confirm_live)
-        f.addRow("", self.live)
-        self.every = QSpinBox(); self.every.setRange(2, 60); self.every.setSuffix(" s")
-        f.addRow("Kijken elke", self.every)
-        self.rt = QCheckBox("Live-verbinding: Hyperliquid meldt trades direct (binnen ~1 s, max 10 traders)")
-        f.addRow("", self.rt)
-        self.stake = QDoubleSpinBox(); self.stake.setRange(2, 500); self.stake.setPrefix("€ ")   # oud, niet meer gebruikt
-        self.budget_info = lab("", "sub", wrap=True)
-        f.addRow("Budget en risico", self.budget_info)
-        self.maxloss = QDoubleSpinBox(); self.maxloss.setRange(0.5, 100); self.maxloss.setSingleStep(0.5)
-        self.maxloss.setPrefix("€ ")
-        self.maxloss.setToolTip("Hoeveel een kopie maximaal mag kosten als de noodstop geraakt wordt. "
-                                "Hieruit rekent de bot de positiegrootte terug. Los van de gewone bot.")
-        f.addRow("Max verlies per kopie", self.maxloss)
-        self.maxlev = QSpinBox(); self.maxlev.setRange(1, 10); self.maxlev.setSuffix("x")
-        f.addRow("Hefboom max", self.maxlev)
-        self.maxpos = QSpinBox(); self.maxpos.setRange(1, 20)
-        f.addRow("Max kopieën tegelijk", self.maxpos)
-        self.dayloss = QDoubleSpinBox(); self.dayloss.setRange(1, 1000); self.dayloss.setPrefix("€ ")  # oud
-        self.stop_l = QDoubleSpinBox(); self.stop_l.setRange(0.5, 50); self.stop_l.setSuffix(" %")
-        f.addRow("Noodstop lange traders", self.stop_l)
-        self.stop_k = QDoubleSpinBox(); self.stop_k.setRange(0.5, 50); self.stop_k.setSuffix(" %")
-        f.addRow("Noodstop korte traders", self.stop_k)
-        self.follow_size = QCheckBox("Bijkopen en deels verkopen van de trader meedoen (naar verhouding)")
-        f.addRow("", self.follow_size)
-        self.max_scale = QDoubleSpinBox(); self.max_scale.setRange(1, 10); self.max_scale.setSingleStep(0.5)
-        self.max_scale.setPrefix("tot "); self.max_scale.setSuffix(" x de beginpositie")
-        f.addRow("Bijkopen hooguit", self.max_scale)
-        self.resize_min = QDoubleSpinBox(); self.resize_min.setRange(2, 50); self.resize_min.setSuffix(" %")
-        f.addRow("Pas aanpassen vanaf", self.resize_min)
-        self.hint = lab("", "hint", wrap=True)
-        f.addRow("", self.hint)
-        for w in (self.stake, self.maxlev, self.stop_l, self.stop_k, self.maxloss):
-            w.valueChanged.connect(self._update_hint)
-        v.addWidget(g)
+        # --- pot: altijd zichtbaar
+        pot = QHBoxLayout()
+        pot.setSpacing(12)
+        self.t_pot = StatTile("Pot nu")
+        self.t_total = StatTile("Resultaat")
+        self.t_risk = StatTile("Risico in gebruik")
+        self.t_brake = StatTile("Noodrem")
+        for t in (self.t_pot, self.t_total, self.t_risk, self.t_brake):
+            pot.addWidget(t)
+        outer.addLayout(pot)
+        brake_row = QHBoxLayout()
+        self.brake_btn = QPushButton("Noodrem vrijgeven")
+        self.brake_btn.clicked.connect(self.release_brake)
+        self.brake_btn.setVisible(False)
+        brake_row.addWidget(self.brake_btn)
+        brake_row.addStretch(1)
+        outer.addLayout(brake_row)
 
-        v.addWidget(lab("TRADERS (één per regel: adres naam lang/kort)", "cap"))
+        self.tabs = QTabWidget()
+        outer.addWidget(self.tabs, 1)
+
+        # ===== Tab 1: Nu (open kopieën en wat de traders open hebben)
+        w1, v = tab_page()
+        v.addWidget(lab("OPEN KOPIEËN", "cap"))
+        self.open_t = table(["Geopend", "Munt", "Kant", "Hefboom", "Positie", "Inzet", "Instap", "Koers nu",
+                             "Resultaat", "Noodstop", "Trader", "Echt"])
+        self.open_t.setMinimumHeight(170)
+        v.addWidget(self.open_t)
+        v.addWidget(lab("WAT DE TRADERS NU OPEN HEBBEN (HYPERLIQUID)", "cap"))
+        v.addWidget(lab("Leg dit naast 'Active' op hun Invo-profiel: zelfde munt, kant en instap = de juiste persoon.",
+                        "hint", wrap=True))
+        self.tpos = table(["Trader", "Adres", "Munt", "Kant", "Hefboom", "Instapprijs $", "Positie $", "Account $",
+                           "Bijgewerkt", "Gekopieerd?"])
+        self.tpos.setMinimumHeight(200)
+        v.addWidget(self.tpos)
+        v.addStretch(1)
+        self.tabs.addTab(w1, "Nu")
+
+        # ===== Tab 2: Resultaten (per trader + gesloten)
+        w2, v = tab_page()
+        tiles = QHBoxLayout()
+        self.t_win = StatTile("Winrate")
+        self.t_avg = StatTile("Gem. per trade")
+        self.t_lag = StatTile("Bot vs trader")
+        for t in (self.t_win, self.t_avg, self.t_lag):
+            tiles.addWidget(t)
+        v.addLayout(tiles)
+        v.addWidget(lab("PER TRADER", "cap"))
+        self.per_trader = table(["Trader", "Trades", "Winrate", "Totaal €", "Gem. bot %", "Gem. trader %",
+                                 "Achterstand", "Beste", "Slechtste"])
+        self.per_trader.setMinimumHeight(170)
+        v.addWidget(self.per_trader)
+        v.addWidget(lab("GESLOTEN KOPIEËN", "cap"))
+        self.closed_t = table(["Dicht", "Munt", "Kant", "Trader", "Bot €", "Bot % inzet", "Trader % (zelfde hefboom)",
+                               "Kosten", "Reden"])
+        self.closed_t.setMinimumHeight(260)
+        v.addWidget(self.closed_t)
+        self.total = lab("", "sub", wrap=True)
+        v.addWidget(self.total)
+        self.tabs.addTab(w2, "Resultaten")
+
+        # ===== Tab 3: Traders (lijst + zoeken)
+        w3, v = tab_page()
+        v.addWidget(lab("GEVOLGDE TRADERS", "cap"))
+        v.addWidget(lab("Eén per regel: adres naam lang/kort. Klik daarna op Opslaan.", "hint"))
         self.traders = QPlainTextEdit()
         self.traders.setPlaceholderText("0x1234…abcd blackstallion lang")
-        self.traders.setMaximumHeight(140)
+        self.traders.setMinimumHeight(130)
+        self.traders.setMaximumHeight(170)
         v.addWidget(self.traders)
-
-        v.addWidget(lab("INVO-TRADER ZOEKEN (vingerafdruk)", "cap"))
-        v.addWidget(lab("Zoekt in de openbare Invo-trades op Hyperliquid naar het adres dat dezelfde trades deed als "
-                        "op het Invo-profiel. De eerste keer duurt het een paar minuten (60 dagen aan bestanden), "
-                        "daarna gaat het snel. Dubbelklik op een uitkomst om hem bij de traders te zetten.",
-                        "hint", wrap=True))
+        gz = QGroupBox("Een Invo-trader zoeken")
+        zv = QVBoxLayout(gz)
         row = QHBoxLayout()
         import copier
         self.fp = QComboBox()
@@ -885,74 +908,110 @@ class CopyPage(QWidget):
         self.find_btn.clicked.connect(self.find)
         row.addWidget(self.find_btn)
         row.addStretch(1)
-        v.addLayout(row)
+        zv.addLayout(row)
         own = QHBoxLayout()
         self.own_name = QLineEdit(); self.own_name.setPlaceholderText("naam, bijv. apx")
         self.own_name.setMaximumWidth(150)
         own.addWidget(self.own_name)
         self.own_trades = QLineEdit()
-        self.own_trades.setPlaceholderText("eigen trades van het Invo-profiel (Closed): munt prijs; munt prijs; … "
-                                           "bijv. BTC 63071; ETH 1823.30; SOL 74.98")
+        self.own_trades.setPlaceholderText("eigen trades (Closed op Invo): munt prijs; munt prijs; …  bijv. BTC 63071; ETH 1823.30")
         own.addWidget(self.own_trades, 1)
         self.own_acct = QLineEdit(); self.own_acct.setPlaceholderText("account $ (als zichtbaar)")
         self.own_acct.setMaximumWidth(170)
         own.addWidget(self.own_acct)
         self.own_style = QComboBox(); self.own_style.addItems(["lang", "kort"])
         own.addWidget(self.own_style)
-        v.addLayout(own)
-        v.addWidget(lab("Vul je eigen trades in om iemand te (her)zoeken; dan wordt de lijst hierboven genegeerd. "
-                        "Gebruik afgesloten trades van gisteren of eerder: Hyperliquid publiceert de Invo-bestanden "
-                        "pas na afloop van een dag. Hoe exacter de prijzen (alle decimalen), hoe beter.", "hint", wrap=True))
+        zv.addLayout(own)
+        zv.addWidget(lab("Tip: Claude kan ook voor je zoeken via de Claude-map; voorstellen verschijnen hieronder.",
+                         "hint", wrap=True))
         self.find_status = lab("", "sub", wrap=True)
-        v.addWidget(self.find_status)
+        zv.addWidget(self.find_status)
         self.found = table(["Invo-naam", "Adres", "Treffers", "Account $ nu", "Account $ op Invo", "Stijl", "Zekerheid"])
         self.found.setSelectionMode(QTableWidget.ExtendedSelection)
         self.found.setSelectionBehavior(QTableWidget.SelectRows)
         self.found.cellDoubleClicked.connect(self._add_found)
-        self.found.setMinimumHeight(180)
-        v.addWidget(self.found)
+        self.found.setMinimumHeight(170)
+        zv.addWidget(self.found)
         addrow = QHBoxLayout()
         self.add_btn = QPushButton("Aangevinkte toevoegen")
         self.add_btn.clicked.connect(self._add_selected)
         addrow.addWidget(self.add_btn)
-        addrow.addWidget(lab("Vink de blokjes voor de namen aan en druk op deze knop. Dubbelklikken op een naam kan ook.",
-                             "hint"))
         addrow.addStretch(1)
-        v.addLayout(addrow)
+        zv.addLayout(addrow)
+        v.addWidget(gz)
+        v.addStretch(1)
+        self.tabs.addTab(w3, "Traders")
 
-        v.addWidget(lab("STATISTIEK KOPIËREN", "cap"))
-        tiles = QHBoxLayout()
-        self.t_total = StatTile("Resultaat")
-        self.t_win = StatTile("Winrate")
-        self.t_avg = StatTile("Gem. per trade")
-        self.t_lag = StatTile("Bot vs trader")
-        for t in (self.t_total, self.t_win, self.t_avg, self.t_lag):
-            tiles.addWidget(t)
-        v.addLayout(tiles)
-        self.per_trader = table(["Trader", "Trades", "Winrate", "Totaal €", "Gem. bot %", "Gem. trader %",
-                                 "Achterstand", "Beste", "Slechtste"])
-        self.per_trader.setMinimumHeight(150)
-        v.addWidget(self.per_trader)
-        v.addWidget(lab("CONTROLE: WAT DE GEVOLGDE TRADERS NU OPEN HEBBEN (HYPERLIQUID)", "cap"))
-        v.addWidget(lab("Leg dit naast het tabblad 'Open' op hun Invo-profiel. Zelfde munten, kant, hefboom en (bijna) "
-                        "dezelfde instapprijs = de bot volgt de juiste persoon. Klopt het niet, haal die trader dan weg "
-                        "en zoek hem opnieuw.", "hint", wrap=True))
-        self.tpos = table(["Trader", "Adres", "Munt", "Kant", "Hefboom", "Instapprijs $", "Positie $", "Account $",
-                           "Bijgewerkt", "Gekopieerd?"])
-        self.tpos.setMinimumHeight(160)
-        v.addWidget(self.tpos)
-        v.addWidget(lab("OPEN KOPIEËN", "cap"))
-        self.open_t = table(["Geopend", "Munt", "Kant", "Hefboom", "Positie", "Inzet", "Instap", "Koers nu",
-                             "Resultaat", "Noodstop", "Trader", "Echt"])
-        self.open_t.setMinimumHeight(140)
-        v.addWidget(self.open_t)
-        v.addWidget(lab("GESLOTEN KOPIEËN (bot naast de trader)", "cap"))
-        self.closed_t = table(["Dicht", "Munt", "Kant", "Trader", "Bot €", "Bot % inzet", "Trader % (zelfde hefboom)",
-                               "Kosten", "Reden"])
-        self.closed_t.setMinimumHeight(220)
-        v.addWidget(self.closed_t)
-        self.total = lab("", "sub", wrap=True)
-        v.addWidget(self.total)
+        # ===== Tab 4: Instellingen, in blokken
+        w4, v = tab_page()
+        g1 = QGroupBox("Aan en uit")
+        f = QFormLayout(g1)
+        self.on = QCheckBox("Kopieer-modus aan")
+        f.addRow("", self.on)
+        self.live = QCheckBox("Live: echt geld (alleen als de bot zelf live op Kraken staat)")
+        self.live.toggled.connect(self._confirm_live)
+        f.addRow("", self.live)
+        self.rt = QCheckBox("Live-verbinding: trades binnen ~1 s (max 10 traders)")
+        f.addRow("", self.rt)
+        self.every = QSpinBox(); self.every.setRange(2, 60); self.every.setSuffix(" s")
+        f.addRow("Daarnaast kijken elke", self.every)
+        v.addWidget(g1)
+
+        g2 = QGroupBox("Grootte van een kopie")
+        f = QFormLayout(g2)
+        self.sizing = QComboBox()
+        self.sizing.addItems(["Zelfde verhouding als de trader", "Vast: max verlies per kopie"])
+        self.sizing.currentIndexChanged.connect(self._update_hint)
+        f.addRow("Manier", self.sizing)
+        self.scale = QSpinBox(); self.scale.setRange(10, 300); self.scale.setSuffix(" % van zijn verhouding")
+        self.scale.setToolTip("100% = jouw kopie weegt in jouw pot even zwaar als zijn positie in zijn account.")
+        f.addRow("Schaal", self.scale)
+        self.maxloss = QDoubleSpinBox(); self.maxloss.setRange(0.5, 100); self.maxloss.setSingleStep(0.5)
+        self.maxloss.setPrefix("€ ")
+        f.addRow("Max verlies per kopie (bij 'Vast')", self.maxloss)
+        self.maxlev = QSpinBox(); self.maxlev.setRange(1, 10); self.maxlev.setSuffix("x")
+        f.addRow("Hefboom max", self.maxlev)
+        self.maxpos = QSpinBox(); self.maxpos.setRange(1, 20)
+        f.addRow("Max kopieën tegelijk", self.maxpos)
+        self.budget_info = lab("", "sub", wrap=True)
+        f.addRow("Budget", self.budget_info)
+        v.addWidget(g2)
+
+        g3 = QGroupBox("Bijkopen en afbouwen")
+        f = QFormLayout(g3)
+        self.follow_size = QCheckBox("Meedoen als de trader bijkoopt of een deel verkoopt (naar verhouding)")
+        f.addRow("", self.follow_size)
+        self.resize_min = QDoubleSpinBox(); self.resize_min.setRange(2, 50); self.resize_min.setSuffix(" %")
+        f.addRow("Pas aanpassen vanaf", self.resize_min)
+        self.max_scale = QDoubleSpinBox(); self.max_scale.setRange(1, 10); self.max_scale.setSingleStep(0.5)
+        self.max_scale.setPrefix("tot "); self.max_scale.setSuffix(" x de beginpositie")
+        f.addRow("Bijkopen hooguit (bij 'Vast')", self.max_scale)
+        v.addWidget(g3)
+
+        g4 = QGroupBox("Bescherming")
+        f = QFormLayout(g4)
+        self.pot_risk = QSpinBox(); self.pot_risk.setRange(5, 100); self.pot_risk.setSuffix(" % van de pot")
+        self.pot_risk.setToolTip("Alle open kopieën samen mogen tot hun noodstops niet meer kunnen verliezen dan dit.")
+        f.addRow("Samen max risico", self.pot_risk)
+        self.brake_on = QCheckBox("Noodrem: alles dicht als de pot te ver onder zijn hoogste stand zakt")
+        f.addRow("", self.brake_on)
+        self.brake_pct = QSpinBox(); self.brake_pct.setRange(3, 60); self.brake_pct.setSuffix(" % onder de top")
+        f.addRow("Noodrem bij", self.brake_pct)
+        self.stop_l = QDoubleSpinBox(); self.stop_l.setRange(0.5, 50); self.stop_l.setSuffix(" %")
+        f.addRow("Noodstop per kopie, lange traders", self.stop_l)
+        self.stop_k = QDoubleSpinBox(); self.stop_k.setRange(0.5, 50); self.stop_k.setSuffix(" %")
+        f.addRow("Noodstop per kopie, korte traders", self.stop_k)
+        v.addWidget(g4)
+        self.hint = lab("", "hint", wrap=True)
+        v.addWidget(self.hint)
+        # oude velden die nog in de code bestaan maar niet meer getoond worden
+        self.stake = QDoubleSpinBox(); self.stake.setRange(2, 500)
+        self.dayloss = QDoubleSpinBox(); self.dayloss.setRange(1, 1000)
+        for w in (self.maxlev, self.stop_l, self.stop_k, self.maxloss, self.scale, self.pot_risk, self.brake_pct):
+            w.valueChanged.connect(self._update_hint)
+        v.addStretch(1)
+        self.tabs.addTab(w4, "Instellingen")
+
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll)
         self._loading = False
@@ -976,6 +1035,11 @@ class CopyPage(QWidget):
         self.follow_size.setChecked(bool(c.get("follow_size", True)))
         self.max_scale.setValue(float(c.get("max_scale", d["max_scale"])))
         self.resize_min.setValue(float(c.get("resize_min_pct", d["resize_min_pct"])))
+        self.sizing.setCurrentIndex(0 if c.get("sizing", d["sizing"]) == "verhouding" else 1)
+        self.scale.setValue(int(c.get("scale_pct", d["scale_pct"])))
+        self.pot_risk.setValue(int(c.get("pot_risk_pct", d["pot_risk_pct"])))
+        self.brake_on.setChecked(bool(c.get("noodrem_on", d["noodrem_on"])))
+        self.brake_pct.setValue(int(c.get("noodrem_pct", d["noodrem_pct"])))
         self.traders.setPlainText("\n".join(f"{t['address']} {t.get('name', '')} {t.get('style', 'lang')}"
                                             for t in c.get("traders", [])))
         self._loading = False
@@ -998,6 +1062,9 @@ class CopyPage(QWidget):
             "stop_pct_lang": round(self.stop_l.value(), 2), "stop_pct_kort": round(self.stop_k.value(), 2),
             "follow_size": self.follow_size.isChecked(), "max_scale": round(self.max_scale.value(), 1),
             "resize_min_pct": round(self.resize_min.value(), 1),
+            "sizing": "verhouding" if self.sizing.currentIndex() == 0 else "vast",
+            "scale_pct": self.scale.value(), "pot_risk_pct": self.pot_risk.value(),
+            "noodrem_on": self.brake_on.isChecked(), "noodrem_pct": self.brake_pct.value(),
             "trail": bool((self.win.cfg.get("copy") or {}).get("trail", False)),   # staat bij Instellingen
             "traders": traders}
         settings.save(self.win.cfg)
@@ -1011,19 +1078,26 @@ class CopyPage(QWidget):
         r = cfg["rules"]
         bot_b, copy_b = settings.budgets(cfg)
         lev = self.maxlev.value()
-        ml = self.maxloss.value()
-        self.budget_info.setText(
-            f"Kopieer-budget €{copy_b:.0f} van totaal €{float(r['budget_eur']):.0f} (in te stellen bij Instellingen). "
-            f"Eén daglimiet van €{float(r['daily_loss_limit_eur']):.2f} voor gewone bot en kopiëren samen.")
-        def size(stop):
-            st = min(stop, 80 / lev)
-            return min(ml / (st / 100 + 0.001), float(r["max_trade_eur"]) * lev), st
-        nl, sl = size(self.stop_l.value())
-        nk, sk = size(self.stop_k.value())
-        self.hint.setText(f"Bij {lev}x: lange trader → positie ~€{nl:.0f} (inzet €{nl / lev:.2f}, noodstop {sl:.1f}%); "
-                          f"korte trader → positie ~€{nk:.0f} (inzet €{nk / lev:.2f}, noodstop {sk:.1f}%). "
-                          "Kleinere stop = grotere positie, maar het verlies bij de stop blijft max "
-                          f"€{ml:.2f}.")
+        self.budget_info.setText(f"€{copy_b:.0f} voor kopiëren (van totaal €{float(r['budget_eur']):.0f}; in te "
+                                 "stellen bij Instellingen → Handelen).")
+        prop = self.sizing.currentIndex() == 0
+        self.scale.setEnabled(prop)
+        self.maxloss.setEnabled(not prop)
+        self.max_scale.setEnabled(not prop)
+        pot_risk = copy_b * self.pot_risk.value() / 100
+        brake = copy_b * self.brake_pct.value() / 100
+        if prop:
+            ex = 0.04 * copy_b * self.scale.value() / 100
+            how = (f"Zet een trader 4% van zijn account in een positie, dan wordt jouw kopie ~€{ex:.2f} positie "
+                   f"(4% van je pot{'' if self.scale.value() == 100 else f' x {self.scale.value()}%'}), "
+                   f"met maximaal {lev}x hefboom. Bijkopen en afbouwen gaan mee in dezelfde verhouding.")
+        else:
+            how = (f"Elke kopie is zo groot dat hij bij de noodstop max €{self.maxloss.value():.2f} kost; "
+                   f"bijkopen tot {self.max_scale.value():.1f}x de beginpositie.")
+        self.hint.setText(how + f" Alle kopieën samen kunnen tot hun noodstops nooit meer dan ~€{pot_risk:.0f} "
+                          f"verliezen ({self.pot_risk.value()}% van de pot)"
+                          + (f"; zakt de pot €{brake:.0f} ({self.brake_pct.value()}%) onder zijn hoogste stand, dan "
+                             "gaat alles dicht." if self.brake_on.isChecked() else "."))
 
     def _confirm_live(self, on):
         if self._loading or not on:
@@ -1230,10 +1304,23 @@ class CopyPage(QWidget):
 
     def _stats(self):
         """Tegels en tabel per trader. Achterstand = gemiddeld (trader % − bot %) per trade, op dezelfde hefboom."""
-        data = query("SELECT trader_name, pnl_eur, pnl_pct, trader_pct, fee_eur FROM copy_trades")
+        raw = query("SELECT trader_name, pnl_eur, pnl_pct, trader_pct, fee_eur, coin, opened, "
+                    "cost_eur / MAX(COALESCE(leverage,1),1) FROM copy_trades ORDER BY id")
+        # Een kopie die in stukjes is afgebouwd telt als één trade: samenvoegen op trader + munt + openingstijd.
+        groups = {}
+        for name, p, bp, tp, fe, coin, opened, cost in raw:
+            g = groups.setdefault((name, coin, opened), [name, 0.0, 0.0, None, 0.0, 0.0])
+            g[1] += p or 0
+            g[4] += fe or 0
+            g[5] += cost or 0
+            if tp is not None:
+                g[3] = tp
+        data = []
+        for (name, coin, opened), g in groups.items():
+            data.append((name, g[1], g[1] / g[5] * 100 if g[5] else None, g[3], g[4]))
         good, bad = C.get("good", "#4ade80"), C.get("bad", "#f87171")
         if not data:
-            for t in (self.t_total, self.t_win, self.t_avg, self.t_lag):
+            for t in (self.t_win, self.t_avg, self.t_lag):
                 t.set("–", "nog geen gesloten kopieën")
             fill(self.per_trader, [])
             return
@@ -1242,7 +1329,6 @@ class CopyPage(QWidget):
         wins = sum(1 for x in pnl if x > 0)
         fees = sum(d[4] or 0 for d in data)
         lags = [(d[3] - d[2]) for d in data if d[3] is not None and d[2] is not None]
-        self.t_total.set(eur(tot, True), f"{n} trades, waarvan {eur(fees)} kosten", good if tot >= 0 else bad)
         self.t_win.set(f"{wins / n * 100:.0f}%", f"{wins} winst, {n - wins} verlies")
         self.t_avg.set(eur(tot / n, True), f"beste {eur(max(pnl), True)}, slechtste {eur(min(pnl), True)}",
                        good if tot >= 0 else bad)
@@ -1285,8 +1371,62 @@ class CopyPage(QWidget):
         fill(self.tpos, rows)
 
     # --- tabellen
+    def release_brake(self):
+        eng = self.win.engine
+        if eng is not None and getattr(eng, "copier", None):
+            eng.copier.release_noodrem()
+        else:
+            import dbutil
+            with dbutil.connect(settings.db_path()) as con:
+                con.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('copy_halted', '')")
+                con.execute("DELETE FROM meta WHERE key='copy_pot_peak'")
+        self.win.log("Noodrem kopiëren vrijgegeven: er mogen weer nieuwe kopieën geopend worden.", "info")
+        self.refresh()
+
+    def _pot(self):
+        cfg = self.win.cfg
+        c = cfg.get("copy") or {}
+        budget = settings.budgets(cfg)[1]
+        one = lambda sql: ((query(sql) or [[0]])[0][0] or 0)
+        realized = one("SELECT COALESCE(SUM(pnl_eur),0) FROM copy_trades")
+        open_pnl = one("SELECT COALESCE(SUM(pnl_now),0) FROM copy_positions")
+        pv = budget + realized + open_pnl
+        risk = 0.0
+        for side, amount, stop, entry, pxn in query("SELECT side, amount, stop_price, entry_price, price_now "
+                                                    "FROM copy_positions"):
+            px = pxn or entry or 0
+            d = 1 if side == "long" else -1
+            risk += max(0.0, d * (px - (stop or 0))) * (amount or 0) + (amount or 0) * px * 0.001
+        meta = dict(query("SELECT key, value FROM meta WHERE key IN ('copy_pot_peak','copy_halted')"))
+        try:
+            peak = max(float(meta.get("copy_pot_peak") or 0), budget, pv)
+        except ValueError:
+            peak = max(budget, pv)
+        halted = bool(meta.get("copy_halted"))
+        good, bad = C["good"], C["bad"]
+        self.t_pot.set(eur(pv), f"budget {eur(budget)} · hoogste stand {eur(peak)}", good if pv >= budget else bad)
+        res = pv - budget
+        self.t_total.set(eur(res, True), f"gesloten {eur(realized, True)} · open {eur(open_pnl, True)}",
+                         good if res >= 0 else bad)
+        cap = pv * float(c.get("pot_risk_pct", 25)) / 100
+        self.t_risk.set(eur(risk), f"van max {eur(cap)} ({c.get('pot_risk_pct', 25)}% van de pot)",
+                        bad if risk > cap * 0.9 else None)
+        if not c.get("noodrem_on", True):
+            self.t_brake.set("uit", "geen noodrem op de pot", None)
+        elif halted:
+            self.t_brake.set("GERAAKT", "alles is gesloten; geef hem vrij om verder te gaan", bad)
+        else:
+            pct = float(c.get("noodrem_pct", 15))
+            at = peak * (1 - pct / 100)
+            self.t_brake.set(eur(at), f"bij {pct:.0f}% onder de top · nog {eur(pv - at)} ruimte", None)
+        self.brake_btn.setVisible(halted)
+        mode = "uit" if not c.get("enabled") else ("LIVE" if c.get("live") else "droog")
+        self.state_lbl.setText(f"  ·  {mode}  ·  {len(c.get('traders', []))} traders"
+                               + ("  ·  noodrem geraakt" if halted else ""))
+
     def refresh(self):
         self._update_hint()
+        self._pot()
         self._trader_positions()
         rows = []
         for r in query("SELECT opened, coin, side, leverage, cost_eur, entry_price, stop_price, trader_name, echt, "
