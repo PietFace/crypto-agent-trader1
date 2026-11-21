@@ -358,12 +358,10 @@ class Engine:
                      f"{self.rules['fee_pct']}% per kant, shorts {'echt' if self.kx else 'gesimuleerd'} en zonder "
                      "leenkosten. Elke positie krijgt een stop-loss bij Kraken zelf.", "info")
             if self.kx:
-                try:
-                    total, free = self.kx.collateral_usd()
-                    self.kraken_account = {"usd": round(total, 2), "free_usd": round(free, 2), "ts": now()}
-                    self.log(f"Kraken-account: ${total:.2f} totaal, ${free:.2f} vrij voor nieuwe posities.", "info")
-                except Exception as e:
-                    self.log(f"Kraken-account niet te lezen: {e}", "bad")
+                acc = self.refresh_kraken_account()
+                if acc:
+                    self.log(f"Kraken-account: ${acc['usd']:.2f} totaal (≈ €{acc['eur']:.2f}), ${acc['free_usd']:.2f} vrij "
+                             "voor nieuwe posities.", "info")
             try:
                 missing = [m for m in self.markets if not self.kr.supported(m)]
                 if missing:
@@ -423,6 +421,8 @@ class Engine:
             except Exception as e:
                 self.busy = False
                 self.log(f"Fout in loop: {e}", "bad")
+            if self.kx and time.time() - getattr(self, "_acc_ts", 0) >= 60:
+                self.refresh_kraken_account()
             if time.time() - last_status >= STATUS_EVERY_SECONDS:
                 self.push_status(True)
                 last_status = time.time()
@@ -1540,6 +1540,30 @@ class Engine:
                 self.remote.push("status", self.status_snapshot(running))
             except Exception:
                 pass
+
+    def refresh_kraken_account(self):
+        """Echte stand van het Kraken-futuresaccount ophalen (in $ en €) en bewaren voor scherm en website."""
+        self._acc_ts = time.time()
+        if not self.kx:
+            return None
+        try:
+            total, free = self.kx.collateral_usd()
+            try:
+                rate = self.kr.eurusd() if self.kr else 0
+            except Exception:
+                rate = 0
+            acc = {"usd": round(total, 2), "free_usd": round(free, 2),
+                   "eur": round(total / rate, 2) if rate else None,
+                   "free_eur": round(free / rate, 2) if rate else None, "ts": now()}
+            self.kraken_account = acc
+            import json as _json
+            self.meta_set("kraken_account", _json.dumps(acc))
+            return acc
+        except Exception as e:
+            if time.time() - getattr(self, "_acc_err", 0) > 1800:
+                self._acc_err = time.time()
+                self.log(f"Kraken-account niet te lezen: {e}", "bad")
+            return None
 
     def realized_all(self):
         """Gerealiseerd resultaat van de bot: longs én shorts (geen schaduwtrades)."""

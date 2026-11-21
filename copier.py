@@ -249,8 +249,13 @@ class CopyEngine:
         every = max(2, int(self.cfg.get("interval_s", 5)))
         names = ", ".join(t["name"] for t in self.traders) or "(nog geen traders)"
         self.e.log(f"Kopieer-modus {'LIVE' if self.live() else 'droog'}: elke {every} s kijken naar {names}. "
-                   f"Budget €{self.budget():.0f}, max verlies €{self.max_loss():.2f} per kopie, "
-                   f"hefboom max {self.cfg.get('max_leverage', 10)}x. Alleen nieuwe posities worden gekopieerd.",
+                   f"Budget €{self.budget():.0f}, "
+                   + (f"grootte naar verhouding van de trader ({self.cfg.get('scale_pct', 100)}%)"
+                      if self.cfg.get("sizing", "verhouding") == "verhouding"
+                      else f"max verlies €{self.max_loss():.2f} per kopie")
+                   + f", samen max {self.cfg.get('pot_risk_pct', 25)}% risico, noodrem "
+                   + (f"{self.cfg.get('noodrem_pct', 15)}% onder de top" if self.cfg.get("noodrem_on", True) else "uit")
+                   + f", hefboom max {self.cfg.get('max_leverage', 10)}x. Alleen nieuwe posities worden gekopieerd.",
                    "info")
         while not self._stop.is_set():
             try:

@@ -100,6 +100,16 @@ def query(sql, args=()):
         return []
 
 
+def kraken_account():
+    """Laatst opgehaalde stand van het echte Kraken-futuresaccount (door de bot elke minuut bijgewerkt)."""
+    try:
+        import json as _json
+        row = query("SELECT value FROM meta WHERE key='kraken_account'")
+        return _json.loads(row[0][0]) if row and row[0][0] else None
+    except Exception:
+        return None
+
+
 def table(headers):
     t = QTableWidget(0, len(headers))
     t.setHorizontalHeaderLabels(headers)
@@ -324,7 +334,9 @@ class BotPage(QWidget):
         self.t_bot.set(eur(total), f"{eur(total - budget, True)} sinds de start · gewone bot "
                        f"{eur(bot_budget + bot_res)} ({eur(bot_res, True)}) · kopiëren "
                        f"{eur(copy_budget + copy_res)} ({eur(copy_res, True)})"
-                       + (f" · live {local_time(ts)}" if ts else ""),
+                       + (f" · live {local_time(ts)}" if ts else "")
+                       + (lambda a: f" · Kraken echt: {eur(a['eur']) if a.get('eur') is not None else '$' + str(a['usd'])}"
+                          if a else "")(kraken_account()),
                        C["good"] if total >= budget else C["bad"])
         hold = None
         try:
@@ -834,7 +846,8 @@ class CopyPage(QWidget):
         self.t_total = StatTile("Resultaat")
         self.t_risk = StatTile("Risico in gebruik")
         self.t_brake = StatTile("Noodrem")
-        for t in (self.t_pot, self.t_total, self.t_risk, self.t_brake):
+        self.t_kraken = StatTile("Kraken (echt geld)")
+        for t in (self.t_kraken, self.t_pot, self.t_total, self.t_risk, self.t_brake):
             pot.addWidget(t)
         outer.addLayout(pot)
         brake_row = QHBoxLayout()
@@ -1420,6 +1433,13 @@ class CopyPage(QWidget):
             at = peak * (1 - pct / 100)
             self.t_brake.set(eur(at), f"bij {pct:.0f}% onder de top · nog {eur(pv - at)} ruimte", None)
         self.brake_btn.setVisible(halted)
+        acc = kraken_account()
+        if acc:
+            eur_txt = eur(acc["eur"]) if acc.get("eur") is not None else f"$ {acc['usd']:.2f}"
+            free = eur(acc["free_eur"]) if acc.get("free_eur") is not None else f"$ {acc['free_usd']:.2f}"
+            self.t_kraken.set(eur_txt, f"${acc['usd']:.2f} · vrij {free} · {local_time(acc.get('ts'))}", None)
+        else:
+            self.t_kraken.set("–", "zichtbaar zodra de bot live op Kraken draait", None)
         mode = "uit" if not c.get("enabled") else ("LIVE" if c.get("live") else "droog")
         self.state_lbl.setText(f"  ·  {mode}  ·  {len(c.get('traders', []))} traders"
                                + ("  ·  noodrem geraakt" if halted else ""))
