@@ -293,8 +293,9 @@ class ClaudeLink:
         if kind == "leiders":
             import tape as tp
             return tp.leaders(settings.data_dir(), days=int(job.get("days", 2)),
-                              window_s=float(job.get("venster_s", 20)), min_users=int(job.get("min_gebruikers", 3)),
-                              top=int(job.get("top", 40)), progress=lambda t: self._progress(stem, t))
+                              window_s=float(job.get("venster_s", 5)), lookback_s=float(job.get("terug_s", 15)),
+                              min_users=int(job.get("min_gebruikers", 4)), top=int(job.get("top", 40)),
+                              min_waves=int(job.get("min_golven", 4)), progress=lambda t: self._progress(stem, t))
         if kind == "tape_status":
             return self.tape.status() if self.tape else {"fout": "meeschrijven staat uit"}
         if kind == "tape":

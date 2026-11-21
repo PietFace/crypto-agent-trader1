@@ -201,21 +201,25 @@ def _invo_fills(data_dir, day):
     return out
 
 
-def leaders(data_dir, days=2, window_s=20, min_users=3, top=40, progress=lambda t: None):
+def leaders(data_dir, days=2, window_s=5, lookback_s=15, min_users=4, top=40, min_waves=4,
+            progress=lambda t: None):
     """Zoek wie de Invo-kopieerders volgen.
 
-    Een 'golf' = minstens min_users verschillende Invo-gebruikers die binnen window_s seconden dezelfde munt
-    dezelfde kant op handelen. Voor elke golf kijken we in de tape wie in de window_s seconden daarvóór dezelfde
-    kant op handelde (als koper bij kopen, als verkoper bij verkopen). Wie dat bij veel golven doet, en weinig
-    andere trades heeft (dus geen market maker is), is een leider."""
+    Een 'golf' = minstens min_users verschillende Invo-gebruikers die binnen window_s seconden dezelfde munt dezelfde
+    kant op handelen. Voor elke golf kijken we wie in de lookback_s seconden daarvóór dezelfde kant op handelde.
+    Drukke handelaren (market makers, bots) zitten toevallig vaak vóór een golf; daarom rekenen we per adres hoe
+    vaak dat bij toeval te verwachten was ('lift' = werkelijk / verwacht). Een echte leider zit er veel vaker dan
+    toeval voor, en met een korte, vaste voorsprong."""
     con = _con(tape_db(data_dir))
-    t_min = con.execute("SELECT MIN(t) FROM tape").fetchone()[0] or time.time()
+    t_min, t_max = con.execute("SELECT MIN(t), MAX(t) FROM tape").fetchone()
+    t_min = t_min or time.time()
+    t_max = t_max or time.time()
     invo_users = set()
     waves = []
     for i in range(days):
         day = (datetime.now(timezone.utc) - timedelta(days=i)).strftime("%Y%m%d")
         progress(f"Invo-golven zoeken op {day}…")
-        fills = [f for f in _invo_fills(data_dir, day) if f[0] >= t_min]
+        fills = [f for f in _invo_fills(data_dir, day) if t_min + lookback_s <= f[0] <= t_max]
         for f in fills:
             invo_users.add(f[1])
         by = defaultdict(list)
@@ -231,90 +235,50 @@ def leaders(data_dir, days=2, window_s=20, min_users=3, top=40, progress=lambda 
                     users.add(fl[k][1])
                     k += 1
                 if len(users) >= min_users:
-                    waves.append((fl[j][0], coin, side, len(users), sum(x[4] * x[5] for x in fl[j:k])))
+                    waves.append((fl[j][0], coin, side, len(users)))
                     j = k
                 else:
                     j += 1
-    progress(f"{len(waves)} golven gevonden; voorgangers zoeken in de tape…")
+    progress(f"{len(waves)} golven; voorgangers zoeken in de tape…")
     hits = defaultdict(lambda: {"golven": 0, "munten": defaultdict(int), "usd": 0.0, "voorsprong": []})
-    for t0, coin, side, n, usd in waves:
+    coins_side = defaultdict(int)
+    for t0, coin, side, n in waves:
+        coins_side[(coin, side)] += 1
         col = "buyer" if side == "B" else "seller"
         rows = con.execute(f"SELECT t, px, sz, {col} FROM tape WHERE coin=? AND t BETWEEN ? AND ?",
-                           (coin, t0 - window_s, t0 - 0.2)).fetchall()
+                           (coin, t0 - lookback_s, t0 - 0.2)).fetchall()
         seen = {}
         for t, px, sz, who in rows:
             if not who or who in invo_users:
                 continue
-            s = seen.setdefault(who, [t, 0.0])
-            s[1] += px * sz
+            s_ = seen.setdefault(who, [t, 0.0])
+            s_[0] = max(s_[0], t)          # laatste trade vóór de golf
+            s_[1] += px * sz
         for who, (t, u) in seen.items():
             h = hits[who]
             h["golven"] += 1
             h["munten"][coin] += 1
             h["usd"] += u
             h["voorsprong"].append(t0 - t)
+    span = max(1.0, t_max - t_min)
     out = []
     for who, h in hits.items():
-        if h["golven"] < 2:
+        if h["golven"] < min_waves:
             continue
-        total = con.execute("SELECT COUNT(*) FROM tape WHERE buyer=? OR seller=?", (who, who)).fetchone()[0]
-        lead = sorted(h["voorsprong"])[len(h["voorsprong"]) // 2]
-        out.append({"address": who, "golven": h["golven"], "trades_in_tape": total,
-                    "precisie": round(h["golven"] / max(total, 1), 3), "usd": round(h["usd"]),
-                    "voorsprong_s": round(lead, 1), "munten": dict(h["munten"])})
-    con.close()
-    # Market makers zitten overal in; een echte leider heeft relatief weinig trades en veel golven.
-    out.sort(key=lambda x: (-(x["golven"] * min(1.0, x["precisie"] * 5)), -x["golven"]))
-    return {"golven": len(waves), "invo_gebruikers": len(invo_users), "leiders": out[:top]}
-
-
-# ---------- interface die app.py en claude_link.py gebruiken ----------
-
-class Tape:
-    """Dunne schil om TapeRecorder: Tape(data_dir, min_notional, retention_h, log).start() / .status()."""
-
-    def __init__(self, data_dir, min_notional=250, retention_h=48, log=lambda t: None, n_coins=60):
-        self.data_dir, self.min_notional, self.retention_h, self.log = data_dir, min_notional, retention_h, log
-        self.n_coins = n_coins
-        self.rec = None
-
-    def start(self):
-        if self.rec is None:
-            self.rec = TapeRecorder(self.data_dir, n_coins=self.n_coins, keep_hours=self.retention_h, log=self.log)
-        return self
-
-    def status(self):
-        st = info(self.data_dir)
-        st["bezig"] = self.rec is not None
-        st["geschreven_deze_sessie"] = self.rec.count if self.rec else 0
-        return st
-
-
-def search(data_dir, coin, ms_from, ms_to, direction=None, px_min=None, px_max=None, min_notional=0, limit=40):
-    """Per adres samengevat wie er tussen twee tijdstippen (ms) in deze munt handelde, eerste eerst.
-    direction: 'koop'/'long' = kopers, 'verkoop'/'short' = verkopers, None = beide."""
-    rows = query(data_dir, coin, ms_from / 1000, ms_to / 1000, px_min, px_max, 0, limit=20000)
-    d = (direction or "").lower()
-    sides = ["koper"] if d in ("koop", "long", "buy", "b") else ["verkoper"] if d in (
-        "verkoop", "short", "sell", "a", "s") else ["koper", "verkoper"]
-    per = {}
-    for r in rows:
-        for s in sides:
-            who = r[s]
-            if not who:
+        # Verwacht bij toeval: per munt/kant hoe vaak hij in een willekeurig venster van lookback_s handelt.
+        expected = 0.0
+        for (coin, side), nw in coins_side.items():
+            if coin not in h["munten"]:
                 continue
-            p = per.setdefault((who, s), {"address": who, "kant": s, "eerste": r["tijd"], "t": r["t"],
-                                          "trades": 0, "usd": 0, "sz": 0.0, "pxsz": 0.0})
-            p["trades"] += 1
-            p["usd"] += r["usd"]
-            p["sz"] += r["sz"]
-            p["pxsz"] += r["px"] * r["sz"]
-    out = []
-    for p in per.values():
-        if p["usd"] < min_notional:
-            continue
-        p["gem_prijs"] = round(p["pxsz"] / p["sz"], 6) if p["sz"] else None
-        del p["pxsz"]
-        out.append(p)
-    out.sort(key=lambda p: p["t"])
-    return out[:limit]
+            col = "buyer" if side == "B" else "seller"
+            cnt = con.execute(f"SELECT COUNT(DISTINCT CAST(t / ? AS INTEGER)) FROM tape WHERE coin=? AND {col}=?",
+                              (lookback_s, coin, who)).fetchone()[0]
+            p = min(1.0, cnt * lookback_s / span)
+            expected += nw * p
+        lift = h["golven"] / expected if expected else 0
+        lead = sorted(h["voorsprong"])[len(h["voorsprong"]) // 2]
+        out.append({"address": who, "golven": h["golven"], "verwacht": round(expected, 1), "lift": round(lift, 1),
+                    "usd": round(h["usd"]), "voorsprong_s": round(lead, 1), "munten": dict(h["munten"])})
+    con.close()
+    out.sort(key=lambda x: (-x["lift"], -x["golven"]))
+    return {"golven": len(waves), "invo_gebruikers": len(invo_users), "leiders": out[:top]}
