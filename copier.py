@@ -414,6 +414,10 @@ class CopyEngine:
         if target < amount * 0.1:          # trader bouwde bijna alles af: dan sluiten we helemaal
             self.close(coin, f"{t['name']} bouwde zijn {side} bijna helemaal af")
             return
+        if (amount - cut) * px < self.min_order_eur(sym):
+            # Wat overblijft zou onder de kleinste order zakken: dan houden we de minimumpositie tot hij sluit.
+            self.say_once(f"cut-{coin}", f"Kopie {coin}: {t['name']} bouwde af, wij houden de minimumpositie.")
+            return
         if live:
             try:
                 size, _ = self.kx.size_for(sym, cut * px)
@@ -563,6 +567,18 @@ class CopyEngine:
             self._said[key] = time.time()
             self.e.log(text, kind)
 
+    def min_order_eur(self, sym):
+        """Kleinste positie die we bij Kraken kunnen openen (één stapgrootte, met wat marge), minimaal €5."""
+        m = 5.0
+        try:
+            px = self.kr.price(sym)
+            if self.kx:
+                p = self.kx.precision(kraken.sym_of(sym))
+                m = max(m, (10 ** -p) * px if p >= 0 else px)
+        except Exception:
+            pass
+        return m * 1.03
+
     def size_for_open(self, their, stop_pct, lev):
         """Grootte van een nieuwe kopie in € (positie). Geeft (notional, reden)."""
         fee2 = 2 * kraken.TAKER_FEE_PCT / 100
@@ -585,9 +601,11 @@ class CopyEngine:
             caps.append((want, f"zelfde verhouding als de trader ({weight * 100:.0f}% van zijn account)"))
         else:
             caps.append((self.max_loss() / risk_per_eur, "max verlies per kopie"))
+        hard = min(max(0.0, self.budget_room()) * lev, max(0.0, self.pot_risk_room()) / risk_per_eur)
         caps.append((max(0.0, self.budget_room()) * lev, "kopieer-budget"))
         caps.append((max(0.0, self.pot_risk_room()) / risk_per_eur, "pot-grens"))
         notional, why = min(caps, key=lambda c: c[0])
+        self._last_hard = hard
         return notional, why
 
     def open(self, coin, side, their, t):
@@ -620,6 +638,12 @@ class CopyEngine:
             self.say_once("halt", "Kopiëren staat stil door de noodrem; geef hem vrij bij Kopiëren om weer te openen.")
             return False
         notional, why = self.size_for_open(their, stop_pct, lev)
+        min_eur = self.min_order_eur(sym)
+        hard = getattr(self, "_last_hard", 0.0)
+        if 0 < notional < min_eur and self.cfg.get("altijd_minimum", True) and hard >= min_eur:
+            # Te klein voor Kraken, maar budget en pot-grens laten het toe: dan de kleinste order.
+            why = f"kleinste order bij Kraken (de verhouding gaf €{notional:.2f})"
+            notional = min_eur
         if notional < 5:
             self.say_once(f"skip-{coin}", f"Kopie {t['name']}: {coin} overgeslagen ({why}: nog maar €{notional:.2f}).")
             return False
