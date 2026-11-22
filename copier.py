@@ -411,7 +411,15 @@ class CopyEngine:
             return
         # afbouwen
         cut = -diff
-        if target < amount * 0.1:          # trader bouwde bijna alles af: dan sluiten we helemaal
+        prev = float(pos.get("trader_size") or 0)
+        if prev and size_now >= prev * 0.999:
+            # hij bouwde niet af; wij zitten alleen boven de verhouding door de kleinste order
+            if size_now > prev:
+                with self.e.db() as con:
+                    con.execute("UPDATE copy_positions SET trader_size=? WHERE coin=?", (size_now, coin))
+            return
+        if (prev and size_now < prev * 0.1) or (not prev and target < amount * 0.1):
+            # trader bouwde bijna alles af: dan sluiten we helemaal
             self.close(coin, f"{t['name']} bouwde zijn {side} bijna helemaal af")
             return
         if (amount - cut) * px < self.min_order_eur(sym):
@@ -640,6 +648,7 @@ class CopyEngine:
         notional, why = self.size_for_open(their, stop_pct, lev)
         min_eur = self.min_order_eur(sym)
         hard = getattr(self, "_last_hard", 0.0)
+        ratio_notional = notional   # de echte verhouding: daarop volgen we zijn bijkopen en afbouwen
         if 0 < notional < min_eur and self.cfg.get("altijd_minimum", True) and hard >= min_eur:
             # Te klein voor Kraken, maar budget en pot-grens laten het toe: dan de kleinste order.
             why = f"kleinste order bij Kraken (de verhouding gaf €{notional:.2f})"
@@ -687,7 +696,7 @@ class CopyEngine:
                         "trader_size, ratio, base_notional) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (coin, sym, side, amount, px, notional, lev, now(), t["address"], t["name"],
                          float(their.get("entry") or 0), stop, ext, int(self.live()),
-                         t_size, amount / t_size if t_size else None, notional))
+                         t_size, (min(amount, ratio_notional / px) / t_size) if t_size else None, notional))
         risk = notional * (stop_pct / 100 + fee2)
         self.e.log(f"{'LIVE' if self.live() else 'DROOG'} KOPIE OPEN {coin} {side} {lev:.0f}x van {t['name']}: "
                    f"positie €{notional:.2f} (inzet €{notional / lev:.2f}, grens: {why}) @ {px:.6g}, noodstop "
