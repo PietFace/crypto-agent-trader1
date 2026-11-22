@@ -11,6 +11,7 @@ Opdrachten:
   {"type": "tape", "coin": "BTC", "van": "2026-11-19T18:30:00+01:00", "tot": "2026-11-19T18:35:00+01:00",
    "richting": "verkoop", "px_min": 63000, "px_max": 63200, "min_bedrag": 1000, "controleer": 10}
   {"type": "tape_status"}
+  {"type": "vingerafdruk", "trades": [["BTC", "verkoop", "2026-11-22T10:42:00+01:00", 60211], ...]}   (wie deed deze trades?)
   {"type": "leiders", "days": 2}
   {"type": "posmatch", "account": 346920, "positions": [["ZRO", "long"], ["LIT", "long"]], "tol_acct": 0.05}   (wie volgen de Invo-kopieerders? zie tape.leaders)
   {"type": "info", "requests": [{"type": "portfolio", "user": "0x..."}]}   (alleen openbare leesverzoeken)
@@ -394,6 +395,43 @@ class ClaudeLink:
                               min_waves=int(job.get("min_golven", 4)), progress=lambda t: self._progress(stem, t))
         if kind == "tape_status":
             return self.tape.status() if self.tape else {"fout": "meeschrijven staat uit"}
+        if kind == "vingerafdruk":
+            # Een paar trades van een (Invo-)trader met tijd en prijs: wie zat in de tape bij ALLE/de meeste?
+            import tape as tp
+            from datetime import datetime
+            hits, per_event = {}, []
+            events = job.get("trades") or []
+            for ev in events[:12]:
+                coin, kant, tijd, px = ev[0], ev[1], ev[2], float(ev[3])
+                win = float(ev[4]) if len(ev) > 4 else 180
+                tol = float(job.get("prijs_tol_pct", 0.05)) / 100
+                t0 = datetime.fromisoformat(str(tijd)).timestamp()
+                rows = tp.query(settings.data_dir(), coin, t0 - win, t0 + win, px * (1 - tol), px * (1 + tol),
+                                min_usd=float(job.get("min_bedrag", 0)), limit=20000)
+                # verkoop = short openen of long sluiten: de trader is de verkoper; koop andersom
+                who = set()
+                for r in rows:
+                    a = r["verkoper"] if kant.startswith("verk") else r["koper"]
+                    if a:
+                        who.add(a.lower())
+                per_event.append({"trade": ev, "tape_trades": len(rows), "adressen": len(who)})
+                for a in who:
+                    hits[a] = hits.get(a, 0) + 1
+            need = int(job.get("min_treffers", max(2, len(events) - 1)))
+            best = sorted(((a, n) for a, n in hits.items() if n >= need), key=lambda x: -x[1])[:30]
+            out = []
+            for a, n in best[:int(job.get("controleer", 15))]:
+                r = {"address": a, "treffers": n}
+                try:
+                    st = copier.trader_state(a)
+                    r["posities"] = st["positions"]
+                    r["account"] = st["account"] + copier.spot_usdc(a)
+                except Exception as e:
+                    r["fout"] = str(e)
+                out.append(r)
+                time.sleep(0.5)
+            return {"tape": tp.info(settings.data_dir()), "per_trade": per_event, "kandidaten": out,
+                    "overig": [{"address": a, "treffers": n} for a, n in best[len(out):]]}
         if kind == "tape":
             import tape as tp
             def ms(v):
