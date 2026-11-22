@@ -299,6 +299,7 @@ class CopyEngine:
                         mine.pop(coin, None)
                     else:
                         self.e.log(f"Kopie {coin} {pos['side']} van {t['name']}: staat bij hem nog open ✓", "muted")
+                        pos = self.fix_ratio(coin, pos, st, t) or pos
                         self.resize(coin, pos, st["positions"][coin], t)
                 continue
             # gesloten of omgedraaid -> wij sluiten
@@ -574,6 +575,30 @@ class CopyEngine:
         if time.time() - self._said.get(key, 0) >= every:
             self._said[key] = time.time()
             self.e.log(text, kind)
+
+    def fix_ratio(self, coin, pos, st, t):
+        """Na een herstart: was de verhouding van een kopie te hoog vastgelegd (oude fout met de kleinste order),
+        dan terugzetten naar de echte verhouding. De positie zelf blijft staan; alleen bijkopen volgt weer de echte."""
+        if self.cfg.get("sizing", "verhouding") != "verhouding" or not pos.get("ratio"):
+            return None
+        their = st["positions"][coin]
+        try:
+            acct = float(st.get("account") or 0) + spot_usdc(t["address"])
+            size = float(their.get("size") or 0)
+            px = self.kr.price(pos["symbol"])
+            if acct <= 0 or size <= 0 or px <= 0:
+                return None
+            weight = float(their.get("value") or size * float(their.get("entry") or 0)) / acct
+            true_ratio = weight * self.pot_value() * float(self.cfg.get("scale_pct", 100)) / 100 / px / size
+        except Exception:
+            return None
+        if pos["ratio"] <= true_ratio * 1.5:
+            return None
+        with self.e.db() as con:
+            con.execute("UPDATE copy_positions SET ratio=? WHERE coin=?", (true_ratio, coin))
+        self.e.log(f"Kopie {coin} van {t['name']}: verhouding gecorrigeerd (was {pos['ratio'] / true_ratio:.1f}x te "
+                   f"hoog); bijkopen volgt nu de echte verhouding.", "info")
+        return dict(pos, ratio=true_ratio)
 
     def min_order_eur(self, sym):
         """Kleinste positie die we bij Kraken kunnen openen (één stapgrootte, met wat marge), minimaal €5."""
