@@ -14,6 +14,8 @@ Opdrachten:
   {"type": "leiders", "days": 2}
   {"type": "posmatch", "account": 346920, "positions": [["ZRO", "long"], ["LIT", "long"]], "tol_acct": 0.05}   (wie volgen de Invo-kopieerders? zie tape.leaders)
   {"type": "info", "requests": [{"type": "portfolio", "user": "0x..."}]}   (alleen openbare leesverzoeken)
+  {"type": "ranglijst", "min_acct": 20000, "min_maand_pnl": 0, "min_week_pnl": 0, "min_activiteit": 5, "alleen_invo": false}
+  {"type": "keuren", "addresses": ["0x...", ...], "dagen": 14}   (trades per dag, hoe lang open, winstkans)
   {"type": "voorstel", "name": "missed", "address": "0x...", "style": "lang", "reden": "..."}
 """
 import glob
@@ -130,7 +132,7 @@ class ClaudeLink:
             os.remove(busy)
         except Exception:
             pass
-        if job.get("type") in ("zoek", "posities", "info"):
+        if job.get("type") in ("zoek", "posities", "info", "ranglijst", "keuren"):
             time.sleep(self.pause)  # Hyperliquid-limiet laten bijkomen voor de volgende opdracht
 
     def _write(self, stem, data):
@@ -249,6 +251,100 @@ class ClaudeLink:
             except Exception:
                 pass
             return {"in_buurt": len(near), "gecontroleerd": checked, "treffers": hits}
+        if kind == "ranglijst":
+            # Leaderboard filteren op winst (maand en week), grootte en activiteit; Invo-gebruikers gemarkeerd.
+            import followers
+            dd = settings.data_dir()
+            rows = followers.fetch_leaderboard(os.path.join(dd, "leaderboard.json"))
+            try:
+                invo = followers.fetch_invo_users(os.path.join(dd, "invo_users.json"),
+                                                  days=int(job.get("invo_dagen", 7)))
+            except Exception:
+                invo = {}
+            invo = {str(a).lower(): v for a, v in (invo or {}).items()}
+            lo, hi = float(job.get("min_acct", 20000)), float(job.get("max_acct", 5e6))
+            out = []
+            for r in rows:
+                a = str(r.get("address") or "").lower()
+                acct = r.get("account_value") or 0
+                m, w, al = r.get("month") or {}, r.get("week") or {}, r.get("alltime") or {}
+                if not a or not (lo <= acct <= hi):
+                    continue
+                if m.get("pnl", 0) < float(job.get("min_maand_pnl", 0)) or w.get("pnl", 0) < float(job.get("min_week_pnl", 0)):
+                    continue
+                if al.get("pnl", 0) < float(job.get("min_alltime_pnl", 0)):
+                    continue
+                activiteit = m.get("vlm", 0) / acct if acct else 0  # maandvolume / account: hoe vaak hij handelt
+                if activiteit < float(job.get("min_activiteit", 5)):
+                    continue
+                if job.get("alleen_invo") and a not in invo:
+                    continue
+                out.append({"address": a, "naam": r.get("name") or "", "account": round(acct),
+                            "maand_pnl": round(m.get("pnl", 0)), "maand_roi": round(m.get("roi", 0) * 100, 1),
+                            "week_pnl": round(w.get("pnl", 0)), "week_roi": round(w.get("roi", 0) * 100, 1),
+                            "alltime_pnl": round(al.get("pnl", 0)), "activiteit": round(activiteit, 1),
+                            "invo_volume": round(invo.get(a, 0))})
+            key = job.get("sorteer", "maand_roi")
+            out.sort(key=lambda x: x.get(key, 0), reverse=True)
+            return {"leaderboard": len(rows), "invo_gebruikers": len(invo), "gevonden": len(out),
+                    "traders": out[:min(int(job.get("limit", 60)), 300)]}
+        if kind == "keuren":
+            # Per adres de trades van de laatste dagen: hoeveel, hoe lang open, winstkans, resultaat, grootste verlies.
+            res = []
+            addrs = [str(a).lower() for a in job.get("addresses") or []][:25]
+            days = max(1, min(int(job.get("dagen", 14)), 60))
+            for i, a in enumerate(addrs):
+                self._progress(stem, f"{i}/{len(addrs)} traders gekeurd")
+                try:
+                    fl = copier.fills_since(a, days=days, max_pages=5)
+                except Exception as e:
+                    res.append({"address": a, "fout": str(e)})
+                    continue
+                fl.sort(key=lambda f: f.get("time", 0))
+                open_at, pnl_acc, trades = {}, {}, []
+                for f in fl:
+                    c = f.get("coin")
+                    try:
+                        start = float(f.get("startPosition") or 0)
+                        sz = float(f.get("sz") or 0)
+                        signed = sz if f.get("side") == "B" else -sz
+                        pnl = float(f.get("closedPnl") or 0) - float(f.get("fee") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if abs(start) < 1e-12 and c not in open_at:
+                        open_at[c] = f.get("time", 0)
+                        pnl_acc[c] = 0.0
+                    if c in open_at:
+                        pnl_acc[c] += pnl
+                    end = start + signed
+                    if c in open_at and (abs(end) < 1e-9 * max(1.0, abs(start)) or start * end < 0):
+                        trades.append({"coin": c, "uur": (f.get("time", 0) - open_at[c]) / 3.6e6,
+                                       "pnl": pnl_acc[c]})
+                        del open_at[c]
+                        if start * end < 0:          # omgedraaid: nieuwe positie de andere kant op
+                            open_at[c] = f.get("time", 0)
+                            pnl_acc[c] = 0.0
+                n = len(trades)
+                holds = sorted(t["uur"] for t in trades)
+                wins = sum(1 for t in trades if t["pnl"] > 0)
+                munten = {}
+                for t in trades:
+                    munten[t["coin"]] = munten.get(t["coin"], 0) + 1
+                res.append({"address": a, "fills": len(fl), "trades": n,
+                            "per_dag": round(n / days, 1),
+                            "mediaan_uur": round(holds[n // 2], 2) if n else None,
+                            "winstkans": round(100 * wins / n) if n else None,
+                            "resultaat": round(sum(t["pnl"] for t in trades)),
+                            "grootste_verlies": round(min((t["pnl"] for t in trades), default=0)),
+                            "grootste_winst": round(max((t["pnl"] for t in trades), default=0)),
+                            "nu_open": sorted(open_at),
+                            "munten": dict(sorted(munten.items(), key=lambda x: -x[1])[:8])})
+                time.sleep(1)
+            try:
+                os.remove(stem + ".voortgang.txt")
+            except Exception:
+                pass
+            return res
         if kind == "backtest":
             # Varianten naast elkaar op historische uurkoersen (Bitvavo), met de regels van nu.
             import backtest
