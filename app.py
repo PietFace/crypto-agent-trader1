@@ -864,7 +864,7 @@ class CopyPage(QWidget):
         # ===== Tab 1: Nu (open kopieën en wat de traders open hebben)
         w1, v = tab_page()
         v.addWidget(lab("OPEN KOPIEËN", "cap"))
-        self.open_t = table(["Geopend", "Munt", "Kant", "Hefboom", "Positie", "Waarde nu", "Inzet", "Instap",
+        self.open_t = table(["Geopend", "Munt", "Kant", "Hefboom", "Positie", "Inzet", "Jouw deel nu", "Instap",
                              "Koers nu", "Resultaat", "Noodstop", "Trader", "Echt"])
         self.open_t.setMinimumHeight(170)
         v.addWidget(self.open_t)
@@ -1454,8 +1454,8 @@ class CopyPage(QWidget):
             opened, coin, side, lev, cost, entry, stop, tn, real, pxn, pnl = r
             margin = (cost or 0) / max(1.0, lev or 1)
             res = (f"{eur(pnl, True)} ({pnl / margin * 100:+.1f}%)" if pnl is not None and margin else "…")
-            value_now = eur((cost or 0) * pxn / entry) if pxn and entry else "…"
-            rows.append([local_time(opened), coin, side, f"{lev:.0f}x", eur(cost or 0), value_now, eur(margin),
+            share_now = eur(margin + pnl) if pnl is not None else "…"   # inzet + winst/verlies: wat jouw deel nu waard is
+            rows.append([local_time(opened), coin, side, f"{lev:.0f}x", eur(cost or 0), eur(margin), share_now,
                          fmt_px(entry or 0), fmt_px(pxn) if pxn else "…", res, fmt_px(stop or 0), tn,
                          "ja" if real else "droog"])
         fill(self.open_t, rows)
