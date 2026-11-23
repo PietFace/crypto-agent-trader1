@@ -326,6 +326,10 @@ class CopyEngine:
                     mine = self.positions()
         self.check_stops()
         try:
+            self.check_trader_rem()
+        except Exception as ex:
+            self.say_once("trem-err", f"Trader-rem-controle mislukt ({ex})", "bad")
+        try:
             self.check_noodrem()
         except Exception as ex:
             self.say_once("noodrem-err", f"Noodrem-controle mislukt ({ex})", "bad")
@@ -543,30 +547,68 @@ class CopyEngine:
     def halted(self):
         return bool(self.e.meta_get("copy_halted"))
 
+    def booked_value(self):
+        """Echt geld van de pot: budget + gesloten resultaat (zonder papieren winst van open kopieën)."""
+        with self.e.db() as con:
+            realized = con.execute("SELECT COALESCE(SUM(pnl_eur),0) FROM copy_trades").fetchone()[0]
+        return self.budget() + realized
+
     def check_noodrem(self):
-        """Zakt de pot meer dan noodrem_pct onder zijn hoogste stand, dan alles dicht en geen nieuwe kopieën meer
-        tot je de noodrem vrijgeeft."""
+        """Zakt de pot (incl. open verlies) meer dan noodrem_pct onder de hoogste stand van het ECHTE geld
+        (budget + gesloten resultaat), dan alles dicht en geen nieuwe kopieën meer tot je hem vrijgeeft.
+        Papieren winst telt niet mee voor de top, zodat een goede ochtend die terugzakt de rem niet trekt."""
         if not self.cfg.get("noodrem_on", True):
             return
         pv = self.pot_value()
-        peak = float(self.e.meta_get("copy_pot_peak") or 0) or max(pv, self.budget())
-        if pv > peak:
-            peak = pv
-        self.e.meta_set("copy_pot_peak", peak)
+        booked = self.booked_value()
+        peak = float(self.e.meta_get("copy_real_peak") or 0) or max(booked, self.budget())
+        if booked > peak:
+            peak = booked
+        self.e.meta_set("copy_real_peak", peak)
+        self.e.meta_set("copy_pot_peak", peak)   # voor de app-tegel
         if self.halted():
             return
-        pct = float(self.cfg.get("noodrem_pct", 15))
+        pct = float(self.cfg.get("noodrem_pct", 25))
         if pv < peak * (1 - pct / 100):
             self.e.meta_set("copy_halted", now())
             self.e.log(f"NOODREM KOPIËREN: de pot staat op €{pv:.2f}, {(1 - pv / peak) * 100:.1f}% onder de top "
-                       f"(€{peak:.2f}). Alle kopieën worden gesloten en er worden geen nieuwe meer geopend tot je "
-                       "de noodrem vrijgeeft bij Kopiëren.", "bad")
+                       f"van je echte geld (€{peak:.2f}). Alle kopieën worden gesloten en er worden geen nieuwe meer "
+                       "geopend tot je de noodrem vrijgeeft bij Kopiëren.", "bad")
             for coin in list(self.positions()):
                 self.close(coin, f"noodrem: pot {pct:.0f}% onder de top")
 
+    def check_trader_rem(self):
+        """Rem per trader: verliezen de open kopieën van één trader samen meer dan trader_rem_pct van de pot,
+        dan alleen díe kopieën dicht en die trader een tijdje pauzeren. De andere traders lopen gewoon door."""
+        pct = float(self.cfg.get("trader_rem_pct", 8))
+        if pct <= 0:
+            return
+        limit = self.pot_value() * pct / 100
+        per = {}
+        for coin, pos in self.positions().items():
+            per.setdefault(pos["trader"], []).append((coin, pos))
+        for addr, items in per.items():
+            loss = -sum(float(p.get("pnl_now") or 0) for _, p in items)
+            if loss <= limit:
+                continue
+            name = items[0][1].get("trader_name") or addr[:8]
+            hours = float(self.cfg.get("trader_pauze_uur", 24))
+            self.e.meta_set(f"copy_pause_{addr}", str(time.time() + hours * 3600))
+            self.e.log(f"TRADER-REM {name}: zijn kopieën staan samen €{loss:.2f} in de min (meer dan {pct:.0f}% van "
+                       f"de pot). Alleen zijn kopieën gaan dicht; {name} is {hours:.0f} uur gepauzeerd.", "bad")
+            for coin, _ in items:
+                self.close(coin, f"trader-rem: {name} samen meer dan {pct:.0f}% van de pot in de min")
+
+    def trader_paused(self, addr):
+        try:
+            return time.time() < float(self.e.meta_get(f"copy_pause_{addr}") or 0)
+        except (TypeError, ValueError):
+            return False
+
     def release_noodrem(self):
         self.e.meta_set("copy_halted", "")
-        self.e.meta_set("copy_pot_peak", self.pot_value())
+        self.e.meta_set("copy_real_peak", self.booked_value())
+        self.e.meta_set("copy_pot_peak", self.booked_value())
 
     def say_once(self, key, text, kind="muted", every=1800):
         """Een melding hooguit eens per 'every' seconden (anders vult het logboek zich bij elke controle)."""
@@ -650,6 +692,10 @@ class CopyEngine:
                 return False
         except Exception as ex:
             self.e.log(f"Kopie {t['name']}: Kraken niet bereikbaar ({ex})", "bad")
+            return False
+        if self.trader_paused(t["address"]):
+            self.say_once(f"pause-{t['address']}", f"Kopie {t['name']}: {coin} overgeslagen, {t['name']} is gepauzeerd "
+                          "door de trader-rem.")
             return False
         if len(self.positions()) >= int(self.cfg.get("max_positions", 5)):
             self.e.log(f"Kopie {t['name']}: {coin} overgeslagen, al {self.cfg.get('max_positions', 5)} kopieën open.",

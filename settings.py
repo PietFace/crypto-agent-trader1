@@ -19,7 +19,7 @@ DEFAULTS = {
     "copy": {"enabled": False, "live": False, "realtime": True, "max_loss_eur": 5.0, "interval_s": 5, "eur_per_trade": 10, "max_leverage": 10,
              "max_positions": 5, "daily_loss_eur": 10, "stop_pct_lang": 10, "stop_pct_kort": 3, "traders": [],
              "follow_size": True, "resize_min_pct": 10, "max_scale": 3,
-             "sizing": "verhouding", "altijd_minimum": True, "scale_pct": 100, "pot_risk_pct": 25, "noodrem_on": True, "noodrem_pct": 15},  # alleen deze signalen met echt geld; de rest als schaduwtrade
+             "sizing": "verhouding", "altijd_minimum": True, "scale_pct": 100, "pot_risk_pct": 25, "noodrem_on": True, "noodrem_pct": 25, "trader_rem_pct": 8, "trader_pauze_uur": 24},  # alleen deze signalen met echt geld; de rest als schaduwtrade
     "trail": {"enabled": False, "activate_frac": 0.5, "distance_frac": 0.5, "buffer_pct": 0.2, "spread_pct": 0.1,
               "reentry": True, "max_reentries": 1, "reentry_band_pct": 0.5, "reentry_hours": 24},
     "tape": {"enabled": True, "min_notional": 250, "retention_h": 48},   # trades meeschrijven om traders te vinden
@@ -121,7 +121,7 @@ def _import_env(cfg):
     return False
 
 
-CFG_VERSION = 3
+CFG_VERSION = 4
 
 
 def budgets(cfg):
@@ -173,6 +173,10 @@ def load():
             # Versie 3: één budget voor gewone bot + kopiëren: €200 totaal, 50/50.
             cfg["rules"]["budget_eur"] = 200
             cfg["copy_share"] = 0.5
+        if int(cfg.get("cfg_version", 1)) < 4:
+            # Noodrem ruimer (25%, vanaf echt geld) en per trader een eigen rem.
+            if float(cfg["copy"].get("noodrem_pct", 15)) < 25:
+                cfg["copy"]["noodrem_pct"] = 25
         if int(cfg.get("cfg_version", 1)) < CFG_VERSION:
             cfg["cfg_version"] = CFG_VERSION
             save(cfg)

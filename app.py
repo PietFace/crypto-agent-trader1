@@ -1006,10 +1006,16 @@ class CopyPage(QWidget):
         self.pot_risk = QSpinBox(); self.pot_risk.setRange(5, 100); self.pot_risk.setSuffix(" % van de pot")
         self.pot_risk.setToolTip("Alle open kopieën samen mogen tot hun noodstops niet meer kunnen verliezen dan dit.")
         f.addRow("Samen max risico", self.pot_risk)
-        self.brake_on = QCheckBox("Noodrem: alles dicht als de pot te ver onder zijn hoogste stand zakt")
+        self.brake_on = QCheckBox("Noodrem: alles dicht als de pot te ver onder de top van je echte geld zakt")
         f.addRow("", self.brake_on)
         self.brake_pct = QSpinBox(); self.brake_pct.setRange(3, 60); self.brake_pct.setSuffix(" % onder de top")
         f.addRow("Noodrem bij", self.brake_pct)
+        self.trader_rem = QSpinBox(); self.trader_rem.setRange(0, 50); self.trader_rem.setSuffix(" % van de pot")
+        self.trader_rem.setToolTip("Verliezen de open kopieën van één trader samen meer dan dit, dan gaan alleen die "
+                                   "dicht en wordt die trader gepauzeerd. 0 = uit.")
+        f.addRow("Rem per trader bij", self.trader_rem)
+        self.trader_pause = QSpinBox(); self.trader_pause.setRange(1, 168); self.trader_pause.setSuffix(" uur")
+        f.addRow("Trader daarna pauzeren", self.trader_pause)
         self.stop_l = QDoubleSpinBox(); self.stop_l.setRange(0.5, 50); self.stop_l.setSuffix(" %")
         f.addRow("Noodstop per kopie, lange traders", self.stop_l)
         self.stop_k = QDoubleSpinBox(); self.stop_k.setRange(0.5, 50); self.stop_k.setSuffix(" %")
@@ -1053,6 +1059,8 @@ class CopyPage(QWidget):
         self.pot_risk.setValue(int(c.get("pot_risk_pct", d["pot_risk_pct"])))
         self.brake_on.setChecked(bool(c.get("noodrem_on", d["noodrem_on"])))
         self.brake_pct.setValue(int(c.get("noodrem_pct", d["noodrem_pct"])))
+        self.trader_rem.setValue(int(c.get("trader_rem_pct", d["trader_rem_pct"])))
+        self.trader_pause.setValue(int(c.get("trader_pauze_uur", d["trader_pauze_uur"])))
         self.traders.setPlainText("\n".join(f"{t['address']} {t.get('name', '')} {t.get('style', 'lang')}"
                                             for t in c.get("traders", [])))
         self._loading = False
@@ -1078,6 +1086,7 @@ class CopyPage(QWidget):
             "sizing": "verhouding" if self.sizing.currentIndex() == 0 else "vast",
             "scale_pct": self.scale.value(), "pot_risk_pct": self.pot_risk.value(),
             "noodrem_on": self.brake_on.isChecked(), "noodrem_pct": self.brake_pct.value(),
+            "trader_rem_pct": self.trader_rem.value(), "trader_pauze_uur": self.trader_pause.value(),
             "trail": bool((self.win.cfg.get("copy") or {}).get("trail", False)),   # staat bij Instellingen
             "traders": traders}
         settings.save(self.win.cfg)
@@ -1429,9 +1438,9 @@ class CopyPage(QWidget):
         elif halted:
             self.t_brake.set("GERAAKT", "alles is gesloten; geef hem vrij om verder te gaan", bad)
         else:
-            pct = float(c.get("noodrem_pct", 15))
+            pct = float(c.get("noodrem_pct", 25))
             at = peak * (1 - pct / 100)
-            self.t_brake.set(eur(at), f"bij {pct:.0f}% onder de top · nog {eur(pv - at)} ruimte", None)
+            self.t_brake.set(eur(at), f"bij {pct:.0f}% onder je echte geld · nog {eur(pv - at)} ruimte", None)
         self.brake_btn.setVisible(halted)
         acc = kraken_account()
         if acc:
