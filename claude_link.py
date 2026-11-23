@@ -326,6 +326,14 @@ class ClaudeLink:
                             open_at[c] = f.get("time", 0)
                             pnl_acc[c] = 0.0
                 n = len(trades)
+                try:
+                    import kraken
+                    _kp = getattr(self, "_kpub", None) or kraken.KrakenPublic(max_age=600)
+                    self._kpub = _kp
+                    ok = {c: _kp.supported(kraken.symbol_for_coin(c)) for c in {t["coin"] for t in trades}}
+                except Exception:
+                    ok = {}
+                kt = [t for t in trades if ok.get(t["coin"])]
                 holds = sorted(t["uur"] for t in trades)
                 wins = sum(1 for t in trades if t["pnl"] > 0)
                 munten = {}
@@ -338,6 +346,10 @@ class ClaudeLink:
                             "resultaat": round(sum(t["pnl"] for t in trades)),
                             "grootste_verlies": round(min((t["pnl"] for t in trades), default=0)),
                             "grootste_winst": round(max((t["pnl"] for t in trades), default=0)),
+                            "kraken_pct": round(100 * len(kt) / n) if n else None,
+                            "kraken_resultaat": round(sum(t["pnl"] for t in kt)),
+                            "kraken_winstkans": round(100 * sum(1 for t in kt if t["pnl"] > 0) / len(kt)) if kt else None,
+                            "niet_op_kraken": sorted(c for c, v in ok.items() if not v)[:10],
                             "nu_open": sorted(open_at),
                             "munten": dict(sorted(munten.items(), key=lambda x: -x[1])[:8])})
                 time.sleep(1)
