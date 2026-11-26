@@ -1501,6 +1501,7 @@ class Engine:
         tot = sum(r[1] or 0 for r in rows)
         return {"enabled": bool(self.copier), "live": bool(self.copier and self.copier.live()),
                 "realtime": bool(self.copier and self.copier.ws_ok),
+                "halted": bool(self.copier and self.copier.halted()),
                 "traders": [t["name"] for t in (self.copier.traders if self.copier else [])],
                 "open": opens, "closed": closed, "per_trader": per_list, "trader_positions": tpos,
                 "totals": {"trades": len(rows), "wins": sum(1 for r in rows if (r[1] or 0) > 0), "pnl": round(tot, 2)}}
