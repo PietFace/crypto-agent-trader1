@@ -2215,10 +2215,11 @@ class MainWindow(QMainWindow):
                                    "De bot begint altijd met droog draaien (geen echte orders).")
             self.sets.note.show()
 
-        # Backtest-verzoeken van de website (alleen backtests, niets anders)
+        # Verzoeken van de website: backtests en een paar vaste knoppen (starten/stoppen, kopie sluiten, noodrem)
+        self.cmdq = queue.Queue()
         try:
             from remote_jobs import JobRunner
-            self.jobs = JobRunner(lambda: self.cfg, self.log)
+            self.jobs = JobRunner(lambda: self.cfg, self.log, on_command=self.cmdq.put)
         except Exception:
             self.jobs = None
 
@@ -2282,12 +2283,65 @@ class MainWindow(QMainWindow):
             while not self.propq.empty():
                 self.propq.get_nowait()
             self.cp.show_proposals()
+        while not self.cmdq.empty():
+            try:
+                self.web_command(self.cmdq.get_nowait())
+            except Exception as ex:
+                self.log(f"Opdracht van de website mislukt: {ex}", "bad")
+            changed = True
         # Ook zonder nieuwe logregels elke 5 s verversen, zodat live waarden (ook van kopieën) meelopen.
         if self.engine is not None and self.engine.running and time.time() - getattr(self, "_last_refresh", 0) > 5:
             changed = True
         if changed:
             self._last_refresh = time.time()
             self.refresh()
+
+    def web_command(self, cmd):
+        """Een knop op de website. Alleen deze vaste opdrachten; nooit iets openen of instellingen wijzigen."""
+        import datetime as _dt
+        c, args, cid = cmd.get("command"), cmd.get("args") or {}, cmd.get("id")
+        res = lambda ok, t: self.jobs and self.jobs.command_result(cid, ok, t)
+        try:   # te oud (bv. pc lag uit): niet meer uitvoeren
+            made = _dt.datetime.fromisoformat(str(cmd.get("created_at")).replace("Z", "+00:00"))
+            if (_dt.datetime.now(_dt.timezone.utc) - made).total_seconds() > 300:
+                res(False, "verlopen: ouder dan 5 minuten")
+                return
+        except Exception:
+            pass
+        running = self.engine is not None and self.engine.running
+        cp = self.engine.copier if running and getattr(self.engine, "copier", None) else None
+        if c == "bot_stop":
+            if not running:
+                return res(True, "bot stond al stil")
+            self.log("Via de website: bot stoppen. Open kopieën blijven staan (met hun noodstop op Kraken).", "head")
+            self.engine.stop()
+            return res(True, "bot stopt")
+        if c == "bot_start":
+            if running:
+                return res(True, "bot draaide al")
+            self.log("Via de website: bot starten.", "head")
+            self.toggle()
+            ok = self.engine is not None and self.engine.running
+            return res(ok, "bot gestart" if ok else "starten lukte niet; kijk op de pc")
+        if c == "noodrem_vrij":
+            if not cp:
+                return res(False, "bot draait niet")
+            cp.release_noodrem()
+            self.log("Via de website: noodrem vrijgegeven.", "head")
+            return res(True, "noodrem vrijgegeven")
+        if c in ("sluit", "sluit_alles"):
+            if not cp:
+                return res(False, "bot draait niet; start hem eerst")
+            open_ = cp.positions()
+            coins = list(open_) if c == "sluit_alles" else [str(args.get("coin", "")).upper()]
+            coins = [x for x in coins if x in open_]
+            if not coins:
+                return res(False, "die kopie staat niet (meer) open")
+            for x in coins:
+                self.log(f"Via de website: kopie {x} handmatig sluiten.", "head")
+                cp.close(x, "handmatig gesloten via de website")
+            return res(True, "gesloten: " + ", ".join(coins))
+        res(False, "onbekende opdracht")
 
     def refresh(self):
         running = self.engine is not None and self.engine.running

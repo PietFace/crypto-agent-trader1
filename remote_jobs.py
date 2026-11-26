@@ -1,6 +1,6 @@
-"""Backtest-verzoeken van de website oppakken en uitvoeren op deze pc.
-
-De website kan alleen een backtest aanvragen: geen handel, geen instellingen. Dit bestand vraagt elke
+"""Verzoeken van de website oppakken: backtests, en een paar knoppen (bot starten/stoppen, een kopie sluiten,
+alles sluiten, noodrem vrijgeven). De website kan NOOIT een trade openen, geld verplaatsen of instellingen of
+keys wijzigen: alleen die vaste opdrachten bestaan, en ze vervallen na 5 minuten. Dit bestand vraagt elke
 30 seconden of er een verzoek klaarstaat (bot-poll), draait de backtest met de huidige instellingen
 en stuurt het resultaat terug (bot-ingest, type backtest_result).
 """
@@ -34,10 +34,14 @@ def _slim(res, months):
             "equity": pts(res["equity"], every), "hold": pts(res["hold"], every), "trades": trades}
 
 
+COMMANDS = ("bot_start", "bot_stop", "sluit", "sluit_alles", "noodrem_vrij")
+
+
 class JobRunner:
-    def __init__(self, get_cfg, log=lambda *a: None):
+    def __init__(self, get_cfg, log=lambda *a: None, on_command=None):
         self.get_cfg = get_cfg
         self.log = log
+        self.on_command = on_command   # wordt op de hoofdthread uitgevoerd (app.py)
         self.busy = False
         self._stop = threading.Event()
         threading.Thread(target=self._loop, daemon=True).start()
@@ -51,23 +55,46 @@ class JobRunner:
                 self._tick()
             except Exception:
                 pass
-            self._stop.wait(30)
+            self._stop.wait(10)
 
     def _tick(self):
         cfg = self.get_cfg()
         rc = cfg.get("remote") or {}
-        if self.busy or not (rc.get("enabled") and rc.get("url") and rc.get("token")):
+        if not (rc.get("enabled") and rc.get("url") and rc.get("token")):
             return
-        r = requests.post(poll_url(rc["url"]), json={}, timeout=15,
+        r = requests.post(poll_url(rc["url"]), json={"want_backtests": not self.busy, "commands": True}, timeout=15,
                           headers={"x-bot-token": rc["token"], "content-type": "application/json"})
         if r.status_code != 200:
             return
-        for req in r.json().get("requests") or []:
+        body = r.json()
+        for cmd in body.get("commands") or []:
+            if cmd.get("command") not in COMMANDS or not self.on_command:
+                self.command_result(cmd.get("id"), False, "onbekende opdracht")
+                continue
+            self.on_command(cmd)
+        reqs = body.get("requests") or []
+        if reqs and not self.busy:
             self.busy = True
-            try:
-                self._run(cfg, rc, req)
-            finally:
-                self.busy = False
+
+            def work():
+                try:
+                    for req in reqs:
+                        self._run(cfg, rc, req)
+                finally:
+                    self.busy = False
+            threading.Thread(target=work, daemon=True).start()
+
+    def command_result(self, cid, ok, text):
+        """Uitkomst van een knop terug naar de website (status bij de opdracht)."""
+        rc = (self.get_cfg() or {}).get("remote") or {}
+        if not cid or not rc.get("url"):
+            return
+        try:
+            requests.post(rc["url"], timeout=15, json={"events": [{"type": "command_result", "data": {
+                "id": cid, "ok": bool(ok), "text": str(text)[:300]}}]},
+                headers={"x-bot-token": rc["token"], "content-type": "application/json"})
+        except Exception:
+            pass
 
     def _send(self, rc, data):
         requests.post(rc["url"], timeout=30, json={"events": [{"type": "backtest_result", "data": data}]},
